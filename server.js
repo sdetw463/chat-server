@@ -3,8 +3,16 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-// 定义存储路径（保存在根目录下）
-const historyFile = path.join(__dirname, 'chat_history.json');
+// 【修复3：Azure 上的持久化存储目录必须是 /home，否则没有写入权限会导致服务器崩溃】
+const isAzure = process.env.WEBSITE_SITE_NAME !== undefined;
+const dataDir = isAzure ? '/home/data' : __dirname;
+
+// 确保数据目录存在
+if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+}
+
+const historyFile = path.join(dataDir, 'chat_history.json');
 
 // 初始化：如果文件不存在，创建一个空的
 if (!fs.existsSync(historyFile)) {
@@ -14,21 +22,21 @@ if (!fs.existsSync(historyFile)) {
 const port = process.env.PORT || 8888;
 const server = http.createServer((req, res) => {
     res.writeHead(200);
-    res.end("TuoTuo Chat Server with File Persistence is running!");
+    res.end("TuoTuo Chat Server is running beautifully on Azure!");
 });
 
 const wss = new WebSocket.Server({ server });
 let clients = new Map();
 
 wss.on('connection', (ws, req) => {
+    // 配合前端的 encodeURIComponent，这里使用 decodeURIComponent 解析中文昵称
     const nickname = decodeURIComponent(req.url.split('/socket/')[1] || "匿名粉丝");
     clients.set(ws, nickname);
 
-    // --- 核心：新用户连接时，读取本地文件并发送历史记录 ---
+    // 新用户连接时，发送历史记录
     try {
         const data = fs.readFileSync(historyFile, 'utf8');
         const history = JSON.parse(data);
-        // 只发送最近的 50 条，防止加载太慢
         const recentHistory = history.slice(-50);
         ws.send(JSON.stringify({ type: 'history', data: recentHistory }));
     } catch (err) {
@@ -42,12 +50,11 @@ wss.on('connection', (ws, req) => {
             const data = JSON.parse(message);
             const msgObj = { type: 'message', ...data };
 
-            // --- 核心：将新消息追加到本地文件中 ---
+            // 将新消息追加到本地文件中
             const fileData = fs.readFileSync(historyFile, 'utf8');
             const history = JSON.parse(fileData);
             history.push(data);
             
-            // 限制文件大小，只保留最近 1000 条，防止硬盘撑爆
             if (history.length > 1000) history.shift();
             
             fs.writeFileSync(historyFile, JSON.stringify(history));
@@ -77,5 +84,5 @@ function broadcastUserList() {
 }
 
 server.listen(port, () => {
-    console.log(`✅ 聊天服务器已启动，历史记录将保存在本地文件`);
+    console.log(`✅ 聊天服务器已启动，历史记录将保存在: ${historyFile}`);
 });
