@@ -10,11 +10,10 @@ const { AzureOpenAI } = require('openai');
 // 1. 初始化 Express App (处理 HTTP API)
 // ==========================================
 const app = express();
-app.use(cors()); // 允许跨域请求
-app.use(express.json()); // 解析 JSON 格式的请求体
+app.use(cors());
+app.use(express.json());
 
 // --- 从环境变量获取 GPT-5.5 配置 ---
-// 这样可以确保你的密钥不会暴露在 GitHub 上
 const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
 const apiKey = process.env.AZURE_OPENAI_KEY; 
 const apiVersion = "2024-12-01-preview";
@@ -24,15 +23,16 @@ let openaiClient = null;
 if (endpoint && apiKey) {
     openaiClient = new AzureOpenAI({ endpoint, apiKey, apiVersion, deployment });
 } else {
-    console.warn("⚠️ 警告: 未检测到 AZURE_OPENAI_ENDPOINT 或 AZURE_OPENAI_KEY 环境变量，AI 功能将无法正常工作！");
+    console.warn("⚠️ 警告: 未检测到 AZURE_OPENAI_ENDPOINT 或 AZURE_OPENAI_KEY 环境变量！");
 }
 
-// 测试路由
-app.get('/', (req, res) => {
-    res.send("TuoTuo Server is running (WebSocket + AI API)!");
-});
+// ----------------------------------------------------
+// 🌟 新增：简单的内存会话管理器 (用于实现多回合对话记忆)
+// 注意：如果服务器重启，这些内存中的对话历史会丢失。
+// ----------------------------------------------------
+const sessions = new Map();
 
-// AI 聊天接口
+// AI 聊天接口 (升级为多回合对话版)
 app.post('/api/ai-chat', async (req, res) => {
     if (!openaiClient) {
         return res.status(500).json({ error: '后端未配置正确的 AI 密钥，请检查 Azure 环境变量。' });
@@ -40,22 +40,59 @@ app.post('/api/ai-chat', async (req, res) => {
 
     try {
         const userMessage = req.body.message;
-        
+        // 简单起见，我们暂时用一个固定的 session ID（例如 'default_user'）
+        // 如果你需要区分不同用户，可以要求前端在发请求时带上用户的 nickname
+        const sessionId = req.body.sessionId || 'default_user';
+
+        // 1. 获取或初始化这个用户的对话历史
+        if (!sessions.has(sessionId)) {
+            sessions.set(sessionId, [
+                { role: "system", content: "你是一个友好的AI助手，现在部署在TuoTuo的个人网站上。你的回答应该专业、友好且富有同理心。" }
+            ]);
+        }
+        const chatHistory = sessions.get(sessionId);
+
+        // 2. 把用户的新消息加入历史记录
+        chatHistory.push({ role: "user", content: userMessage });
+
+        // 为了防止上下文过长导致超出 Token 限制，我们只保留最近的 10 条对话 (5组问答)
+        // 注意要始终保留第一条 system prompt
+        if (chatHistory.length > 11) {
+            // 删除掉最老的两条 (一问一答)，保留最新的
+            chatHistory.splice(1, 2);
+        }
+
+        // 3. 把包含历史记录的完整数组发给大模型
         const result = await openaiClient.chat.completions.create({
-            messages: [
-                { role: "system", content: "你是一个友好的AI助手，现在部署在TuoTuo的个人网站上。你的回答应该专业、友好且富有同理心。" },
-                { role: "user", content: userMessage }
-            ],
+            messages: chatHistory,
             model: deployment,
         });
 
-        res.json({ reply: result.choices[0].message.content });
+        const aiReply = result.choices[0].message.content;
+
+        // 4. 把 AI 的回复也加入历史记录，完成这回合的记忆
+        chatHistory.push({ role: "assistant", content: aiReply });
+
+        res.json({ reply: aiReply });
     } catch (error) {
-        console.error("AI 接口报错:", error);
-        res.status(500).json({ error: 'AI 思考时出错了，请稍后再试~' });
+        console.error("🔥 AI 接口详细报错:", error);
+        
+        let errorMessage = 'AI 思考时出错了，请稍后再试~';
+        if (error.response && error.response.data && error.response.data.error) {
+            errorMessage = `Azure API 报错: ${error.response.data.error.message || JSON.stringify(error.response.data.error)}`;
+        } else if (error.message) {
+            errorMessage = `后端报错: ${error.message}`;
+        }
+        
+        res.status(500).json({ error: errorMessage });
     }
 });
 
+
+// 测试路由
+app.get('/', (req, res) => {
+    res.send("TuoTuo Server is running (Multi-turn AI enabled)!");
+});
 
 // ==========================================
 // 2. 将 Express 挂载到 HTTP Server
@@ -63,23 +100,16 @@ app.post('/api/ai-chat', async (req, res) => {
 const server = http.createServer(app);
 const port = process.env.PORT || 8888;
 
-
 // ==========================================
-// 3. WebSocket 逻辑 (升级为持久化存储)
+// 3. WebSocket 逻辑 (持久化存储版)
 // ==========================================
-// 动态获取 Azure 的持久化根目录 (Linux通常是 /home, Windows通常是 D:\home)
-// 如果不在 Azure 环境，则回退到当前代码目录 __dirname
 const homeDir = process.env.HOME || process.env.HOMEDRIVE + process.env.HOMEPATH || __dirname;
-
-// 推荐将数据文件放在 home 目录下的 data 文件夹中
 const dataDir = path.join(homeDir, 'data');
 
-// 如果 data 文件夹不存在，先创建它
 if (!fs.existsSync(dataDir)) {
     fs.mkdirSync(dataDir, { recursive: true });
 }
 
-// 现在将聊天记录保存在持久化目录中
 const historyFile = path.join(dataDir, 'chat_history.json');
 
 if (!fs.existsSync(historyFile)) {
