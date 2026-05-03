@@ -2,38 +2,84 @@ const WebSocket = require('ws');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const express = require('express');
+const cors = require('cors');
+const { AzureOpenAI } = require('openai');
 
-// 【修复3：Azure 上的持久化存储目录必须是 /home，否则没有写入权限会导致服务器崩溃】
-const isAzure = process.env.WEBSITE_SITE_NAME !== undefined;
-const dataDir = isAzure ? '/home/data' : __dirname;
+// ==========================================
+// 1. 初始化 Express App (处理 HTTP API)
+// ==========================================
+const app = express();
+app.use(cors()); // 允许跨域请求
+app.use(express.json()); // 解析 JSON 格式的请求体
 
-// 确保数据目录存在
-if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true });
+// --- 从环境变量获取 GPT-5.5 配置 ---
+// 这样可以确保你的密钥不会暴露在 GitHub 上
+const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
+const apiKey = process.env.AZURE_OPENAI_KEY; 
+const apiVersion = "2024-12-01-preview";
+const deployment = "gpt-5.5";
+
+let openaiClient = null;
+if (endpoint && apiKey) {
+    openaiClient = new AzureOpenAI({ endpoint, apiKey, apiVersion, deployment });
+} else {
+    console.warn("⚠️ 警告: 未检测到 AZURE_OPENAI_ENDPOINT 或 AZURE_OPENAI_KEY 环境变量，AI 功能将无法正常工作！");
 }
 
-const historyFile = path.join(dataDir, 'chat_history.json');
+// 测试路由
+app.get('/', (req, res) => {
+    res.send("TuoTuo Server is running (WebSocket + AI API)!");
+});
 
-// 初始化：如果文件不存在，创建一个空的
+// AI 聊天接口
+app.post('/api/ai-chat', async (req, res) => {
+    if (!openaiClient) {
+        return res.status(500).json({ error: '后端未配置正确的 AI 密钥，请检查 Azure 环境变量。' });
+    }
+
+    try {
+        const userMessage = req.body.message;
+        
+        const result = await openaiClient.chat.completions.create({
+            messages: [
+                { role: "system", content: "你是一个友好的AI助手，现在部署在TuoTuo的个人网站上。你的回答应该专业、友好且富有同理心。" },
+                { role: "user", content: userMessage }
+            ],
+            model: deployment,
+        });
+
+        res.json({ reply: result.choices[0].message.content });
+    } catch (error) {
+        console.error("AI 接口报错:", error);
+        res.status(500).json({ error: 'AI 思考时出错了，请稍后再试~' });
+    }
+});
+
+
+// ==========================================
+// 2. 将 Express 挂载到 HTTP Server
+// ==========================================
+const server = http.createServer(app);
+const port = process.env.PORT || 8888;
+
+
+// ==========================================
+// 3. WebSocket 逻辑 (保持你原来的代码不变)
+// ==========================================
+const historyFile = path.join(__dirname, 'chat_history.json');
+
 if (!fs.existsSync(historyFile)) {
     fs.writeFileSync(historyFile, JSON.stringify([]));
 }
-
-const port = process.env.PORT || 8888;
-const server = http.createServer((req, res) => {
-    res.writeHead(200);
-    res.end("TuoTuo Chat Server is running beautifully on Azure!");
-});
 
 const wss = new WebSocket.Server({ server });
 let clients = new Map();
 
 wss.on('connection', (ws, req) => {
-    // 配合前端的 encodeURIComponent，这里使用 decodeURIComponent 解析中文昵称
     const nickname = decodeURIComponent(req.url.split('/socket/')[1] || "匿名粉丝");
     clients.set(ws, nickname);
 
-    // 新用户连接时，发送历史记录
     try {
         const data = fs.readFileSync(historyFile, 'utf8');
         const history = JSON.parse(data);
@@ -50,7 +96,6 @@ wss.on('connection', (ws, req) => {
             const data = JSON.parse(message);
             const msgObj = { type: 'message', ...data };
 
-            // 将新消息追加到本地文件中
             const fileData = fs.readFileSync(historyFile, 'utf8');
             const history = JSON.parse(fileData);
             history.push(data);
@@ -59,7 +104,6 @@ wss.on('connection', (ws, req) => {
             
             fs.writeFileSync(historyFile, JSON.stringify(history));
 
-            // 转发给所有人
             broadcast(JSON.stringify(msgObj));
         } catch (e) {
             console.error("处理消息失败");
@@ -83,6 +127,7 @@ function broadcastUserList() {
     broadcast(JSON.stringify({ type: 'userlist', data: userList }));
 }
 
+// 启动服务器
 server.listen(port, () => {
-    console.log(`✅ 聊天服务器已启动，历史记录将保存在: ${historyFile}`);
+    console.log(`✅ 服务器已启动，端口 ${port}。支持 WebSocket 和 HTTP API。`);
 });
