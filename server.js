@@ -47,7 +47,7 @@ app.post('/api/ai-chat', async (req, res) => {
         // 1. 获取或初始化这个用户的对话历史
         if (!sessions.has(sessionId)) {
             sessions.set(sessionId, [
-                { role: "system", content: "你是一个友好的AI助手，现在部署在TuoTuo的个人网站上。你的回答应该专业、友好且富有同理心。" }
+                { role: "system", content: "你叫TuoTuo，是一个全能型的 AI 助手，你被赋予的模拟性格是一个可爱又有点调皮的女孩子，你将帮助大家解决任何困难。" }
             ]);
         }
         const chatHistory = sessions.get(sessionId);
