@@ -143,8 +143,24 @@ function trimChatHistory(chatHistory) {
     }
 }
 
-function buildUserContent(userMessage, base64Image) {
-    if (base64Image) {
+// ✨ 升级：支持将多张图片拼接给大模型
+function buildUserContent(userMessage, images) {
+    if (images && Array.isArray(images) && images.length > 0) {
+        const content = [
+            {
+                type: "text",
+                text: userMessage || "请仔细看看这些图片，并描述一下里面的内容。"
+            }
+        ];
+        images.forEach(img => {
+            content.push({
+                type: "image_url",
+                image_url: { url: img }
+            });
+        });
+        return content;
+    } else if (typeof images === 'string') {
+        // 兼容旧版的单张图模式
         return [
             {
                 type: "text",
@@ -152,9 +168,7 @@ function buildUserContent(userMessage, base64Image) {
             },
             {
                 type: "image_url",
-                image_url: {
-                    url: base64Image
-                }
+                image_url: { url: images }
             }
         ];
     }
@@ -201,10 +215,11 @@ function sendSSEDone(res) {
 async function handleNormalAIChat(req, res) {
     const userMessage = req.body.message;
     const sessionId = req.body.sessionId || 'default_user';
-    const base64Image = req.body.image;
+    // ✨ 支持多图片接收
+    const imagesArray = req.body.images || req.body.image;
 
     const chatHistory = getOrCreateSession(sessionId);
-    const formattedContent = buildUserContent(userMessage, base64Image);
+    const formattedContent = buildUserContent(userMessage, imagesArray);
 
     chatHistory.push({
         role: "user",
@@ -289,10 +304,11 @@ async function handleStreamingAIChat(req, res) {
 
     const userMessage = req.body.message;
     const sessionId = req.body.sessionId || 'default_user';
-    const base64Image = req.body.image;
+    // ✨ 支持多图片接收
+    const imagesArray = req.body.images || req.body.image;
 
     const chatHistory = getOrCreateSession(sessionId);
-    const formattedContent = buildUserContent(userMessage, base64Image);
+    const formattedContent = buildUserContent(userMessage, imagesArray);
 
     chatHistory.push({
         role: "user",
