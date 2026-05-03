@@ -65,9 +65,22 @@ const port = process.env.PORT || 8888;
 
 
 // ==========================================
-// 3. WebSocket 逻辑 (保持你原来的代码不变)
+// 3. WebSocket 逻辑 (升级为持久化存储)
 // ==========================================
-const historyFile = path.join(__dirname, 'chat_history.json');
+// 动态获取 Azure 的持久化根目录 (Linux通常是 /home, Windows通常是 D:\home)
+// 如果不在 Azure 环境，则回退到当前代码目录 __dirname
+const homeDir = process.env.HOME || process.env.HOMEDRIVE + process.env.HOMEPATH || __dirname;
+
+// 推荐将数据文件放在 home 目录下的 data 文件夹中
+const dataDir = path.join(homeDir, 'data');
+
+// 如果 data 文件夹不存在，先创建它
+if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+}
+
+// 现在将聊天记录保存在持久化目录中
+const historyFile = path.join(dataDir, 'chat_history.json');
 
 if (!fs.existsSync(historyFile)) {
     fs.writeFileSync(historyFile, JSON.stringify([]));
