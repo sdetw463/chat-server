@@ -225,37 +225,66 @@ app.post('/api/ai-chat', async (req, res) => {
 });
 
 // ==========================================
-// ✨ AI 画图独立接口 (gpt-image-2)
+// ✨ AI 画图独立接口 (gpt-image-2 纯原生直连版)
 // ==========================================
 app.post('/api/ai-image', async (req, res) => {
-    if (!openaiImageClient) return res.status(500).json({ error: '后端未配置正确的画图模型密钥。' });
-
     try {
         const prompt = req.body.prompt;
         if (!prompt) return res.status(400).json({ error: '必须告诉 TuoTuo 你想画什么哦！' });
 
-        // 使用专门的画图客户端调用最新模型
-        const result = await openaiImageClient.images.generate({
-            model: imageDeployment, 
-            prompt: prompt,
-            n: 1,
-            size: "1024x1024"
+        console.log(`🎨 TuoTuo 正在后台努力画图: ${prompt}`);
+
+        // 提取环境变量
+        const targetEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || endpoint;
+        const targetKey = process.env.AZURE_OPENAI_IMAGE_KEY || apiKey;
+        
+        // 完全复刻你截图中官方给的请求地址
+        const url = `${targetEndpoint.replace(/\/$/, '')}/openai/deployments/gpt-image-2/images/generations?api-version=2024-02-01`;
+
+        // 绕过 SDK，使用最底层的原生 fetch 强行按照官方格式发请求
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'api-key': targetKey
+            },
+            body: JSON.stringify({
+                prompt: prompt,
+                size: "1024x1024",
+                quality: "low",
+                output_compression: 100,
+                output_format: "png", // 完美契合截图里的要求
+                n: 1
+            })
         });
 
-        const imageUrl = result.data[0].url;
-        const revisedPrompt = result.data[0].revised_prompt || prompt;
+        // 如果 Azure 拒绝了我们，立刻抛出错误，不要干等
+        if (!response.ok) {
+            const errText = await response.text();
+            console.error("🔥 Azure 返回了错误:", errText);
+            throw new Error(`Azure 拒绝了请求 (${response.status})，可能模型还没准备好`);
+        }
+
+        const data = await response.json();
+        
+        let imageUrl = '';
+        // 优先解析官方 curl 里指定的 b64_json，如果没有再找 url
+        if (data.data && data.data[0].b64_json) {
+            imageUrl = 'data:image/png;base64,' + data.data[0].b64_json;
+        } else if (data.data && data.data[0].url) {
+            imageUrl = data.data[0].url;
+        } else {
+            throw new Error("模型没有返回有效的图片数据");
+        }
+
+        // 获取模型优化后的提示词
+        const revisedPrompt = data.data[0].revised_prompt || prompt;
 
         res.json({ url: imageUrl, revised_prompt: revisedPrompt });
 
     } catch (error) {
-        console.error("🔥 AI 画图接口报错:", error);
-        let errorMessage = 'AI 画家开小差了，请稍后再试~';
-        if (error.response && error.response.data && error.response.data.error) {
-            errorMessage = error.response.data.error.message;
-        } else if (error.message) {
-            errorMessage = error.message;
-        }
-        res.status(500).json({ error: errorMessage });
+        console.error("🔥 AI 画图接口崩溃:", error);
+        res.status(500).json({ error: error.message || 'AI 画家开小差了，请稍后再试~' });
     }
 });
 
