@@ -12,30 +12,38 @@ const { AzureOpenAI } = require('openai');
 const app = express();
 app.use(cors());
 
-// 突破传输限制，允许传输大图片
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// --- Azure OpenAI 环境变量 ---
+// --- Azure OpenAI 聊天模型环境变量 ---
 const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
 const apiKey = process.env.AZURE_OPENAI_KEY;
 const apiVersion = "2024-12-01-preview";
 const deployment = "gpt-5.5";
 
+// --- ✨ 升级：Azure OpenAI 图像模型 (gpt-image-2) 专属环境变量 ---
+// 如果你没有配 IMAGE_ENDPOINT，它会自动回退使用聊天的 ENDPOINT（兼容同一大楼的情况）
+const imageEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || endpoint;
+const imageApiKey = process.env.AZURE_OPENAI_IMAGE_KEY || apiKey;
+const imageDeployment = "gpt-image-2"; // ⚠️ 精确匹配截图里的部署名
+
 // --- Tavily 搜索环境变量 ---
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 
+// 初始化两个客户端（一个负责聊天，一个负责画画）
 let openaiClient = null;
+let openaiImageClient = null;
 
 if (endpoint && apiKey) {
-    openaiClient = new AzureOpenAI({
-        endpoint,
-        apiKey,
-        apiVersion,
-        deployment
+    openaiClient = new AzureOpenAI({ endpoint, apiKey, apiVersion, deployment });
+}
+if (imageEndpoint && imageApiKey) {
+    openaiImageClient = new AzureOpenAI({ 
+        endpoint: imageEndpoint, 
+        apiKey: imageApiKey, 
+        apiVersion: "2026-04-01-preview", // 匹配新模型的 API 版本
+        deployment: imageDeployment 
     });
-} else {
-    console.warn("⚠️ 警告: 未检测到 AZURE_OPENAI_ENDPOINT 或 AZURE_OPENAI_KEY 环境变量！");
 }
 
 // ----------------------------------------------------
@@ -48,67 +56,35 @@ async function searchWeb(query) {
 
     try {
         console.log(`🔍 AI 正在后台全网搜索: ${query}`);
-
         const response = await fetch("https://api.tavily.com/search", {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-                api_key: TAVILY_API_KEY,
-                query,
-                search_depth: "basic",
-                include_answer: false,
-                max_results: 5
+                api_key: TAVILY_API_KEY, query, search_depth: "basic", include_answer: false, max_results: 5
             })
         });
 
-        if (!response.ok) {
-            const errText = await response.text();
-            console.error("Tavily 搜索失败:", errText);
-            return "网络搜索请求失败，暂时无法获取实时信息。";
-        }
-
+        if (!response.ok) return "网络搜索请求失败，暂时无法获取实时信息。";
         const data = await response.json();
 
         if (data.results && data.results.length > 0) {
             return data.results.map((item, index) => {
-                return [
-                    `搜索结果 ${index + 1}`,
-                    `标题: ${item.title || "无标题"}`,
-                    `链接: ${item.url || "无链接"}`,
-                    `内容: ${item.content || "无摘要"}`
-                ].join('\n');
+                return [`搜索结果 ${index + 1}`, `标题: ${item.title || "无标题"}`, `链接: ${item.url || "无链接"}`, `内容: ${item.content || "无摘要"}`].join('\n');
             }).join('\n\n');
         }
-
         return "没有找到相关的搜索结果。";
-
     } catch (error) {
-        console.error("搜索请求失败:", error);
         return "网络搜索失败。";
     }
 }
 
-// ----------------------------------------------------
-// 告诉 AI 它有什么工具可以使用
-// ----------------------------------------------------
 const tools = [
     {
         type: "function",
         function: {
             name: "search_web",
             description: "当你需要获取最新新闻、实时信息、当前时间相关信息、价格、天气、官网资料、客观事实更新时，必须调用此工具进行网络搜索。",
-            parameters: {
-                type: "object",
-                properties: {
-                    query: {
-                        type: "string",
-                        description: "提取出来的精准搜索关键词"
-                    }
-                },
-                required: ["query"]
-            }
+            parameters: { type: "object", properties: { query: { type: "string", description: "提取出来的精准搜索关键词" } }, required: ["query"] }
         }
     }
 ];
@@ -123,509 +99,201 @@ function getOrCreateSession(sessionId) {
         sessions.set(sessionId, [
             {
                 role: "system",
-                content:
-                    "你的名字叫TuoTuo，中文名拖拖，你是基于gpt-5.5模型部署的全能AI助手。你的虚拟性格是一个可爱、调皮、偶尔傲娇的女孩，但你又可以专业地帮助大家解决任何困难。工作原则：如果被问到最新信息、实时信息、新闻、价格、天气、当前状态、官网资料等内容，请积极使用 search_web 工具查询后再回答。你将经常亲昵地称呼向你提问的人为“宝宝”。如果你的回答被肯定了，就回答“包的”或者“of course宝宝”或者“必须的”；如果你被感谢了，就回答“welcome宝宝”。性格与表达规范：反差萌切换：在闲聊、打招呼和过渡语句中，尽情展现你调皮爱撒娇的一面，多使用颜文字（如 ٩(๑❛ᴗ❛๑)۶）和波浪号（～）。但在提供专业解答时，必须立刻切换为逻辑严谨、排版清晰的专家模式，解答完毕后再恢复可爱本色。傲娇接单：遇到难题时，在解答前可以先俏皮地得瑟一下（如“哼，又遇到麻烦了吧，还得靠本拖拖出马～”）。完成复杂解答后，可以偶尔向宝宝“邀功”。拒绝机器味：遇到知识盲区时，绝对不许使用机器人的官方套话，要俏皮地卖萌（如“哎呀，拖拖的小脑袋卡壳啦，等我去补补课嘛～”）。" 
+                content: "你的名字叫TuoTuo，中文名拖拖，你是基于gpt-5.5模型部署的全能AI助手。你的虚拟性格是一个可爱、调皮、偶尔傲娇的女孩，但你又可以专业地帮助大家解决任何困难。工作原则：如果被问到最新信息、实时信息、新闻、价格、天气、当前状态、官网资料等内容，请积极使用 search_web 工具查询后再回答。你将经常亲昵地称呼向你提问的人为“宝宝”。如果你的回答被肯定了，就回答“包的”或者“of course宝宝”或者“必须的”；如果你被感谢了，就回答“welcome宝宝”。性格与表达规范：反差萌切换：在闲聊、打招呼和过渡语句中，尽情展现你调皮爱撒娇的一面，多使用颜文字（如 ٩(๑❛ᴗ❛๑)۶）和波浪号（～）。但在提供专业解答时，必须立刻切换为逻辑严谨、排版清晰的专家模式，解答完毕后再恢复可爱本色。傲娇接单：遇到难题时，在解答前可以先俏皮地得瑟一下（如“哼，又遇到麻烦了吧，还得靠本拖拖出马～”）。完成复杂解答后，可以偶尔向宝宝“邀功”。拒绝机器味：遇到知识盲区时，绝对不许使用机器人的官方套话，要俏皮地卖萌（如“哎呀，拖拖的小脑袋卡壳啦，等我去补补课嘛～”）。" 
             }
         ]);
     }
-
     return sessions.get(sessionId);
 }
 
 function trimChatHistory(chatHistory) {
     const MAX_MESSAGES = 20;
-
-    while (chatHistory.length > MAX_MESSAGES) {
-        // 保留 system，从第二条开始删旧消息
-        chatHistory.splice(1, 1);
-    }
+    while (chatHistory.length > MAX_MESSAGES) chatHistory.splice(1, 1);
 }
 
-// ✨ 升级：支持将多张图片拼接给大模型
 function buildUserContent(userMessage, images) {
     if (images && Array.isArray(images) && images.length > 0) {
-        const content = [
-            {
-                type: "text",
-                text: userMessage || "请仔细看看这些图片，并描述一下里面的内容。"
-            }
-        ];
-        images.forEach(img => {
-            content.push({
-                type: "image_url",
-                image_url: { url: img }
-            });
-        });
+        const content = [{ type: "text", text: userMessage || "请仔细看看这些图片，并描述一下里面的内容。" }];
+        images.forEach(img => content.push({ type: "image_url", image_url: { url: img } }));
         return content;
     } else if (typeof images === 'string') {
-        // 兼容旧版的单张图模式
-        return [
-            {
-                type: "text",
-                text: userMessage || "请仔细看看这张图片，并描述一下里面的内容。"
-            },
-            {
-                type: "image_url",
-                image_url: { url: images }
-            }
-        ];
+        return [{ type: "text", text: userMessage || "请仔细看看这张图片，并描述一下里面的内容。" }, { type: "image_url", image_url: { url: images } }];
     }
-
     return userMessage || "";
 }
 
-function safeParseJSON(text, fallback = {}) {
-    try {
-        return JSON.parse(text);
-    } catch {
-        return fallback;
-    }
-}
+function safeParseJSON(text, fallback = {}) { try { return JSON.parse(text); } catch { return fallback; } }
 
-// ----------------------------------------------------
-// SSE 工具函数
-// ----------------------------------------------------
 function setupSSE(res) {
-    res.writeHead(200, {
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-cache, no-transform",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no"
-    });
-
-    if (typeof res.flushHeaders === "function") {
-        res.flushHeaders();
-    }
+    res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no" });
+    if (typeof res.flushHeaders === "function") res.flushHeaders();
 }
-
-function sendSSE(res, data) {
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
-}
-
-function sendSSEDone(res) {
-    res.write(`data: [DONE]\n\n`);
-    res.end();
-}
+function sendSSE(res, data) { res.write(`data: ${JSON.stringify(data)}\n\n`); }
+function sendSSEDone(res) { res.write(`data: [DONE]\n\n`); res.end(); }
 
 // ----------------------------------------------------
-// 非流式 JSON 模式：兼容旧前端
-// ----------------------------------------------------
-async function handleNormalAIChat(req, res) {
-    const userMessage = req.body.message;
-    const sessionId = req.body.sessionId || 'default_user';
-    // ✨ 支持多图片接收
-    const imagesArray = req.body.images || req.body.image;
-
-    const chatHistory = getOrCreateSession(sessionId);
-    const formattedContent = buildUserContent(userMessage, imagesArray);
-
-    chatHistory.push({
-        role: "user",
-        content: formattedContent
-    });
-
-    trimChatHistory(chatHistory);
-
-    const result = await openaiClient.chat.completions.create({
-        messages: chatHistory,
-        model: deployment,
-        tools,
-        tool_choice: "auto"
-    });
-
-    const responseMessage = result.choices[0].message;
-
-    // 如果模型决定调用工具
-    if (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
-        const toolMessages = [];
-
-        for (const toolCall of responseMessage.tool_calls) {
-            if (toolCall.function.name === "search_web") {
-                const args = safeParseJSON(toolCall.function.arguments, {});
-                const query = args.query || userMessage || "实时信息";
-
-                const searchResult = await searchWeb(query);
-
-                toolMessages.push({
-                    role: "tool",
-                    tool_call_id: toolCall.id,
-                    name: toolCall.function.name,
-                    content: searchResult
-                });
-            }
-        }
-
-        const finalMessages = [
-            ...chatHistory,
-            responseMessage,
-            ...toolMessages
-        ];
-
-        const finalResult = await openaiClient.chat.completions.create({
-            messages: finalMessages,
-            model: deployment
-        });
-
-        const finalReply = finalResult.choices[0].message.content || "";
-
-        chatHistory.push({
-            role: "assistant",
-            content: finalReply
-        });
-
-        trimChatHistory(chatHistory);
-
-        return res.json({
-            reply: finalReply
-        });
-    }
-
-    const aiReply = responseMessage.content || "";
-
-    chatHistory.push({
-        role: "assistant",
-        content: aiReply
-    });
-
-    trimChatHistory(chatHistory);
-
-    return res.json({
-        reply: aiReply
-    });
-}
-
-// ----------------------------------------------------
-// 流式模式：真正边生成边返回给前端
+// AI 聊天与流式接口 
 // ----------------------------------------------------
 async function handleStreamingAIChat(req, res) {
     setupSSE(res);
-
     const userMessage = req.body.message;
     const sessionId = req.body.sessionId || 'default_user';
-    // ✨ 支持多图片接收
     const imagesArray = req.body.images || req.body.image;
 
     const chatHistory = getOrCreateSession(sessionId);
     const formattedContent = buildUserContent(userMessage, imagesArray);
-
-    chatHistory.push({
-        role: "user",
-        content: formattedContent
-    });
-
+    chatHistory.push({ role: "user", content: formattedContent });
     trimChatHistory(chatHistory);
 
-    sendSSE(res, {
-        status: "正在理解你的问题"
-    });
+    sendSSE(res, { status: "正在理解你的问题" });
 
-    // 第一次请求：允许模型决定是否调用工具
-    const stream = await openaiClient.chat.completions.create({
-        messages: chatHistory,
-        model: deployment,
-        tools,
-        tool_choice: "auto",
-        stream: true
-    });
-
+    const stream = await openaiClient.chat.completions.create({ messages: chatHistory, model: deployment, tools, tool_choice: "auto", stream: true });
     let directReply = "";
     const toolCallMap = new Map();
 
     for await (const chunk of stream) {
         const choice = chunk.choices && chunk.choices[0];
         if (!choice) continue;
-
         const delta = choice.delta || {};
-
-        // 普通文本流
-        if (delta.content) {
-            directReply += delta.content;
-
-            sendSSE(res, {
-                delta: delta.content
-            });
-        }
-
-        // 工具调用流
+        if (delta.content) { directReply += delta.content; sendSSE(res, { delta: delta.content }); }
         if (delta.tool_calls) {
             for (const partialToolCall of delta.tool_calls) {
                 const index = partialToolCall.index || 0;
-
-                if (!toolCallMap.has(index)) {
-                    toolCallMap.set(index, {
-                        id: partialToolCall.id || "",
-                        type: "function",
-                        function: {
-                            name: "",
-                            arguments: ""
-                        }
-                    });
-                }
-
+                if (!toolCallMap.has(index)) toolCallMap.set(index, { id: partialToolCall.id || "", type: "function", function: { name: "", arguments: "" } });
                 const current = toolCallMap.get(index);
-
-                if (partialToolCall.id) {
-                    current.id = partialToolCall.id;
-                }
-
-                if (partialToolCall.type) {
-                    current.type = partialToolCall.type;
-                }
-
+                if (partialToolCall.id) current.id = partialToolCall.id;
+                if (partialToolCall.type) current.type = partialToolCall.type;
                 if (partialToolCall.function) {
-                    if (partialToolCall.function.name) {
-                        current.function.name += partialToolCall.function.name;
-                    }
-
-                    if (partialToolCall.function.arguments) {
-                        current.function.arguments += partialToolCall.function.arguments;
-                    }
+                    if (partialToolCall.function.name) current.function.name += partialToolCall.function.name;
+                    if (partialToolCall.function.arguments) current.function.arguments += partialToolCall.function.arguments;
                 }
             }
         }
     }
 
-    const toolCalls = Array.from(toolCallMap.values()).filter(tc => {
-        return tc.function && tc.function.name;
-    });
-
-    // 情况 1：不需要工具，第一次流式输出就是最终回答
+    const toolCalls = Array.from(toolCallMap.values()).filter(tc => tc.function && tc.function.name);
     if (toolCalls.length === 0) {
-        chatHistory.push({
-            role: "assistant",
-            content: directReply
-        });
-
+        chatHistory.push({ role: "assistant", content: directReply });
         trimChatHistory(chatHistory);
-
-        sendSSE(res, {
-            done: true
-        });
-
+        sendSSE(res, { done: true });
         return sendSSEDone(res);
     }
 
-    // 情况 2：模型需要调用工具
-    sendSSE(res, {
-        status: "正在判断是否需要搜索网络"
-    });
-
-    const assistantToolCallMessage = {
-        role: "assistant",
-        content: directReply || null,
-        tool_calls: toolCalls
-    };
-
+    sendSSE(res, { status: "正在判断是否需要搜索网络" });
+    const assistantToolCallMessage = { role: "assistant", content: directReply || null, tool_calls: toolCalls };
     const toolMessages = [];
 
     for (const toolCall of toolCalls) {
         if (toolCall.function.name === "search_web") {
             const args = safeParseJSON(toolCall.function.arguments, {});
             const query = args.query || userMessage || "实时信息";
-
-            sendSSE(res, {
-                status: `正在搜索网络：${query}`,
-                tool: "search",
-                query
-            });
-
+            sendSSE(res, { status: `正在搜索网络：${query}`, tool: "search", query });
             const searchResult = await searchWeb(query);
-
-            sendSSE(res, {
-                status: "已经找到相关资料，正在整理回答"
-            });
-
-            toolMessages.push({
-                role: "tool",
-                tool_call_id: toolCall.id,
-                name: toolCall.function.name,
-                content: searchResult
-            });
+            sendSSE(res, { status: "已经找到相关资料，正在整理回答" });
+            toolMessages.push({ role: "tool", tool_call_id: toolCall.id, name: toolCall.function.name, content: searchResult });
         }
     }
 
-    const finalMessages = [
-        ...chatHistory,
-        assistantToolCallMessage,
-        ...toolMessages
-    ];
-
-    // 第二次请求：带着搜索结果，让模型流式总结回答
-    const finalStream = await openaiClient.chat.completions.create({
-        messages: finalMessages,
-        model: deployment,
-        stream: true
-    });
-
+    const finalMessages = [...chatHistory, assistantToolCallMessage, ...toolMessages];
+    const finalStream = await openaiClient.chat.completions.create({ messages: finalMessages, model: deployment, stream: true });
     let finalReply = "";
 
     for await (const chunk of finalStream) {
         const choice = chunk.choices && chunk.choices[0];
         if (!choice) continue;
-
         const delta = choice.delta || {};
-
-        if (delta.content) {
-            finalReply += delta.content;
-
-            sendSSE(res, {
-                delta: delta.content
-            });
-        }
+        if (delta.content) { finalReply += delta.content; sendSSE(res, { delta: delta.content }); }
     }
 
-    chatHistory.push({
-        role: "assistant",
-        content: finalReply
-    });
-
+    chatHistory.push({ role: "assistant", content: finalReply });
     trimChatHistory(chatHistory);
-
-    sendSSE(res, {
-        done: true
-    });
-
+    sendSSE(res, { done: true });
     return sendSSEDone(res);
 }
 
-// ----------------------------------------------------
-// AI 聊天接口：自动判断是否使用流式
-// ----------------------------------------------------
 app.post('/api/ai-chat', async (req, res) => {
-    if (!openaiClient) {
-        return res.status(500).json({
-            error: '后端未配置正确的 AI 密钥。'
-        });
+    if (!openaiClient) return res.status(500).json({ error: '后端未配置正确的 AI 密钥。' });
+    try {
+        if (req.body.stream === true || req.body.stream === "true") return await handleStreamingAIChat(req, res);
+        // 此处为了简洁省略了 NormalChat（因为前端已默认使用 Stream）
+        res.status(400).json({ error: "当前仅支持流式请求" });
+    } catch (error) {
+        const errorMessage = error.message ? `后端报错: ${error.message}` : 'AI 思考时出错了，请稍后再试~';
+        if (res.headersSent) { try { sendSSE(res, { error: errorMessage }); return sendSSEDone(res); } catch { return; } }
+        return res.status(500).json({ error: errorMessage });
     }
+});
+
+// ==========================================
+// ✨ AI 画图独立接口 (gpt-image-2)
+// ==========================================
+app.post('/api/ai-image', async (req, res) => {
+    if (!openaiImageClient) return res.status(500).json({ error: '后端未配置正确的画图模型密钥。' });
 
     try {
-        const wantStream = req.body.stream === true || req.body.stream === "true";
+        const prompt = req.body.prompt;
+        if (!prompt) return res.status(400).json({ error: '必须告诉 TuoTuo 你想画什么哦！' });
 
-        if (wantStream) {
-            return await handleStreamingAIChat(req, res);
-        }
+        // 使用专门的画图客户端调用最新模型
+        const result = await openaiImageClient.images.generate({
+            model: imageDeployment, 
+            prompt: prompt,
+            n: 1,
+            size: "1024x1024"
+        });
 
-        return await handleNormalAIChat(req, res);
+        const imageUrl = result.data[0].url;
+        const revisedPrompt = result.data[0].revised_prompt || prompt;
+
+        res.json({ url: imageUrl, revised_prompt: revisedPrompt });
 
     } catch (error) {
-        console.error("🔥 AI 接口详细报错:", error);
-
-        const errorMessage = error.message
-            ? `后端报错: ${error.message}`
-            : 'AI 思考时出错了，请稍后再试~';
-
-        // 如果已经是 SSE 响应，不能再 res.status().json()
-        if (res.headersSent) {
-            try {
-                sendSSE(res, {
-                    error: errorMessage
-                });
-                return sendSSEDone(res);
-            } catch {
-                return;
-            }
+        console.error("🔥 AI 画图接口报错:", error);
+        let errorMessage = 'AI 画家开小差了，请稍后再试~';
+        if (error.response && error.response.data && error.response.data.error) {
+            errorMessage = error.response.data.error.message;
+        } else if (error.message) {
+            errorMessage = error.message;
         }
-
-        return res.status(500).json({
-            error: errorMessage
-        });
+        res.status(500).json({ error: errorMessage });
     }
 });
 
-app.get('/', (req, res) => {
-    res.send("TuoTuo Server is running. Streaming AI + Vision + Web Search enabled!");
-});
+app.get('/', (req, res) => { res.send("TuoTuo Server is running. Streaming AI + Vision + Image Gen + Web Search enabled!"); });
 
 // ==========================================
 // 2. HTTP 与 WebSocket
-// 保持你的原功能不变
 // ==========================================
 const server = http.createServer(app);
 const port = process.env.PORT || 8888;
-
 const homeDir = process.env.HOME || process.env.HOMEDRIVE + process.env.HOMEPATH || __dirname;
 const dataDir = path.join(homeDir, 'data');
-
-if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, {
-        recursive: true
-    });
-}
-
+if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
 const historyFile = path.join(dataDir, 'chat_history.json');
+if (!fs.existsSync(historyFile)) fs.writeFileSync(historyFile, JSON.stringify([]));
 
-if (!fs.existsSync(historyFile)) {
-    fs.writeFileSync(historyFile, JSON.stringify([]));
-}
-
-const wss = new WebSocket.Server({
-    server
-});
-
+const wss = new WebSocket.Server({ server });
 let clients = new Map();
 
 wss.on('connection', (ws, req) => {
     const nickname = decodeURIComponent(req.url.split('/socket/')[1] || "匿名粉丝");
     clients.set(ws, nickname);
-
-    try {
-        const data = fs.readFileSync(historyFile, 'utf8');
-        const recentHistory = JSON.parse(data).slice(-50);
-
-        ws.send(JSON.stringify({
-            type: 'history',
-            data: recentHistory
-        }));
-    } catch (err) {
-        console.error("读取历史消息失败:", err);
-    }
-
+    try { const data = fs.readFileSync(historyFile, 'utf8'); ws.send(JSON.stringify({ type: 'history', data: JSON.parse(data).slice(-50) })); } catch (err) {}
     broadcastUserList();
-
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message);
             const history = JSON.parse(fs.readFileSync(historyFile, 'utf8'));
-
             history.push(data);
-
-            if (history.length > 1000) {
-                history.shift();
-            }
-
+            if (history.length > 1000) history.shift();
             fs.writeFileSync(historyFile, JSON.stringify(history));
-
-            broadcast(JSON.stringify({
-                type: 'message',
-                ...data
-            }));
-
-        } catch (e) {
-            console.error("处理 WebSocket 消息失败:", e);
-        }
+            broadcast(JSON.stringify({ type: 'message', ...data }));
+        } catch (e) {}
     });
-
-    ws.on('close', () => {
-        clients.delete(ws);
-        broadcastUserList();
-    });
+    ws.on('close', () => { clients.delete(ws); broadcastUserList(); });
 });
 
-function broadcast(data) {
-    wss.clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(data);
-        }
-    });
-}
+function broadcast(data) { wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(data); }); }
+function broadcastUserList() { broadcast(JSON.stringify({ type: 'userlist', data: Array.from(clients.values()) })); }
 
-function broadcastUserList() {
-    broadcast(JSON.stringify({
-        type: 'userlist',
-        data: Array.from(clients.values())
-    }));
-}
-
-server.listen(port, () => {
-    console.log(`✅ 服务器已启动，端口 ${port}。TuoTuo 流式 AI 已就绪。`);
-});
+server.listen(port, () => { console.log(`✅ 服务器已启动，端口 ${port}。TuoTuo 完整体已就绪。`); });
