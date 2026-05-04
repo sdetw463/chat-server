@@ -22,15 +22,13 @@ const apiVersion = "2024-12-01-preview";
 const deployment = "gpt-5.5";
 
 // --- ✨ 升级：Azure OpenAI 图像模型 (gpt-image-2) 专属环境变量 ---
-// 如果你没有配 IMAGE_ENDPOINT，它会自动回退使用聊天的 ENDPOINT（兼容同一大楼的情况）
 const imageEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || endpoint;
 const imageApiKey = process.env.AZURE_OPENAI_IMAGE_KEY || apiKey;
-const imageDeployment = "gpt-image-2"; // ⚠️ 精确匹配截图里的部署名
+const imageDeployment = "gpt-image-2"; 
 
 // --- Tavily 搜索环境变量 ---
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 
-// 初始化两个客户端（一个负责聊天，一个负责画画）
 let openaiClient = null;
 let openaiImageClient = null;
 
@@ -41,7 +39,7 @@ if (imageEndpoint && imageApiKey) {
     openaiImageClient = new AzureOpenAI({ 
         endpoint: imageEndpoint, 
         apiKey: imageApiKey, 
-        apiVersion: "2024-02-01", // 匹配新模型的 API 版本
+        apiVersion: "2024-02-01", 
         deployment: imageDeployment 
     });
 }
@@ -215,7 +213,6 @@ app.post('/api/ai-chat', async (req, res) => {
     if (!openaiClient) return res.status(500).json({ error: '后端未配置正确的 AI 密钥。' });
     try {
         if (req.body.stream === true || req.body.stream === "true") return await handleStreamingAIChat(req, res);
-        // 此处为了简洁省略了 NormalChat（因为前端已默认使用 Stream）
         res.status(400).json({ error: "当前仅支持流式请求" });
     } catch (error) {
         const errorMessage = error.message ? `后端报错: ${error.message}` : 'AI 思考时出错了，请稍后再试~';
@@ -230,45 +227,50 @@ app.post('/api/ai-chat', async (req, res) => {
 app.post('/api/ai-image', async (req, res) => {
     try {
         const prompt = req.body.prompt;
+        const images = req.body.images; // 接收前端可能传来的图片数组
         if (!prompt) return res.status(400).json({ error: '必须告诉 TuoTuo 你想画什么哦！' });
 
         console.log(`🎨 TuoTuo 正在后台努力画图: ${prompt}`);
 
-        // 提取环境变量
         const targetEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || endpoint;
         const targetKey = process.env.AZURE_OPENAI_IMAGE_KEY || apiKey;
         
-        // 完全复刻你截图中官方给的请求地址
         const url = `${targetEndpoint.replace(/\/$/, '')}/openai/deployments/gpt-image-2/images/generations?api-version=2024-02-01`;
 
-        // 绕过 SDK，使用最底层的原生 fetch 强行按照官方格式发请求
+        // 构造发送给画图接口的数据体
+        const requestBody = {
+            prompt: prompt,
+            size: "1920x1080", // ✨ 已为你修改默认比例为 1920x1080
+            quality: "low",
+            output_compression: 100,
+            output_format: "png",
+            n: 1
+        };
+
+        // 如果用户上传了图片，并且当前调用的渠道支持传图(多模态透传)，将其放入
+        if (images && images.length > 0) {
+            requestBody.image = images[0];
+            requestBody.images = images;
+        }
+
         const response = await fetch(url, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 'api-key': targetKey
             },
-            body: JSON.stringify({
-                prompt: prompt,
-                size: "1024x1024",
-                quality: "low",
-                output_compression: 100,
-                output_format: "png", // 完美契合截图里的要求
-                n: 1
-            })
+            body: JSON.stringify(requestBody)
         });
 
-        // 如果 Azure 拒绝了我们，立刻抛出错误，不要干等
         if (!response.ok) {
             const errText = await response.text();
             console.error("🔥 Azure 返回了错误:", errText);
-            throw new Error(`Azure 拒绝了请求 (${response.status})，可能模型还没准备好`);
+            throw new Error(`Azure 拒绝了请求 (${response.status})，可能接口暂不支持该尺寸或包含不支持的参数`);
         }
 
         const data = await response.json();
         
         let imageUrl = '';
-        // 优先解析官方 curl 里指定的 b64_json，如果没有再找 url
         if (data.data && data.data[0].b64_json) {
             imageUrl = 'data:image/png;base64,' + data.data[0].b64_json;
         } else if (data.data && data.data[0].url) {
@@ -277,7 +279,6 @@ app.post('/api/ai-image', async (req, res) => {
             throw new Error("模型没有返回有效的图片数据");
         }
 
-        // 获取模型优化后的提示词
         const revisedPrompt = data.data[0].revised_prompt || prompt;
 
         res.json({ url: imageUrl, revised_prompt: revisedPrompt });
