@@ -41,7 +41,7 @@ if (imageEndpoint && imageApiKey) {
     openaiImageClient = new AzureOpenAI({ 
         endpoint: imageEndpoint, 
         apiKey: imageApiKey, 
-        apiVersion: "2026-04-01-preview", // 匹配新模型的 API 版本
+        apiVersion: "2024-02-01", // 匹配新模型的 API 版本
         deployment: imageDeployment 
     });
 }
