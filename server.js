@@ -21,7 +21,7 @@ const apiKey = process.env.AZURE_OPENAI_KEY;
 const apiVersion = "2024-12-01-preview";
 const deployment = "gpt-5.5";
 
-// --- ✨ 升级：Azure OpenAI 图像模型 (gpt-image-2) 专属环境变量 ---
+// --- ✨ 升级：Azure OpenAI 图像模型专属环境变量 ---
 const imageEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || endpoint;
 const imageApiKey = process.env.AZURE_OPENAI_IMAGE_KEY || apiKey;
 const imageDeployment = "gpt-image-2"; 
@@ -222,50 +222,85 @@ app.post('/api/ai-chat', async (req, res) => {
 });
 
 // ==========================================
-// ✨ AI 画图独立接口 (gpt-image-2 纯原生直连版)
+// ✨ AI 画图独立接口 (兼容图生图与文生图)
 // ==========================================
 app.post('/api/ai-image', async (req, res) => {
     try {
         const prompt = req.body.prompt;
-        const images = req.body.images; // 接收前端可能传来的图片数组
+        const images = req.body.images; // 接收前端传来的智能处理后的图生图对象
         if (!prompt) return res.status(400).json({ error: '必须告诉 TuoTuo 你想画什么哦！' });
 
         console.log(`🎨 TuoTuo 正在后台努力画图: ${prompt}`);
 
         const targetEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || endpoint;
         const targetKey = process.env.AZURE_OPENAI_IMAGE_KEY || apiKey;
-        
-        const url = `${targetEndpoint.replace(/\/$/, '')}/openai/deployments/gpt-image-2/images/generations?api-version=2024-02-01`;
+        const targetVersion = "2024-02-01"; // 匹配官方文档的版本
 
-        // 构造发送给画图接口的数据体
-        const requestBody = {
-            prompt: prompt,
-            size: "1920x1080", // ✨ 已为你修改默认比例为 1920x1080
-            quality: "low",
-            output_compression: 100,
-            output_format: "png",
-            n: 1
-        };
+        let response;
 
-        // 如果用户上传了图片，并且当前调用的渠道支持传图(多模态透传)，将其放入
+        // ✨ 逻辑分流 1：如果存在图片，走 edits 接口 (图生图)
         if (images && images.length > 0) {
-            requestBody.image = images[0];
-            requestBody.images = images;
-        }
+            const url = `${targetEndpoint.replace(/\/$/, '')}/openai/deployments/gpt-image-2/images/edits?api-version=${targetVersion}`;
+            
+            // 使用 FormData 模拟表单文件上传，完美匹配 curl 的 -F 参数
+            const formData = new FormData();
+            formData.append('prompt', prompt);
+            formData.append('n', "1");
+            formData.append('size', "1024x1024");
+            
+            const imgObj = images[0]; // 取出第一张图片对象
+            
+            // 提取图像数据转为 Buffer 并封装成 Blob
+            if (imgObj.image) {
+                const base64Data = imgObj.image.replace(/^data:image\/\w+;base64,/, "");
+                const buffer = Buffer.from(base64Data, 'base64');
+                formData.append('image', new Blob([buffer], { type: 'image/png' }), 'image.png');
+            }
+            
+            // 提取前端智能生成的透明遮罩数据转为 Buffer
+            if (imgObj.mask) {
+                const maskData = imgObj.mask.replace(/^data:image\/\w+;base64,/, "");
+                const maskBuffer = Buffer.from(maskData, 'base64');
+                formData.append('mask', new Blob([maskBuffer], { type: 'image/png' }), 'mask.png');
+            }
 
-        const response = await fetch(url, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'api-key': targetKey
-            },
-            body: JSON.stringify(requestBody)
-        });
+            response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'api-key': targetKey,
+                    'Authorization': `Bearer ${targetKey}` // 双重授权匹配官方 curl
+                },
+                body: formData // fetch 会自动处理 boundary
+            });
+
+        } else {
+            // ✨ 逻辑分流 2：如果不带图片，走 generations 接口 (文生图)
+            const url = `${targetEndpoint.replace(/\/$/, '')}/openai/deployments/gpt-image-2/images/generations?api-version=${targetVersion}`;
+            
+            const requestBody = {
+                prompt: prompt,
+                size: "1024x1024", // ⚠️ 必须恢复 1024x1024，解决 400 Bad Request 报错
+                quality: "low",
+                output_compression: 100,
+                output_format: "png",
+                n: 1
+            };
+
+            response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'api-key': targetKey,
+                    'Authorization': `Bearer ${targetKey}` // 双重授权匹配官方 curl
+                },
+                body: JSON.stringify(requestBody)
+            });
+        }
 
         if (!response.ok) {
             const errText = await response.text();
             console.error("🔥 Azure 返回了错误:", errText);
-            throw new Error(`Azure 拒绝了请求 (${response.status})，可能接口暂不支持该尺寸或包含不支持的参数`);
+            throw new Error(`Azure 拒绝了请求 (${response.status})：${errText}`);
         }
 
         const data = await response.json();
