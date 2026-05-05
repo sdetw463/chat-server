@@ -105,8 +105,21 @@ function getOrCreateSession(sessionId) {
 }
 
 function trimChatHistory(chatHistory) {
-    const MAX_MESSAGES = 20;
+    const MAX_MESSAGES = 40; // 封印解除 1：允许保留最多 40 条对话记录（原来是 20 条）
     while (chatHistory.length > MAX_MESSAGES) chatHistory.splice(1, 1);
+
+    let totalLength = 0;
+    for (let i = chatHistory.length - 1; i >= 1; i--) {
+        const msg = chatHistory[i];
+        const msgLength = JSON.stringify(msg.content || '').length;
+        totalLength += msgLength;
+        
+        // 封印解除 2：将极限从 60000 提升到 120000 字符。
+        // 这大约相当于 8 万 Token，既能让 AI 读超大文件，又能留出足够的空间让 AI 输出回答，防止把 128k 彻底撑爆。
+        if (totalLength > 120000 && i < chatHistory.length - 2) {
+             chatHistory.splice(i, 1);
+        }
+    }
 }
 
 function buildUserContent(userMessage, images) {
@@ -215,8 +228,16 @@ app.post('/api/ai-chat', async (req, res) => {
         if (req.body.stream === true || req.body.stream === "true") return await handleStreamingAIChat(req, res);
         res.status(400).json({ error: "当前仅支持流式请求" });
     } catch (error) {
-        const errorMessage = error.message ? `后端报错: ${error.message}` : 'AI 思考时出错了，请稍后再试~';
-        if (res.headersSent) { try { sendSSE(res, { error: errorMessage }); return sendSSEDone(res); } catch { return; } }
+        console.error("🔥 流式对话崩溃:", error);
+        const errorMessage = error.message ? error.message : 'AI 思考时出错了，请稍后再试~';
+        
+        if (res.headersSent) { 
+            try { 
+                // ✨ 将错误信息伪装成正常的 AI 回复 (delta) 发送给前端显示
+                sendSSE(res, { delta: `\n\n⚠️ **系统提示**：抱歉宝宝，上下文太长或者文件太大了，导致小脑瓜处理不过来啦！报错原因：\`${errorMessage}\`。**建议点击左侧的【新聊天】清空记忆后再试一次哦！**` }); 
+                return sendSSEDone(res); 
+            } catch { return; } 
+        }
         return res.status(500).json({ error: errorMessage });
     }
 });
