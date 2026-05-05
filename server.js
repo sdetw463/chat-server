@@ -105,18 +105,33 @@ function getOrCreateSession(sessionId) {
 }
 
 function trimChatHistory(chatHistory) {
-    const MAX_MESSAGES = 40; // 封印解除 1：允许保留最多 40 条对话记录（原来是 20 条）
+    const MAX_MESSAGES = 50; // 拥有顶级模型，我们可以保留多达 50 条上下文对话
     while (chatHistory.length > MAX_MESSAGES) chatHistory.splice(1, 1);
 
     let totalLength = 0;
     for (let i = chatHistory.length - 1; i >= 1; i--) {
         const msg = chatHistory[i];
-        const msgLength = JSON.stringify(msg.content || '').length;
+        let msgLength = 0;
+
+        // ✨ 终极修复：精准计算 Token，跳过 base64 图片的字符串干扰
+        if (typeof msg.content === 'string') {
+            msgLength = msg.content.length;
+        } else if (Array.isArray(msg.content)) {
+            // 如果内容是数组（包含图片和文字）
+            msg.content.forEach(item => {
+                if (item.type === 'text' && item.text) {
+                    msgLength += item.text.length; // 只计算纯文字的长度
+                } else if (item.type === 'image_url') {
+                    msgLength += 1000; // 每张图片估算为 1000 个字符长度（模拟视觉 Token 消耗）
+                }
+            });
+        }
+
         totalLength += msgLength;
         
-        // 封印解除 2：将极限从 60000 提升到 120000 字符。
-        // 这大约相当于 8 万 Token，既能让 AI 读超大文件，又能留出足够的空间让 AI 输出回答，防止把 128k 彻底撑爆。
-        if (totalLength > 120000 && i < chatHistory.length - 2) {
+        // 顶级模型 128k Token 约等于 15万~20万个汉字。
+        // 我们安全地卡在 150,000 字符，完美兼顾“超长记忆”与“防止崩溃”！
+        if (totalLength > 150000 && i < chatHistory.length - 2) {
              chatHistory.splice(i, 1);
         }
     }
