@@ -22,7 +22,25 @@ if (process.env.MONGODB_URI) {
     console.error('❌ 警告：服务器没有读到 MONGODB_URI 环境变量！');
 }
 
-const wsMsgSchema = new mongoose.Schema({}, { strict: false, timestamps: true });
+// ✨ 修复 1：明确写出数据表的所有字段，防止 Cosmos DB 拒绝隐式数据的写入
+const wsMsgSchema = new mongoose.Schema({
+    msgType: String,
+    name: String,
+    avatar: String,
+    msg: String,
+    imgs: [String],
+    time: String,
+    dateKey: String,
+    author: String,
+    text: String,
+    img: String,
+    albumType: String,
+    imgId: String,
+    isLike: Boolean,
+    likes: Number,
+    likedBy: [String],
+    entryId: String
+}, { strict: false, timestamps: true });
 const WsMessage = mongoose.model('WsMessage', wsMsgSchema, 'chat_history');
 
 const aiSessionSchema = new mongoose.Schema({ sessionId: String, userName: String, data: Object }, { strict: false });
@@ -55,7 +73,7 @@ async function uploadBase64ToBlob(base64Str) {
 }
 
 // ==========================================
-// 2. AI 接口和搜索逻辑
+// 2. 完整保留的 AI 接口和搜索逻辑
 // ==========================================
 const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
 const apiKey = process.env.AZURE_OPENAI_KEY;
@@ -286,7 +304,7 @@ app.post('/api/ai-image', async (req, res) => {
 });
 
 // ==========================================
-// 3. 处理 AI 聊天记录保存和读取的接口 (Cosmos DB)
+// 3. 处理 AI 聊天记录保存和读取的接口 (Cosmos DB) - 已清理掉所有重复代码
 // ==========================================
 app.post('/api/sessions', async (req, res) => {
     try {
@@ -314,7 +332,6 @@ app.post('/api/sessions', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ✨ 已删掉多余的重复代码
 app.get('/api/sessions', async (req, res) => {
     try {
         if(!process.env.MONGODB_URI) return res.json([]);
@@ -324,7 +341,7 @@ app.get('/api/sessions', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ✨ 全新体检工具
+// ✨ 状态体检工具
 app.get('/api/status', (req, res) => {
     res.json({
         "数据库是否连接": mongoose.connection.readyState === 1 ? "✅ 正常" : "❌ 未连接",
@@ -333,10 +350,22 @@ app.get('/api/status', (req, res) => {
     });
 });
 
+// ✨ 修复 2：终极物理读写探测工具，用于彻底排除数据库异常
+app.get('/api/test-db', async (req, res) => {
+    try {
+        const testData = { msgType: 'sys_test', msg: 'Hello Azure Cosmos DB!', time: new Date().toISOString() };
+        const created = await WsMessage.create(testData); // 强制写入测试数据
+        const history = await WsMessage.find().sort({ _id: -1 }).limit(5).lean(); // 测试通过 _id 倒序读取
+        res.json({ success: true, message: "完美！读写测试全通！", data_written: created, recent_data: history });
+    } catch (err) {
+        res.json({ success: false, error_message: err.message, stack: err.stack });
+    }
+});
+
 app.get('/', (req, res) => { res.send("TuoTuo Server is running!"); });
 
 // ==========================================
-// 4. WebSocket (聊天室、日记、留言)
+// 4. WebSocket (聊天室、日记、留言) 
 // ==========================================
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
@@ -348,7 +377,8 @@ wss.on('connection', async (ws, req) => {
     
     try {
         if(process.env.MONGODB_URI) {
-            const history = await WsMessage.find().sort({ createdAt: -1 }).limit(800).lean();
+            // ✨ 修复 3：使用 _id 进行自带时间戳的完美排序，防止 Cosmos DB 报错拒载
+            const history = await WsMessage.find().sort({ _id: -1 }).limit(800).lean();
             history.reverse();
             ws.send(JSON.stringify({ type: 'history', data: history }));
         }
@@ -367,8 +397,8 @@ wss.on('connection', async (ws, req) => {
             }
 
             if(process.env.MONGODB_URI) {
-                const newMsg = new WsMessage(data);
-                await newMsg.save();
+                // ✨ 修复 4：使用 create() 进行强制安全写入，规避隐式字段保存丢失问题
+                await WsMessage.create(data);
             }
 
             broadcast(JSON.stringify({ type: 'message', ...data }));
