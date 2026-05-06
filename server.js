@@ -230,6 +230,14 @@ app.post('/api/ai-image', async (req, res) => {
 
         console.log(`🎨 TuoTuo 正在后台努力画图: ${prompt}`);
 
+        // ✨ 魔法在这里：智能解析用户想要的大小
+        let targetSize = "1024x1024"; // 默认正方形
+        if (/(竖屏|竖图|手机壁纸|9:16|1024x1792)/i.test(prompt)) {
+            targetSize = "1024x1792"; // 匹配为标准的竖向尺寸
+        } else if (/(横屏|横图|电脑壁纸|宽屏|16:9|1792x1024)/i.test(prompt)) {
+            targetSize = "1792x1024"; // 匹配为标准的横向尺寸
+        }
+
         const targetEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || endpoint;
         const targetKey = process.env.AZURE_OPENAI_IMAGE_KEY || apiKey;
         const targetVersion = "2024-02-01"; 
@@ -237,11 +245,13 @@ app.post('/api/ai-image', async (req, res) => {
         let response;
 
         if (images && images.length > 0) {
+            // ⚠️ 注意：如果是图生图 (修改图片)，Azure 底层通常强制要求正方形
+            // 为了防止 Azure 报错导致服务崩溃，这里我们依然锁定为 1024x1024
             const url = `${targetEndpoint.replace(/\/$/, '')}/openai/deployments/gpt-image-2/images/edits?api-version=${targetVersion}`;
             const formData = new FormData();
             formData.append('prompt', prompt);
             formData.append('n', "1");
-            formData.append('size', "1024x1024");
+            formData.append('size', "1024x1024"); 
             
             const imgObj = images[0]; 
             
@@ -264,8 +274,16 @@ app.post('/api/ai-image', async (req, res) => {
             });
 
         } else {
+            // ✨ 纯文生图：在这里应用我们智能识别出来的尺寸！
             const url = `${targetEndpoint.replace(/\/$/, '')}/openai/deployments/gpt-image-2/images/generations?api-version=${targetVersion}`;
-            const requestBody = { prompt: prompt, size: "1024x1024", quality: "low", output_compression: 100, output_format: "png", n: 1 };
+            const requestBody = { 
+                prompt: prompt, 
+                size: targetSize, // 使用智能匹配的动态尺寸
+                quality: "low", 
+                output_compression: 100, 
+                output_format: "png", 
+                n: 1 
+            };
 
             response = await fetch(url, {
                 method: 'POST',
