@@ -121,7 +121,7 @@ const deployment = process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-5.5";
 const imageEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || endpoint;
 const imageApiKey = process.env.AZURE_OPENAI_IMAGE_KEY || apiKey;
 const imageDeployment = process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT || "gpt-image-2";
-const imageApiVersion = process.env.AZURE_OPENAI_IMAGE_API_VERSION || "2025-04-01-preview"; 
+const imageApiVersion = process.env.AZURE_OPENAI_IMAGE_API_VERSION || "2024-02-01";
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 
 let openaiClient = null; let openaiImageClient = null;
@@ -355,6 +355,7 @@ async function runDocumentOnce(messages) {
     return runCleanCompletionOnce(messages);
 }
 
+
 function messagesWithSystemPrompt(messages, systemPrompt) {
     const cloned = messages.map(msg => ({ ...msg }));
     if (cloned[0] && cloned[0].role === "system") cloned[0] = { role: "system", content: systemPrompt };
@@ -571,46 +572,49 @@ app.post('/api/ai-image', async (req, res) => {
         const base = imageEndpoint.replace(/\/$/, '');
         const deploymentName = encodeURIComponent(imageDeployment);
         let response;
+        const authHeaders = { 'Authorization': `Bearer ${imageApiKey}` };
 
         if (images.length > 0 && images[0] && images[0].image) {
-            const parsed = parseDataUrlImage(images[0].image);
-            if (!parsed) return res.status(400).json({ error: '参考图片格式无效，请重新上传图片。' });
+            const parsedImage = parseDataUrlImage(images[0].image);
+            if (!parsedImage) return res.status(400).json({ error: '参考图片格式无效，请重新上传图片。' });
 
+            const parsedMask = parseDataUrlImage(images[0].mask || '');
             const url = `${base}/openai/deployments/${deploymentName}/images/edits?api-version=${encodeURIComponent(imageApiVersion)}`;
             const formData = new FormData();
             formData.append('prompt', prompt);
-            formData.append('n', '1');
-            formData.append('size', '1024x1024');
-            formData.append('image', new Blob([parsed.buffer], { type: parsed.mime }), `reference.${parsed.ext}`);
+            formData.append('image', new Blob([parsedImage.buffer], { type: parsedImage.mime }), `reference.${parsedImage.ext}`);
+            if (parsedMask) {
+                formData.append('mask', new Blob([parsedMask.buffer], { type: parsedMask.mime }), `mask.${parsedMask.ext}`);
+            }
 
             response = await fetchWithTimeout(url, {
                 method: 'POST',
-                headers: { 'api-key': imageApiKey },
+                headers: authHeaders,
                 body: formData
-            }, 240000);
+            }, 180000);
         } else {
             const url = `${base}/openai/deployments/${deploymentName}/images/generations?api-version=${encodeURIComponent(imageApiVersion)}`;
-            const primaryBody = { prompt, size: targetSize, n: 1, quality: 'medium', output_format: 'png' };
+            const primaryBody = { prompt, size: targetSize, n: 1, quality: 'low', output_compression: 100, output_format: 'png' };
             response = await fetchWithTimeout(url, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'api-key': imageApiKey },
+                headers: { 'Content-Type': 'application/json', ...authHeaders },
                 body: JSON.stringify(primaryBody)
-            }, 240000);
+            }, 180000);
 
             if (!response.ok && response.status === 400) {
                 const retryBody = { prompt, size: targetSize, n: 1 };
                 response = await fetchWithTimeout(url, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'api-key': imageApiKey },
+                    headers: { 'Content-Type': 'application/json', ...authHeaders },
                     body: JSON.stringify(retryBody)
-                }, 240000);
+                }, 180000);
             }
         }
 
         if (!response.ok) throw new Error(await readAzureError(response));
         const data = await response.json();
         const normalized = normalizeAzureImageData(data);
-        res.json({ url: normalized.url, revised_prompt: normalized.revised_prompt || prompt });
+        res.json({ url: normalized.url, revised_prompt: normalized.revised_prompt || prompt, reference_used: images.length > 0 });
     } catch (error) {
         console.error('🔥 AI 画图接口崩溃:', error);
         const msg = error.name === 'AbortError' ? '图片生成超时了，请稍后再试或把提示词写得更短一些。' : (error.message || 'AI 画家开小差了，请稍后再试~');
