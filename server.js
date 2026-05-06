@@ -5,6 +5,7 @@ const cors = require('cors');
 const { AzureOpenAI } = require('openai');
 const mongoose = require('mongoose');
 const { BlobServiceClient } = require('@azure/storage-blob');
+const FormData = require('form-data'); // ✨ 引入专业的 form-data 库
 
 const app = express();
 app.use(cors());
@@ -158,7 +159,6 @@ function getOrCreateSession(sessionId) {
     return sessions.get(sessionId);
 }
 
-// ✨ 优化：增加容量限制（约3MB），确保即便处理 Base64 也不会撑爆 Node.js 内存
 function trimChatHistory(chatHistory) {
     const MAX_MESSAGES = 30;
     while (chatHistory.length > MAX_MESSAGES) chatHistory.splice(1, 1);
@@ -201,7 +201,6 @@ async function handleStreamingAIChat(req, res) {
     const imagesArrayRaw = req.body.images || req.body.image || [];
     const imagesArray = Array.isArray(imagesArrayRaw) ? imagesArrayRaw : [imagesArrayRaw];
 
-    // ✨ 核心修复：跳过上传私有 Blob 的步骤，直接将带有 Data URL (Base64) 的数组交给 Azure OpenAI 进行多模态分析。
     const chatHistory = getOrCreateSession(sessionId);
     const formattedContent = buildUserContent(userMessage, imagesArray);
     chatHistory.push({ role: "user", content: formattedContent });
@@ -308,16 +307,37 @@ app.post('/api/ai-image', async (req, res) => {
             if (!parsed) return res.status(400).json({ error: '参考图片格式无效，请重新上传图片。' });
 
             const url = `${base}/openai/deployments/${deploymentName}/images/edits?api-version=${encodeURIComponent(imageApiVersion)}`;
-            const formData = new FormData();
-            formData.append('prompt', prompt);
-            formData.append('n', '1');
-            formData.append('size', '1024x1024');
-            formData.append('image', new Blob([parsed.buffer], { type: parsed.mime }), `reference.${parsed.ext}`);
+            
+            // ✨ 核心修复：使用专业的 form-data 库构建 multipart/form-data
+            const form = new FormData();
+            form.append('prompt', prompt);
+            form.append('n', 1);
+            form.append('size', '1024x1024'); // edits endpoint typically requires 1024x1024
+            
+            // 必须提供 filename 和 contentType
+            form.append('image', parsed.buffer, {
+                filename: `reference.${parsed.ext}`,
+                contentType: parsed.mime
+            });
+
+            // 如果有前端生成的 mask 也传过去
+            if (images[0].mask) {
+                const parsedMask = parseDataUrlImage(images[0].mask);
+                if (parsedMask) {
+                    form.append('mask', parsedMask.buffer, {
+                        filename: `mask.${parsedMask.ext}`,
+                        contentType: parsedMask.mime
+                    });
+                }
+            }
 
             response = await fetchWithTimeout(url, {
                 method: 'POST',
-                headers: { 'api-key': imageApiKey },
-                body: formData
+                headers: { 
+                    'api-key': imageApiKey,
+                    ...form.getHeaders() // 这一步至关重要，带上 boundary
+                },
+                body: form
             }, 240000);
         } else {
             const url = `${base}/openai/deployments/${deploymentName}/images/generations?api-version=${encodeURIComponent(imageApiVersion)}`;
