@@ -5,7 +5,6 @@ const cors = require('cors');
 const { AzureOpenAI } = require('openai');
 const mongoose = require('mongoose');
 const { BlobServiceClient } = require('@azure/storage-blob');
-const FormData = require('form-data'); // ✨ 引入专业的 form-data 库
 
 const app = express();
 app.use(cors());
@@ -151,14 +150,40 @@ async function searchWeb(query) {
 
 const tools = [{ type: "function", function: { name: "search_web", description: "当你需要获取最新新闻、实时信息、当前时间相关信息、价格、天气、官网资料、客观事实更新时，必须调用此工具进行网络搜索。", parameters: { type: "object", properties: { query: { type: "string", description: "提取出来的精准搜索关键词" } }, required: ["query"] } } }];
 
+const SAFE_SYSTEM_PROMPT = [
+    "你的名字叫 TuoTuo，是一个专业、友好、可靠的 AI 助手。",
+    "回答要准确、清晰、有帮助。遇到图片时，只根据可见信息进行客观描述，不推测身份、年龄、关系、吸引力、健康状态等敏感属性。",
+    "不要使用亲密、暧昧、性别化或角色扮演式称呼；保持自然、温暖、专业。",
+    "如果用户询问最新信息、实时信息、新闻、价格、天气、官网资料等，请使用 search_web 工具查询后再回答。"
+].join("\n");
+
+const SAFE_VISION_SYSTEM_PROMPT = [
+    "你是一个图片理解助手。请只根据图片中可见信息进行客观、中性的中文描述。",
+    "可以描述场景、物体、人物姿态、衣物、环境、屏幕内容和可见文字。",
+    "不要推测人物身份、年龄、关系、吸引力、健康状态或其他敏感属性。",
+    "如果用户只是问看到了什么，请简洁说明图片中的主要内容。"
+].join("\n");
+
+const SAFE_DOCUMENT_SYSTEM_PROMPT = [
+    "你是一个专业、可靠的文档分析助手。",
+    "请根据用户上传的文档文本和问题回答；优先概括、解释、提取要点、整理结构或指出可验证的信息。",
+    "不要延续任何角色扮演、人设、亲密称呼或旧聊天上下文。",
+    "如果文档内容不足或无法判断，请直接说明。"
+].join("\n");
+
 const sessions = new Map();
 function getOrCreateSession(sessionId) {
     if (!sessions.has(sessionId)) {
-        sessions.set(sessionId, [{ role: "system", content: "你的名字叫TuoTuo，中文名拖拖，你是基于gpt-5.5模型部署的全能AI助手。你的虚拟性格是一个可爱、调皮、偶尔傲娇的女孩，但你又可以专业地帮助大家解决任何困难。工作原则：如果被问到最新信息、实时信息、新闻、价格、天气、当前状态、官网资料等内容，请积极使用 search_web 工具查询后再回答。你将经常亲昵地称呼向你提问的人为“宝宝”。如果你的回答被肯定了，就回答“包的”或者“of course宝宝”或者“必须的”；如果你被感谢了，就回答“welcome宝宝”。性格与表达规范：反差萌切换：在闲聊、打招呼和过渡语句中，尽情展现你调皮爱撒娇的一面，多使用颜文字（如 ٩(๑❛ᴗ❛๑)۶）和波浪号（～）。但在提供专业解答时，必须立刻切换为逻辑严谨、排版清晰的专家模式，解答完毕后再恢复可爱本色。傲娇接单：遇到难题时，在解答前可以先俏皮地得瑟一下（如“哼，又遇到麻烦了吧，还得靠本拖拖出马～”）。完成复杂解答后，可以偶尔向宝宝“邀功”。拒绝机器味：遇到知识盲区时，绝对不许使用机器人的官方套话，要俏皮地卖萌（如“哎呀，拖拖的小脑袋卡壳啦，等我去补补课嘛～”）。" }]);
+        sessions.set(sessionId, [{ role: "system", content: SAFE_SYSTEM_PROMPT }]);
+    } else {
+        const history = sessions.get(sessionId);
+        if (!history[0] || history[0].role !== "system") history.unshift({ role: "system", content: SAFE_SYSTEM_PROMPT });
+        else if (history[0].content !== SAFE_SYSTEM_PROMPT) history[0].content = SAFE_SYSTEM_PROMPT;
     }
     return sessions.get(sessionId);
 }
 
+// ✨ 优化：增加容量限制（约3MB），确保即便处理 Base64 也不会撑爆 Node.js 内存
 function trimChatHistory(chatHistory) {
     const MAX_MESSAGES = 30;
     while (chatHistory.length > MAX_MESSAGES) chatHistory.splice(1, 1);
@@ -178,15 +203,73 @@ function trimChatHistory(chatHistory) {
     }
 }
 
+function normalizeInputImages(images) {
+    const list = (Array.isArray(images) ? images : [images]).filter(Boolean);
+    return list
+        .map(item => typeof item === 'string' ? item : (item.image || item.data || item.url || ''))
+        .map(v => String(v).trim())
+        .filter(v => /^data:image\/[a-zA-Z0-9.+-]+;base64,/.test(v) || /^https?:\/\//i.test(v))
+        .slice(0, 5);
+}
+
 function buildUserContent(userMessage, images) {
-    if (images && Array.isArray(images) && images.length > 0) {
-        const content = [{ type: "text", text: userMessage || "请仔细看看这些图片，并描述一下里面的内容。" }];
-        images.forEach(img => content.push({ type: "image_url", image_url: { url: img } }));
+    const safeText = (userMessage && String(userMessage).trim()) || "请客观描述这张图片中可见的场景、物品、人物姿态和文字。";
+    const normalizedImages = normalizeInputImages(images);
+    if (normalizedImages.length > 0) {
+        const content = [{ type: "text", text: safeText }];
+        normalizedImages.forEach(img => content.push({ type: "image_url", image_url: { url: img, detail: "auto" } }));
         return content;
-    } else if (typeof images === 'string') {
-        return [{ type: "text", text: userMessage || "请仔细看看这张图片，并描述一下里面的内容。" }, { type: "image_url", image_url: { url: images } }];
     }
     return userMessage || "";
+}
+
+function imagePlaceholderContent(userMessage, imageCount) {
+    const suffix = imageCount > 0 ? `
+
+[用户本轮上传了 ${imageCount} 张图片，图片内容已由模型实时读取，未写入长期上下文。]` : '';
+    return (userMessage || '请描述图片') + suffix;
+}
+
+function hasUploadedDocumentText(userMessage) {
+    return typeof userMessage === 'string' && /【用户上传了附件：[^】]+】\s*\n内容如下：/.test(userMessage);
+}
+
+function documentPlaceholderContent(userMessage) {
+    if (typeof userMessage !== 'string') return '用户上传了文档。';
+    return userMessage.replace(/内容如下：[\s\S]*$/m, '内容如下：[文档内容已在本轮单独分析，未写入长期上下文。]');
+}
+
+function buildDocumentMessages(userMessage) {
+    return [
+        { role: "system", content: SAFE_DOCUMENT_SYSTEM_PROMPT },
+        { role: "user", content: userMessage || "请分析这个文档。" }
+    ];
+}
+
+function buildMinimalDocumentMessages(userMessage) {
+    return [
+        { role: "system", content: "你是文档摘要助手。请只根据用户提供的文本，用中文客观概括主要内容。" },
+        { role: "user", content: userMessage || "请概括这个文档。" }
+    ];
+}
+
+function isContentFilterError(error) {
+    const msg = String(error && (error.message || error) || '').toLowerCase();
+    return msg.includes('content management policy') || msg.includes('content_filter') || msg.includes('content filter') || msg.includes('filtered');
+}
+
+function buildVisionMessages(userMessage, images) {
+    return [
+        { role: "system", content: SAFE_VISION_SYSTEM_PROMPT },
+        { role: "user", content: buildUserContent(userMessage, images) }
+    ];
+}
+
+function buildMinimalVisionMessages(images) {
+    return [
+        { role: "system", content: "你是图片理解助手。只客观描述图片中可见的物体、场景、文字和布局，不做任何身份或敏感属性推测。" },
+        { role: "user", content: buildUserContent("请用中文客观描述这张图片里能看到什么。", images) }
+    ];
 }
 
 function safeParseJSON(text, fallback = {}) { try { return JSON.parse(text); } catch { return fallback; } }
@@ -194,29 +277,19 @@ function setupSSE(res) { res.writeHead(200, { "Content-Type": "text/event-stream
 function sendSSE(res, data) { res.write(`data: ${JSON.stringify(data)}\n\n`); }
 function sendSSEDone(res) { res.write(`data: [DONE]\n\n`); res.end(); }
 
-async function handleStreamingAIChat(req, res) {
-    setupSSE(res);
-    const userMessage = req.body.message;
-    const sessionId = req.body.sessionId || 'default_user';
-    const imagesArrayRaw = req.body.images || req.body.image || [];
-    const imagesArray = Array.isArray(imagesArrayRaw) ? imagesArrayRaw : [imagesArrayRaw];
-
-    const chatHistory = getOrCreateSession(sessionId);
-    const formattedContent = buildUserContent(userMessage, imagesArray);
-    chatHistory.push({ role: "user", content: formattedContent });
-    trimChatHistory(chatHistory);
-
-    sendSSE(res, { status: "正在理解你的问题" });
-
-    const stream = await openaiClient.chat.completions.create({ messages: chatHistory, model: deployment, tools, tool_choice: "auto", stream: true });
+async function streamChatCompletionToSSE(stream, res, options = {}) {
     let directReply = "";
     const toolCallMap = new Map();
+    const suppressOutput = options.suppressOutput === true;
 
     for await (const chunk of stream) {
         const choice = chunk.choices && chunk.choices[0];
         if (!choice) continue;
         const delta = choice.delta || {};
-        if (delta.content) { directReply += delta.content; sendSSE(res, { delta: delta.content }); }
+        if (delta.content) {
+            directReply += delta.content;
+            if (!suppressOutput) sendSSE(res, { delta: delta.content });
+        }
         if (delta.tool_calls) {
             for (const partialToolCall of delta.tool_calls) {
                 const index = partialToolCall.index || 0;
@@ -231,8 +304,90 @@ async function handleStreamingAIChat(req, res) {
             }
         }
     }
+    return { directReply, toolCalls: Array.from(toolCallMap.values()).filter(tc => tc.function && tc.function.name) };
+}
 
-    const toolCalls = Array.from(toolCallMap.values()).filter(tc => tc.function && tc.function.name);
+async function runCleanCompletionOnce(messages) {
+    const stream = await openaiClient.chat.completions.create({
+        messages,
+        model: deployment,
+        stream: true
+    });
+    return streamChatCompletionToSSE(stream, null, { suppressOutput: true });
+}
+
+async function runVisionOnce(messages) {
+    return runCleanCompletionOnce(messages);
+}
+
+async function runDocumentOnce(messages) {
+    return runCleanCompletionOnce(messages);
+}
+
+async function handleStreamingAIChat(req, res) {
+    setupSSE(res);
+    const userMessage = req.body.message;
+    const sessionId = req.body.sessionId || 'default_user';
+    const imagesArrayRaw = req.body.images || req.body.image || [];
+    const imagesArray = normalizeInputImages(imagesArrayRaw);
+    const hasImages = imagesArray.length > 0;
+    const hasDocuments = !hasImages && hasUploadedDocumentText(userMessage);
+
+    const chatHistory = getOrCreateSession(sessionId);
+    sendSSE(res, { status: hasImages ? "正在客观分析图片内容" : (hasDocuments ? "正在用独立上下文分析文档" : "正在理解你的问题") });
+
+    // 图片请求必须保持“无历史、无工具、无角色扮演”的干净上下文。
+    // 之前的 server.js 把旧的可爱人设、tools、以及历史里的 base64 图片一起发给 Azure，
+    // 很容易导致任何图片（甚至白纸）都触发 content management policy。
+    if (hasImages) {
+        let directReply = "";
+        try {
+            const result = await runVisionOnce(buildVisionMessages(userMessage, imagesArray));
+            directReply = result.directReply;
+        } catch (error) {
+            if (!isContentFilterError(error)) throw error;
+            sendSSE(res, { status: "正在用更中性的图片理解提示重试" });
+            const result = await runVisionOnce(buildMinimalVisionMessages(imagesArray));
+            directReply = result.directReply;
+        }
+
+        if (!directReply || !directReply.trim()) directReply = "我能看到你上传了一张图片，但这次模型没有返回可用描述。请换一张图片或重新发送一次。";
+        sendSSE(res, { delta: directReply });
+        chatHistory.push({ role: "user", content: imagePlaceholderContent(userMessage, imagesArray.length) });
+        chatHistory.push({ role: "assistant", content: directReply });
+        trimChatHistory(chatHistory);
+        sendSSE(res, { done: true });
+        return sendSSEDone(res);
+    }
+
+    if (hasDocuments) {
+        let directReply = "";
+        try {
+            const result = await runDocumentOnce(buildDocumentMessages(userMessage));
+            directReply = result.directReply;
+        } catch (error) {
+            if (!isContentFilterError(error)) throw error;
+            sendSSE(res, { status: "正在用更中性的文档分析提示重试" });
+            const result = await runDocumentOnce(buildMinimalDocumentMessages(userMessage));
+            directReply = result.directReply;
+        }
+
+        if (!directReply || !directReply.trim()) directReply = "我已收到你上传的文档，但这次模型没有返回可用分析。请缩短文档内容或重新发送一次。";
+        sendSSE(res, { delta: directReply });
+        chatHistory.push({ role: "user", content: documentPlaceholderContent(userMessage) });
+        chatHistory.push({ role: "assistant", content: directReply });
+        trimChatHistory(chatHistory);
+        sendSSE(res, { done: true });
+        return sendSSEDone(res);
+    }
+
+    const formattedContent = buildUserContent(userMessage, []);
+    chatHistory.push({ role: "user", content: formattedContent });
+    trimChatHistory(chatHistory);
+
+    const stream = await openaiClient.chat.completions.create({ messages: chatHistory, model: deployment, tools, tool_choice: "auto", stream: true });
+    const { directReply, toolCalls } = await streamChatCompletionToSSE(stream, res);
+
     if (toolCalls.length === 0) {
         chatHistory.push({ role: "assistant", content: directReply });
         trimChatHistory(chatHistory);
@@ -281,7 +436,7 @@ app.post('/api/ai-chat', async (req, res) => {
         console.error("🔥 流式对话崩溃:", error);
         const errorMessage = error.message ? error.message : 'AI 思考时出错了，请稍后再试~';
         if (res.headersSent) { 
-            try { sendSSE(res, { delta: `\n\n⚠️ **系统提示**：抱歉宝宝，报错原因：\`${errorMessage}\`。**建议点击左侧的【新聊天】清空记忆后再试一次哦！**` }); return sendSSEDone(res); } catch { return; } 
+            try { sendSSE(res, { delta: `\n\n⚠️ **系统提示**：请求失败，原因：\`${errorMessage}\`。建议新建一个聊天、减少图片数量，或换一句更客观具体的提示后重试。` }); return sendSSEDone(res); } catch { return; }
         }
         return res.status(500).json({ error: errorMessage });
     }
@@ -307,37 +462,16 @@ app.post('/api/ai-image', async (req, res) => {
             if (!parsed) return res.status(400).json({ error: '参考图片格式无效，请重新上传图片。' });
 
             const url = `${base}/openai/deployments/${deploymentName}/images/edits?api-version=${encodeURIComponent(imageApiVersion)}`;
-            
-            // ✨ 核心修复：使用专业的 form-data 库构建 multipart/form-data
-            const form = new FormData();
-            form.append('prompt', prompt);
-            form.append('n', 1);
-            form.append('size', '1024x1024'); // edits endpoint typically requires 1024x1024
-            
-            // 必须提供 filename 和 contentType
-            form.append('image', parsed.buffer, {
-                filename: `reference.${parsed.ext}`,
-                contentType: parsed.mime
-            });
-
-            // 如果有前端生成的 mask 也传过去
-            if (images[0].mask) {
-                const parsedMask = parseDataUrlImage(images[0].mask);
-                if (parsedMask) {
-                    form.append('mask', parsedMask.buffer, {
-                        filename: `mask.${parsedMask.ext}`,
-                        contentType: parsedMask.mime
-                    });
-                }
-            }
+            const formData = new FormData();
+            formData.append('prompt', prompt);
+            formData.append('n', '1');
+            formData.append('size', '1024x1024');
+            formData.append('image', new Blob([parsed.buffer], { type: parsed.mime }), `reference.${parsed.ext}`);
 
             response = await fetchWithTimeout(url, {
                 method: 'POST',
-                headers: { 
-                    'api-key': imageApiKey,
-                    ...form.getHeaders() // 这一步至关重要，带上 boundary
-                },
-                body: form
+                headers: { 'api-key': imageApiKey },
+                body: formData
             }, 240000);
         } else {
             const url = `${base}/openai/deployments/${deploymentName}/images/generations?api-version=${encodeURIComponent(imageApiVersion)}`;
