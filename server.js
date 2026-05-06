@@ -314,11 +314,13 @@ app.post('/api/ai-image', async (req, res) => {
 });
 
 // ==========================================
-// 3. 处理 AI 聊天记录保存和读取的接口 (Cosmos DB)
+// 3. 处理 AI 聊天记录保存和读取的接口 (Cosmos DB) - 增加身份识别
 // ==========================================
 app.post('/api/sessions', async (req, res) => {
     try {
-        const { sessions } = req.body;
+        const { sessions, userName } = req.body; // ✨ 新增：接收用户名
+        if (!userName) return res.json({ success: false, msg: "缺少用户身份" });
+
         for (const s of sessions) {
             for (const msg of s.messages) {
                 if (msg.mediaHtml && msg.mediaHtml.includes('data:image')) {
@@ -332,9 +334,27 @@ app.post('/api/sessions', async (req, res) => {
                     }
                 }
             }
-            await AiSession.findOneAndUpdate({ sessionId: s.id }, { sessionId: s.id, data: s }, { upsert: true });
+            if(process.env.MONGODB_URI) {
+                // ✨ 新增：根据 sessionId 和 userName 双重条件来查找和更新，打上专属标签
+                await AiSession.findOneAndUpdate(
+                    { sessionId: s.id, userName: userName }, 
+                    { sessionId: s.id, userName: userName, data: s }, 
+                    { upsert: true }
+                );
+            }
         }
         res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/sessions', async (req, res) => {
+    try {
+        if(!process.env.MONGODB_URI) return res.json([]);
+        const userName = req.query.userName; // ✨ 新增：从请求中获取用户名
+        
+        // ✨ 新增：只去数据库里拿属于这个 user 的聊天记录
+        const docs = await AiSession.find(userName ? { userName: userName } : {}).lean();
+        res.json(docs.map(d => d.data));
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
