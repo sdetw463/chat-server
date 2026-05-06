@@ -132,20 +132,42 @@ if (imageEndpoint && imageApiKey) {
     openaiImageClient = new AzureOpenAI({ endpoint: imageEndpoint, apiKey: imageApiKey, apiVersion: imageApiVersion, deployment: imageDeployment });
 }
 
-async function searchWeb(query) {
-    if (!TAVILY_API_KEY) return "⚠️ 搜索功能未配置：缺少 TAVILY_API_KEY 环境变量。";
+async function searchWebResults(query, options = {}) {
+    if (!TAVILY_API_KEY) return { error: "⚠️ 搜索功能未配置：缺少 TAVILY_API_KEY 环境变量。", results: [] };
     try {
         const response = await fetch("https://api.tavily.com/search", {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ api_key: TAVILY_API_KEY, query, search_depth: "basic", include_answer: false, max_results: 5 })
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                api_key: TAVILY_API_KEY,
+                query,
+                search_depth: options.search_depth || "basic",
+                include_answer: false,
+                max_results: options.max_results || 5
+            })
         });
-        if (!response.ok) return "网络搜索请求失败，暂时无法获取实时信息。";
+        if (!response.ok) return { error: "网络搜索请求失败，暂时无法获取实时信息。", results: [] };
         const data = await response.json();
-        if (data.results && data.results.length > 0) {
-            return data.results.map((item, index) => [`搜索结果 ${index + 1}`, `标题: ${item.title || "无标题"}`, `链接: ${item.url || "无链接"}`, `内容: ${item.content || "无摘要"}`].join('\n')).join('\n\n');
-        }
-        return "没有找到相关的搜索结果。";
-    } catch (error) { return "网络搜索失败。"; }
+        return { error: "", results: Array.isArray(data.results) ? data.results : [] };
+    } catch (error) {
+        return { error: "网络搜索失败。", results: [] };
+    }
+}
+
+function formatSearchResults(results) {
+    if (!results || results.length === 0) return "没有找到相关的搜索结果。";
+    return results.map((item, index) => [
+        `搜索结果 ${index + 1}`,
+        `标题: ${item.title || "无标题"}`,
+        `链接: ${item.url || "无链接"}`,
+        `内容: ${item.content || "无摘要"}`
+    ].join('\n')).join('\n\n');
+}
+
+async function searchWeb(query) {
+    const data = await searchWebResults(query, { search_depth: "basic", max_results: 5 });
+    if (data.error) return data.error;
+    return formatSearchResults(data.results);
 }
 
 const tools = [{ type: "function", function: { name: "search_web", description: "当你需要获取最新新闻、实时信息、当前时间相关信息、价格、天气、官网资料、客观事实更新时，必须调用此工具进行网络搜索。", parameters: { type: "object", properties: { query: { type: "string", description: "提取出来的精准搜索关键词" } }, required: ["query"] } } }];
@@ -265,6 +287,22 @@ function buildMinimalVisionMessages(images) {
     ];
 }
 
+const THINKING_MODE_PROMPT = [
+    TUOTUO_PERSONA_PROMPT,
+    "\n【思考一下模式】",
+    "回答前请先在内部更仔细地拆解问题、检查约束、比较可能方案，再给出最终答案。",
+    "不要展示冗长的内部推理过程；直接给用户清晰、可靠、结构化的结论。",
+    "如果问题涉及代码、数学、方案选择或复杂分析，请优先保证正确性和可执行性。"
+].join("\n");
+
+const RESEARCH_MODE_PROMPT = [
+    TUOTUO_PERSONA_PROMPT,
+    "\n【深度研究模式】",
+    "你将收到用户问题和多轮联网搜索结果。请综合资料后回答，优先给出结论、关键依据、可能的不确定性和后续建议。",
+    "必须在答案末尾附上“参考来源”，列出用到的标题和链接。",
+    "不要编造来源；如果搜索结果不足，请明确说明资料有限。"
+].join("\n");
+
 function safeParseJSON(text, fallback = {}) { try { return JSON.parse(text); } catch { return fallback; } }
 function setupSSE(res) { res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no" }); if (typeof res.flushHeaders === "function") res.flushHeaders(); }
 function sendSSE(res, data) { res.write(`data: ${JSON.stringify(data)}\n\n`); }
@@ -317,6 +355,80 @@ async function runDocumentOnce(messages) {
     return runCleanCompletionOnce(messages);
 }
 
+function messagesWithSystemPrompt(messages, systemPrompt) {
+    const cloned = messages.map(msg => ({ ...msg }));
+    if (cloned[0] && cloned[0].role === "system") cloned[0] = { role: "system", content: systemPrompt };
+    else cloned.unshift({ role: "system", content: systemPrompt });
+    return cloned;
+}
+
+function getResearchQueries(userMessage) {
+    const base = String(userMessage || '').replace(/【用户上传了附件：[\s\S]*$/g, '').trim() || '最新资料';
+    const cleaned = base.slice(0, 160);
+    return Array.from(new Set([
+        cleaned,
+        `${cleaned} 最新 官方 2026`,
+        `${cleaned} 背景 分析 资料`
+    ])).slice(0, 3);
+}
+
+function formatResearchMaterial(items) {
+    if (!items.length) return '没有找到可用联网资料。';
+    return items.map((item, index) => [
+        `资料 ${index + 1}`,
+        `标题: ${item.title || '无标题'}`,
+        `链接: ${item.url || '无链接'}`,
+        `摘要: ${item.content || '无摘要'}`
+    ].join('\n')).join('\n\n');
+}
+
+async function handleResearchMode(userMessage, chatHistory, res) {
+    if (!TAVILY_API_KEY) {
+        sendSSE(res, { status: "深度研究需要先配置 TAVILY_API_KEY" });
+        throw new Error("深度研究模式需要配置 TAVILY_API_KEY 环境变量。");
+    }
+
+    const queries = getResearchQueries(userMessage);
+    const resultMap = new Map();
+
+    for (const query of queries) {
+        sendSSE(res, { status: `正在深度搜索：${query}`, tool: "search", query });
+        const data = await searchWebResults(query, { search_depth: "advanced", max_results: 5 });
+        if (data.error) sendSSE(res, { status: data.error });
+        for (const item of data.results) {
+            const key = item.url || `${item.title || ''}-${item.content || ''}`;
+            if (key && !resultMap.has(key)) resultMap.set(key, item);
+        }
+    }
+
+    const results = Array.from(resultMap.values()).slice(0, 10);
+    sendSSE(res, { status: "已经找到资料，正在交叉整理结论" });
+
+    const researchMessages = [
+        { role: "system", content: RESEARCH_MODE_PROMPT },
+        { role: "user", content: [
+            `用户问题：\n${userMessage || ''}`,
+            `\n联网搜索资料：\n${formatResearchMaterial(results)}`,
+            "\n请基于以上资料进行深度研究回答，并在末尾列出参考来源。"
+        ].join('\n') }
+    ];
+
+    const stream = await openaiClient.chat.completions.create({ messages: researchMessages, model: deployment, stream: true });
+    let finalReply = "";
+    for await (const chunk of stream) {
+        const choice = chunk.choices && chunk.choices[0];
+        if (!choice) continue;
+        const delta = choice.delta || {};
+        if (delta.content) { finalReply += delta.content; sendSSE(res, { delta: delta.content }); }
+    }
+
+    chatHistory.push({ role: "user", content: userMessage || "" });
+    chatHistory.push({ role: "assistant", content: finalReply });
+    trimChatHistory(chatHistory);
+    sendSSE(res, { done: true });
+    return sendSSEDone(res);
+}
+
 async function handleStreamingAIChat(req, res) {
     setupSSE(res);
     const userMessage = req.body.message;
@@ -325,9 +437,13 @@ async function handleStreamingAIChat(req, res) {
     const imagesArray = normalizeInputImages(imagesArrayRaw);
     const hasImages = imagesArray.length > 0;
     const hasDocuments = !hasImages && hasUploadedDocumentText(userMessage);
+    const reasoningMode = ['normal', 'think', 'research'].includes(req.body.reasoningMode) ? req.body.reasoningMode : 'normal';
 
     const chatHistory = getOrCreateSession(sessionId);
-    sendSSE(res, { status: hasImages ? "正在客观分析图片内容" : (hasDocuments ? "正在用独立上下文分析文档" : "正在理解你的问题") });
+    const initialStatus = hasImages
+        ? "正在客观分析图片内容"
+        : (hasDocuments ? "正在用独立上下文分析文档" : (reasoningMode === 'research' ? "正在启动深度研究" : (reasoningMode === 'think' ? "正在认真思考" : "正在理解你的问题")));
+    sendSSE(res, { status: initialStatus });
 
     // 图片请求必须保持“无历史、无工具、无角色扮演”的干净上下文。
     // 之前的 server.js 把旧的可爱人设、tools、以及历史里的 base64 图片一起发给 Azure，
@@ -374,11 +490,16 @@ async function handleStreamingAIChat(req, res) {
         return sendSSEDone(res);
     }
 
+    if (reasoningMode === 'research') {
+        return await handleResearchMode(userMessage, chatHistory, res);
+    }
+
     const formattedContent = buildUserContent(userMessage, []);
     chatHistory.push({ role: "user", content: formattedContent });
     trimChatHistory(chatHistory);
 
-    const stream = await openaiClient.chat.completions.create({ messages: chatHistory, model: deployment, tools, tool_choice: "auto", stream: true });
+    const messagesForChat = reasoningMode === 'think' ? messagesWithSystemPrompt(chatHistory, THINKING_MODE_PROMPT) : chatHistory;
+    const stream = await openaiClient.chat.completions.create({ messages: messagesForChat, model: deployment, tools, tool_choice: "auto", stream: true });
     const { directReply, toolCalls } = await streamChatCompletionToSSE(stream, res);
 
     if (toolCalls.length === 0) {
@@ -403,7 +524,8 @@ async function handleStreamingAIChat(req, res) {
         }
     }
 
-    const finalMessages = [...chatHistory, assistantToolCallMessage, ...toolMessages];
+    const finalMessagesBase = [...chatHistory, assistantToolCallMessage, ...toolMessages];
+    const finalMessages = reasoningMode === 'think' ? messagesWithSystemPrompt(finalMessagesBase, THINKING_MODE_PROMPT) : finalMessagesBase;
     const finalStream = await openaiClient.chat.completions.create({ messages: finalMessages, model: deployment, stream: true });
     let finalReply = "";
 
