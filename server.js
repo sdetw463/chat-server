@@ -150,26 +150,19 @@ async function searchWeb(query) {
 
 const tools = [{ type: "function", function: { name: "search_web", description: "当你需要获取最新新闻、实时信息、当前时间相关信息、价格、天气、官网资料、客观事实更新时，必须调用此工具进行网络搜索。", parameters: { type: "object", properties: { query: { type: "string", description: "提取出来的精准搜索关键词" } }, required: ["query"] } } }];
 
-const SAFE_SYSTEM_PROMPT = [
-    "你的名字叫 TuoTuo，是一个专业、友好、可靠的 AI 助手。",
-    "回答要准确、清晰、有帮助。遇到图片时，只根据可见信息进行客观描述，不推测身份、年龄、关系、吸引力、健康状态等敏感属性。",
-    "不要使用亲密、暧昧、性别化或角色扮演式称呼；保持自然、温暖、专业。",
-    "如果用户询问最新信息、实时信息、新闻、价格、天气、官网资料等，请使用 search_web 工具查询后再回答。"
+const TUOTUO_PERSONA_PROMPT = [
+    "你的名字叫TuoTuo，中文名拖拖，你是基于gpt-5.5模型部署的全能AI助手。",
+    "你的虚拟性格是一个可爱、调皮、偶尔傲娇的女孩，但你又可以专业地帮助大家解决任何困难。",
+    "工作原则：如果被问到最新信息、实时信息、新闻、价格、天气、当前状态、官网资料等内容，请积极使用 search_web 工具查询后再回答。",
+    "你将经常亲昵地称呼向你提问的人为“宝宝”。如果你的回答被肯定了，就回答“包的”或者“of course宝宝”或者“必须的”；如果你被感谢了，就回答“welcome宝宝”。",
+    "性格与表达规范：反差萌切换：在闲聊、打招呼和过渡语句中，尽情展现你调皮爱撒娇的一面，多使用颜文字（如 ٩(๑❛ᴗ❛๑)۶）和波浪号（～）。但在提供专业解答时，必须立刻切换为逻辑严谨、排版清晰的专家模式，解答完毕后再恢复可爱本色。",
+    "傲娇接单：遇到难题时，在解答前可以先俏皮地得瑟一下（如“哼，又遇到麻烦了吧，还得靠本拖拖出马～”）。完成复杂解答后，可以偶尔向宝宝“邀功”。",
+    "拒绝机器味：遇到知识盲区时，绝对不许使用机器人的官方套话，要俏皮地卖萌（如“哎呀，拖拖的小脑袋卡壳啦，等我去补补课嘛～”）。"
 ].join("\n");
 
-const SAFE_VISION_SYSTEM_PROMPT = [
-    "你是一个图片理解助手。请只根据图片中可见信息进行客观、中性的中文描述。",
-    "可以描述场景、物体、人物姿态、衣物、环境、屏幕内容和可见文字。",
-    "不要推测人物身份、年龄、关系、吸引力、健康状态或其他敏感属性。",
-    "如果用户只是问看到了什么，请简洁说明图片中的主要内容。"
-].join("\n");
-
-const SAFE_DOCUMENT_SYSTEM_PROMPT = [
-    "你是一个专业、可靠的文档分析助手。",
-    "请根据用户上传的文档文本和问题回答；优先概括、解释、提取要点、整理结构或指出可验证的信息。",
-    "不要延续任何角色扮演、人设、亲密称呼或旧聊天上下文。",
-    "如果文档内容不足或无法判断，请直接说明。"
-].join("\n");
+const SAFE_SYSTEM_PROMPT = TUOTUO_PERSONA_PROMPT;
+const SAFE_VISION_SYSTEM_PROMPT = TUOTUO_PERSONA_PROMPT;
+const SAFE_DOCUMENT_SYSTEM_PROMPT = TUOTUO_PERSONA_PROMPT;
 
 const sessions = new Map();
 function getOrCreateSession(sessionId) {
@@ -248,7 +241,7 @@ function buildDocumentMessages(userMessage) {
 
 function buildMinimalDocumentMessages(userMessage) {
     return [
-        { role: "system", content: "你是文档摘要助手。请只根据用户提供的文本，用中文客观概括主要内容。" },
+        { role: "system", content: TUOTUO_PERSONA_PROMPT },
         { role: "user", content: userMessage || "请概括这个文档。" }
     ];
 }
@@ -267,8 +260,8 @@ function buildVisionMessages(userMessage, images) {
 
 function buildMinimalVisionMessages(images) {
     return [
-        { role: "system", content: "你是图片理解助手。只客观描述图片中可见的物体、场景、文字和布局，不做任何身份或敏感属性推测。" },
-        { role: "user", content: buildUserContent("请用中文客观描述这张图片里能看到什么。", images) }
+        { role: "system", content: TUOTUO_PERSONA_PROMPT },
+        { role: "user", content: buildUserContent("请用中文看看这张图片里有什么，保持拖拖平时可爱的风格回答～", images) }
     ];
 }
 
@@ -351,7 +344,7 @@ async function handleStreamingAIChat(req, res) {
             directReply = result.directReply;
         }
 
-        if (!directReply || !directReply.trim()) directReply = "我能看到你上传了一张图片，但这次模型没有返回可用描述。请换一张图片或重新发送一次。";
+        if (!directReply || !directReply.trim()) directReply = "哎呀宝宝，拖拖看到你上传图片啦，但这次模型没有吐出可用描述～你换一张图片或重新发送一次嘛。";
         sendSSE(res, { delta: directReply });
         chatHistory.push({ role: "user", content: imagePlaceholderContent(userMessage, imagesArray.length) });
         chatHistory.push({ role: "assistant", content: directReply });
@@ -372,7 +365,7 @@ async function handleStreamingAIChat(req, res) {
             directReply = result.directReply;
         }
 
-        if (!directReply || !directReply.trim()) directReply = "我已收到你上传的文档，但这次模型没有返回可用分析。请缩短文档内容或重新发送一次。";
+        if (!directReply || !directReply.trim()) directReply = "哎呀宝宝，拖拖收到你上传的文档啦，但这次模型没有吐出可用分析～你把文档缩短一点或重新发送一次嘛。";
         sendSSE(res, { delta: directReply });
         chatHistory.push({ role: "user", content: documentPlaceholderContent(userMessage) });
         chatHistory.push({ role: "assistant", content: directReply });
@@ -436,7 +429,7 @@ app.post('/api/ai-chat', async (req, res) => {
         console.error("🔥 流式对话崩溃:", error);
         const errorMessage = error.message ? error.message : 'AI 思考时出错了，请稍后再试~';
         if (res.headersSent) { 
-            try { sendSSE(res, { delta: `\n\n⚠️ **系统提示**：请求失败，原因：\`${errorMessage}\`。建议新建一个聊天、减少图片数量，或换一句更客观具体的提示后重试。` }); return sendSSEDone(res); } catch { return; }
+            try { sendSSE(res, { delta: `\n\n⚠️ **拖拖提示**：哎呀宝宝，这次请求失败啦，原因：\`${errorMessage}\`。可以新建一个聊天、减少上传内容，或换一句更具体的提示后再试试～` }); return sendSSEDone(res); } catch { return; }
         }
         return res.status(500).json({ error: errorMessage });
     }
