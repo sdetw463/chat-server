@@ -14,22 +14,30 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 // ==========================================
 // 1. 初始化数据库和对象存储
 // ==========================================
-mongoose.connect(process.env.MONGODB_URI, { useNewUrlParser: true, useUnifiedTopology: true })
-    .then(() => console.log('✅ MongoDB 数据库连接成功！'))
-    .catch(err => console.error('🔥 MongoDB 连接失败:', err));
+if (process.env.MONGODB_URI) {
+    mongoose.connect(process.env.MONGODB_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+        .then(() => console.log('✅ MongoDB 数据库连接成功！'))
+        .catch(err => console.error('🔥 MongoDB 连接失败:', err));
+} else {
+    console.error('❌ 警告：服务器没有读到 MONGODB_URI 环境变量！');
+}
 
 const wsMsgSchema = new mongoose.Schema({}, { strict: false, timestamps: true });
 const WsMessage = mongoose.model('WsMessage', wsMsgSchema, 'chat_history');
 
-const aiSessionSchema = new mongoose.Schema({ sessionId: String, data: Object }, { strict: false });
+const aiSessionSchema = new mongoose.Schema({ sessionId: String, userName: String, data: Object }, { strict: false });
 const AiSession = mongoose.model('AiSession', aiSessionSchema, 'ai_sessions');
 
-const blobServiceClient = BlobServiceClient.fromConnectionString(process.env.AZURE_STORAGE_CONNECTION_STRING);
-const containerClient = blobServiceClient.getContainerClient('tuotuo-files');
+let containerClient = null;
+if (process.env.AZURE_STORAGE_CONNECTION_STRING) {
+    try {
+        const blobServiceClient = BlobServiceClient.fromConnectionString(process.env.AZURE_STORAGE_CONNECTION_STRING);
+        containerClient = blobServiceClient.getContainerClient('tuotuo-files');
+    } catch(e) { console.error('存储连接错误', e); }
+}
 
-// 核心功能：拦截 Base64 并上传至云端 Blob 存储
 async function uploadBase64ToBlob(base64Str) {
-    if (!base64Str || !base64Str.startsWith('data:image')) return base64Str;
+    if (!containerClient || !base64Str || !base64Str.startsWith('data:image')) return base64Str;
     try {
         const matches = base64Str.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
         if (!matches || matches.length !== 3) return base64Str;
@@ -39,7 +47,7 @@ async function uploadBase64ToBlob(base64Str) {
         const blobName = `img_${Date.now()}_${Math.random().toString(36).substring(2, 8)}.${extension}`;
         const blockBlobClient = containerClient.getBlockBlobClient(blobName);
         await blockBlobClient.uploadData(buffer, { blobHTTPHeaders: { blobContentType: type } });
-        return blockBlobClient.url; // 返回高速云链接
+        return blockBlobClient.url;
     } catch (err) {
         console.error('图片上传 Blob 失败:', err);
         return base64Str;
@@ -47,7 +55,7 @@ async function uploadBase64ToBlob(base64Str) {
 }
 
 // ==========================================
-// 2. 完整保留的 AI 接口和搜索逻辑
+// 2. AI 接口和搜索逻辑
 // ==========================================
 const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
 const apiKey = process.env.AZURE_OPENAI_KEY;
@@ -69,7 +77,6 @@ if (imageEndpoint && imageApiKey) {
 async function searchWeb(query) {
     if (!TAVILY_API_KEY) return "⚠️ 搜索功能未配置：缺少 TAVILY_API_KEY 环境变量。";
     try {
-        console.log(`🔍 AI 正在后台全网搜索: ${query}`);
         const response = await fetch("https://api.tavily.com/search", {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ api_key: TAVILY_API_KEY, query, search_depth: "basic", include_answer: false, max_results: 5 })
@@ -129,7 +136,6 @@ async function handleStreamingAIChat(req, res) {
     const sessionId = req.body.sessionId || 'default_user';
     const imagesArray = req.body.images || req.body.image || [];
 
-    // ✨ 在发给 AI 之前，将可能存在的 Base64 图片全量转换为云端 URL
     const processedImages = [];
     for (const img of (Array.isArray(imagesArray) ? imagesArray : [imagesArray])) {
         processedImages.push(await uploadBase64ToBlob(img));
@@ -221,32 +227,22 @@ app.post('/api/ai-chat', async (req, res) => {
     }
 });
 
-// 完整保留的 AI 画图接口
 app.post('/api/ai-image', async (req, res) => {
     try {
         const prompt = req.body.prompt;
         const images = req.body.images; 
         if (!prompt) return res.status(400).json({ error: '必须告诉 TuoTuo 你想画什么哦！' });
 
-        console.log(`🎨 TuoTuo 正在后台努力画图: ${prompt}`);
-
-        // ✨ 魔法在这里：智能解析用户想要的大小
-        let targetSize = "1024x1024"; // 默认正方形
-        if (/(竖屏|竖图|手机壁纸|9:16|1024x1792)/i.test(prompt)) {
-            targetSize = "1024x1792"; // 匹配为标准的竖向尺寸
-        } else if (/(横屏|横图|电脑壁纸|宽屏|16:9|1792x1024)/i.test(prompt)) {
-            targetSize = "1792x1024"; // 匹配为标准的横向尺寸
-        }
+        let targetSize = "1024x1024";
+        if (/(竖屏|竖图|手机壁纸|9:16|1024x1792)/i.test(prompt)) targetSize = "1024x1792";
+        else if (/(横屏|横图|电脑壁纸|宽屏|16:9|1792x1024)/i.test(prompt)) targetSize = "1792x1024";
 
         const targetEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || endpoint;
         const targetKey = process.env.AZURE_OPENAI_IMAGE_KEY || apiKey;
         const targetVersion = "2024-02-01"; 
 
         let response;
-
         if (images && images.length > 0) {
-            // ⚠️ 注意：如果是图生图 (修改图片)，Azure 底层通常强制要求正方形
-            // 为了防止 Azure 报错导致服务崩溃，这里我们依然锁定为 1024x1024
             const url = `${targetEndpoint.replace(/\/$/, '')}/openai/deployments/gpt-image-2/images/edits?api-version=${targetVersion}`;
             const formData = new FormData();
             formData.append('prompt', prompt);
@@ -254,47 +250,25 @@ app.post('/api/ai-image', async (req, res) => {
             formData.append('size', "1024x1024"); 
             
             const imgObj = images[0]; 
-            
             if (imgObj.image) {
                 const base64Data = imgObj.image.replace(/^data:image\/\w+;base64,/, "");
                 const buffer = Buffer.from(base64Data, 'base64');
                 formData.append('image', new Blob([buffer], { type: 'image/png' }), 'image.png');
             }
-            
             if (imgObj.mask) {
                 const maskData = imgObj.mask.replace(/^data:image\/\w+;base64,/, "");
                 const maskBuffer = Buffer.from(maskData, 'base64');
                 formData.append('mask', new Blob([maskBuffer], { type: 'image/png' }), 'mask.png');
             }
-
-            response = await fetch(url, {
-                method: 'POST',
-                headers: { 'api-key': targetKey, 'Authorization': `Bearer ${targetKey}` },
-                body: formData 
-            });
-
+            response = await fetch(url, { method: 'POST', headers: { 'api-key': targetKey, 'Authorization': `Bearer ${targetKey}` }, body: formData });
         } else {
-            // ✨ 纯文生图：在这里应用我们智能识别出来的尺寸！
             const url = `${targetEndpoint.replace(/\/$/, '')}/openai/deployments/gpt-image-2/images/generations?api-version=${targetVersion}`;
-            const requestBody = { 
-                prompt: prompt, 
-                size: targetSize, // 使用智能匹配的动态尺寸
-                quality: "low", 
-                output_compression: 100, 
-                output_format: "png", 
-                n: 1 
-            };
-
-            response = await fetch(url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'api-key': targetKey, 'Authorization': `Bearer ${targetKey}` },
-                body: JSON.stringify(requestBody)
-            });
+            const requestBody = { prompt: prompt, size: targetSize, quality: "low", output_compression: 100, output_format: "png", n: 1 };
+            response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'api-key': targetKey, 'Authorization': `Bearer ${targetKey}` }, body: JSON.stringify(requestBody) });
         }
 
         if (!response.ok) {
             const errText = await response.text();
-            console.error("🔥 Azure 返回了错误:", errText);
             throw new Error(`Azure 拒绝了请求 (${response.status})：${errText}`);
         }
 
@@ -304,9 +278,7 @@ app.post('/api/ai-image', async (req, res) => {
         else if (data.data && data.data[0].url) { imageUrl = data.data[0].url; } 
         else { throw new Error("模型没有返回有效的图片数据"); }
 
-        const revisedPrompt = data.data[0].revised_prompt || prompt;
-        res.json({ url: imageUrl, revised_prompt: revisedPrompt });
-
+        res.json({ url: imageUrl, revised_prompt: data.data[0].revised_prompt || prompt });
     } catch (error) {
         console.error("🔥 AI 画图接口崩溃:", error);
         res.status(500).json({ error: error.message || 'AI 画家开小差了，请稍后再试~' });
@@ -314,11 +286,11 @@ app.post('/api/ai-image', async (req, res) => {
 });
 
 // ==========================================
-// 3. 处理 AI 聊天记录保存和读取的接口 (Cosmos DB) - 增加身份识别
+// 3. 处理 AI 聊天记录保存和读取的接口 (Cosmos DB)
 // ==========================================
 app.post('/api/sessions', async (req, res) => {
     try {
-        const { sessions, userName } = req.body; // ✨ 新增：接收用户名
+        const { sessions, userName } = req.body; 
         if (!userName) return res.json({ success: false, msg: "缺少用户身份" });
 
         for (const s of sessions) {
@@ -335,40 +307,36 @@ app.post('/api/sessions', async (req, res) => {
                 }
             }
             if(process.env.MONGODB_URI) {
-                // ✨ 新增：根据 sessionId 和 userName 双重条件来查找和更新，打上专属标签
-                await AiSession.findOneAndUpdate(
-                    { sessionId: s.id, userName: userName }, 
-                    { sessionId: s.id, userName: userName, data: s }, 
-                    { upsert: true }
-                );
+                await AiSession.findOneAndUpdate({ sessionId: s.id, userName: userName }, { sessionId: s.id, userName: userName, data: s }, { upsert: true });
             }
         }
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ✨ 已删掉多余的重复代码
 app.get('/api/sessions', async (req, res) => {
     try {
         if(!process.env.MONGODB_URI) return res.json([]);
-        const userName = req.query.userName; // ✨ 新增：从请求中获取用户名
-        
-        // ✨ 新增：只去数据库里拿属于这个 user 的聊天记录
+        const userName = req.query.userName; 
         const docs = await AiSession.find(userName ? { userName: userName } : {}).lean();
         res.json(docs.map(d => d.data));
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/sessions', async (req, res) => {
-    try {
-        const docs = await AiSession.find().lean();
-        res.json(docs.map(d => d.data));
-    } catch (err) { res.status(500).json({ error: err.message }); }
+// ✨ 全新体检工具
+app.get('/api/status', (req, res) => {
+    res.json({
+        "数据库是否连接": mongoose.connection.readyState === 1 ? "✅ 正常" : "❌ 未连接",
+        "MONGODB_URI 是否已读到": !!process.env.MONGODB_URI ? "✅ 是" : "❌ 否",
+        "云存储是否配置": !!process.env.AZURE_STORAGE_CONNECTION_STRING ? "✅ 是" : "❌ 否"
+    });
 });
 
-app.get('/', (req, res) => { res.send("TuoTuo Server is running with MongoDB & Blob Storage & Full AI Features!"); });
+app.get('/', (req, res) => { res.send("TuoTuo Server is running!"); });
 
 // ==========================================
-// 4. WebSocket (聊天室、日记、留言) 配合云端库
+// 4. WebSocket (聊天室、日记、留言)
 // ==========================================
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
@@ -380,7 +348,6 @@ wss.on('connection', async (ws, req) => {
     
     try {
         if(process.env.MONGODB_URI) {
-            // ✨ 核心修复：-1 代表倒序（拿最新的），取出最近的 800 条，然后再 reverse() 翻转回正常的时间顺序发给前端
             const history = await WsMessage.find().sort({ createdAt: -1 }).limit(800).lean();
             history.reverse();
             ws.send(JSON.stringify({ type: 'history', data: history }));
@@ -392,7 +359,6 @@ wss.on('connection', async (ws, req) => {
     ws.on('message', async (message) => {
         try {
             const data = JSON.parse(message);
-            // 自动拦截 Base64 并上传至云端图库
             if (data.msg && data.msg.startsWith('data:image')) {
                 data.msg = await uploadBase64ToBlob(data.msg);
             }
@@ -414,4 +380,4 @@ wss.on('connection', async (ws, req) => {
 function broadcast(data) { wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(data); }); }
 function broadcastUserList() { broadcast(JSON.stringify({ type: 'userlist', data: Array.from(clients.values()) })); }
 
-server.listen(process.env.PORT || 8888, () => { console.log(`✅ 完整终极版 TuoTuo 服务器已启动！`); });
+server.listen(process.env.PORT || 8888, () => { console.log(`✅ TuoTuo 服务器已启动！`); });
