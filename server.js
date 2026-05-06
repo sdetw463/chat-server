@@ -379,8 +379,12 @@ wss.on('connection', async (ws, req) => {
     clients.set(ws, nickname);
     
     try {
-        const history = await WsMessage.find().sort({ createdAt: 1 }).limit(100).lean();
-        ws.send(JSON.stringify({ type: 'history', data: history }));
+        if(process.env.MONGODB_URI) {
+            // ✨ 核心修复：-1 代表倒序（拿最新的），取出最近的 800 条，然后再 reverse() 翻转回正常的时间顺序发给前端
+            const history = await WsMessage.find().sort({ createdAt: -1 }).limit(800).lean();
+            history.reverse();
+            ws.send(JSON.stringify({ type: 'history', data: history }));
+        }
     } catch (err) { console.error("读取历史记录失败", err); }
     
     broadcastUserList();
@@ -396,8 +400,10 @@ wss.on('connection', async (ws, req) => {
                 data.imgs = await Promise.all(data.imgs.map(img => uploadBase64ToBlob(img)));
             }
 
-            const newMsg = new WsMessage(data);
-            await newMsg.save();
+            if(process.env.MONGODB_URI) {
+                const newMsg = new WsMessage(data);
+                await newMsg.save();
+            }
 
             broadcast(JSON.stringify({ type: 'message', ...data }));
         } catch (e) { console.error(e); }
