@@ -22,7 +22,6 @@ if (process.env.MONGODB_URI) {
     console.error('❌ 警告：服务器没有读到 MONGODB_URI 环境变量！');
 }
 
-// ✨ 修复 1：明确写出数据表的所有字段，防止 Cosmos DB 拒绝隐式数据的写入
 const wsMsgSchema = new mongoose.Schema({
     msgType: String,
     name: String,
@@ -159,17 +158,23 @@ function getOrCreateSession(sessionId) {
     return sessions.get(sessionId);
 }
 
+// ✨ 优化：增加容量限制（约3MB），确保即便处理 Base64 也不会撑爆 Node.js 内存
 function trimChatHistory(chatHistory) {
-    const MAX_MESSAGES = 50;
+    const MAX_MESSAGES = 30;
     while (chatHistory.length > MAX_MESSAGES) chatHistory.splice(1, 1);
     let totalLength = 0;
     for (let i = chatHistory.length - 1; i >= 1; i--) {
         const msg = chatHistory[i];
         let msgLength = 0;
         if (typeof msg.content === 'string') msgLength = msg.content.length;
-        else if (Array.isArray(msg.content)) msg.content.forEach(item => { if (item.type === 'text' && item.text) msgLength += item.text.length; else if (item.type === 'image_url') msgLength += 1000; });
+        else if (Array.isArray(msg.content)) {
+            msg.content.forEach(item => { 
+                if (item.type === 'text' && item.text) msgLength += item.text.length; 
+                else if (item.type === 'image_url' && item.image_url.url) msgLength += item.image_url.url.length; 
+            });
+        }
         totalLength += msgLength;
-        if (totalLength > 150000 && i < chatHistory.length - 2) chatHistory.splice(i, 1);
+        if (totalLength > 3000000 && i < chatHistory.length - 2) chatHistory.splice(i, 1);
     }
 }
 
@@ -193,15 +198,12 @@ async function handleStreamingAIChat(req, res) {
     setupSSE(res);
     const userMessage = req.body.message;
     const sessionId = req.body.sessionId || 'default_user';
-    const imagesArray = req.body.images || req.body.image || [];
+    const imagesArrayRaw = req.body.images || req.body.image || [];
+    const imagesArray = Array.isArray(imagesArrayRaw) ? imagesArrayRaw : [imagesArrayRaw];
 
-    const processedImages = [];
-    for (const img of (Array.isArray(imagesArray) ? imagesArray : [imagesArray])) {
-        processedImages.push(await uploadBase64ToBlob(img));
-    }
-
+    // ✨ 核心修复：跳过上传私有 Blob 的步骤，直接将带有 Data URL (Base64) 的数组交给 Azure OpenAI 进行多模态分析。
     const chatHistory = getOrCreateSession(sessionId);
-    const formattedContent = buildUserContent(userMessage, processedImages);
+    const formattedContent = buildUserContent(userMessage, imagesArray);
     chatHistory.push({ role: "user", content: formattedContent });
     trimChatHistory(chatHistory);
 
@@ -348,7 +350,7 @@ app.post('/api/ai-image', async (req, res) => {
 });
 
 // ==========================================
-// 3. 处理 AI 聊天记录保存和读取的接口 (Cosmos DB) - 已清理掉所有重复代码
+// 3. 处理 AI 聊天记录保存和读取的接口 (Cosmos DB)
 // ==========================================
 app.post('/api/sessions', async (req, res) => {
     try {
@@ -385,7 +387,6 @@ app.get('/api/sessions', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ✨ 状态体检工具
 app.get('/api/status', (req, res) => {
     res.json({
         "数据库是否连接": mongoose.connection.readyState === 1 ? "✅ 正常" : "❌ 未连接",
@@ -397,12 +398,11 @@ app.get('/api/status', (req, res) => {
     });
 });
 
-// ✨ 修复 2：终极物理读写探测工具，用于彻底排除数据库异常
 app.get('/api/test-db', async (req, res) => {
     try {
         const testData = { msgType: 'sys_test', msg: 'Hello Azure Cosmos DB!', time: new Date().toISOString() };
-        const created = await WsMessage.create(testData); // 强制写入测试数据
-        const history = await WsMessage.find().sort({ _id: -1 }).limit(5).lean(); // 测试通过 _id 倒序读取
+        const created = await WsMessage.create(testData); 
+        const history = await WsMessage.find().sort({ _id: -1 }).limit(5).lean(); 
         res.json({ success: true, message: "完美！读写测试全通！", data_written: created, recent_data: history });
     } catch (err) {
         res.json({ success: false, error_message: err.message, stack: err.stack });
@@ -424,7 +424,6 @@ wss.on('connection', async (ws, req) => {
     
     try {
         if(process.env.MONGODB_URI) {
-            // ✨ 修复 3：使用 _id 进行自带时间戳的完美排序，防止 Cosmos DB 报错拒载
             const history = await WsMessage.find().sort({ _id: -1 }).limit(800).lean();
             history.reverse();
             ws.send(JSON.stringify({ type: 'history', data: history }));
@@ -444,7 +443,6 @@ wss.on('connection', async (ws, req) => {
             }
 
             if(process.env.MONGODB_URI) {
-                // ✨ 修复 4：使用 create() 进行强制安全写入，规避隐式字段保存丢失问题
                 await WsMessage.create(data);
             }
 
