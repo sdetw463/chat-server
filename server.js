@@ -139,7 +139,7 @@ if (imageEndpoint && imageApiKey) {
 async function searchWebResults(query, options = {}) {
     if (!TAVILY_API_KEY) return { error: "⚠️ 搜索功能未配置：缺少 TAVILY_API_KEY 环境变量。", results: [] };
     try {
-        const response = await fetch("https://api.tavily.com/search", {
+        const response = await fetchWithTimeout("https://api.tavily.com/search", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -149,7 +149,7 @@ async function searchWebResults(query, options = {}) {
                 include_answer: false,
                 max_results: options.max_results || 5
             })
-        });
+        }, options.timeoutMs || 45000);
         if (!response.ok) return { error: "网络搜索请求失败，暂时无法获取实时信息。", results: [] };
         const data = await response.json();
         return { error: "", results: Array.isArray(data.results) ? data.results : [] };
@@ -203,7 +203,7 @@ const TUOTUO_PERSONA_PROMPT = [
 ].join("\n");
 
 function getReasoningEffort(mode) {
-    if (mode === "research") return process.env.AI_RESEARCH_REASONING_EFFORT || "xhigh";
+    if (mode === "research") return process.env.AI_RESEARCH_REASONING_EFFORT || "high";
     if (mode === "think") return process.env.AI_THINK_REASONING_EFFORT || "high";
     if (mode === "vision") return process.env.AI_VISION_REASONING_EFFORT || "medium";
     if (mode === "document") return process.env.AI_DOCUMENT_REASONING_EFFORT || "high";
@@ -213,7 +213,7 @@ function getReasoningEffort(mode) {
 function shouldRetryWithoutAdvancedParams(error) {
     const msg = String(error && (error.message || error) || '').toLowerCase();
     const status = error && (error.status || error.code || error.statusCode);
-    return status === 400 && (
+    return Number(status) === 400 && (
         msg.includes('unsupported') ||
         msg.includes('unrecognized') ||
         msg.includes('unknown parameter') ||
@@ -374,9 +374,39 @@ const RESEARCH_MODE_PROMPT = [
 ].join("\n");
 
 function safeParseJSON(text, fallback = {}) { try { return JSON.parse(text); } catch { return fallback; } }
-function setupSSE(res) { res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no" }); if (typeof res.flushHeaders === "function") res.flushHeaders(); }
-function sendSSE(res, data) { res.write(`data: ${JSON.stringify(data)}\n\n`); }
-function sendSSEDone(res) { res.write(`data: [DONE]\n\n`); res.end(); }
+function clearSSEHeartbeat(res) {
+    if (res && res.__sseHeartbeat) {
+        clearInterval(res.__sseHeartbeat);
+        res.__sseHeartbeat = null;
+    }
+}
+function setupSSE(res) {
+    res.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no"
+    });
+    if (typeof res.flushHeaders === "function") res.flushHeaders();
+    res.__sseHeartbeat = setInterval(() => {
+        try {
+            sendSSE(res, { type: "heartbeat", ts: Date.now() });
+        } catch {
+            clearSSEHeartbeat(res);
+        }
+    }, 12000);
+    res.on("close", () => clearSSEHeartbeat(res));
+}
+function sendSSE(res, data) {
+    if (!res || res.writableEnded || res.destroyed) return;
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+function sendSSEDone(res) {
+    clearSSEHeartbeat(res);
+    if (!res || res.writableEnded || res.destroyed) return;
+    res.write(`data: [DONE]\n\n`);
+    res.end();
+}
 
 async function streamChatCompletionToSSE(stream, res, options = {}) {
     let directReply = "";
@@ -469,11 +499,16 @@ async function handleResearchMode(userMessage, chatHistory, res) {
     const queries = getResearchQueries(userMessage);
     const resultMap = new Map();
 
-    for (const query of queries) {
+    const searchBatches = await Promise.all(queries.map(async query => {
         sendSSE(res, { status: `正在深度搜索：${query}`, tool: "search", query });
-        const data = await searchWebResults(query, { search_depth: "advanced", max_results: 5 });
+        const data = await searchWebResults(query, { search_depth: "advanced", max_results: 5, timeoutMs: 45000 });
         if (data.error) sendSSE(res, { status: data.error });
-        for (const item of data.results) {
+        else sendSSE(res, { status: `完成搜索：${query}` });
+        return data.results || [];
+    }));
+
+    for (const batchResults of searchBatches) {
+        for (const item of batchResults) {
             const key = item.url || `${item.title || ''}-${item.content || ''}`;
             if (key && !resultMap.has(key)) resultMap.set(key, item);
         }
