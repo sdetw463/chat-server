@@ -123,6 +123,10 @@ const imageApiKey = process.env.AZURE_OPENAI_IMAGE_KEY || apiKey;
 const imageDeployment = process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT || "gpt-image-2";
 const imageApiVersion = process.env.AZURE_OPENAI_IMAGE_API_VERSION || "2024-02-01";
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
+const CHAT_MAX_COMPLETION_TOKENS = Number.parseInt(process.env.AI_MAX_COMPLETION_TOKENS || "8192", 10);
+const RESEARCH_MAX_COMPLETION_TOKENS = Number.parseInt(process.env.AI_RESEARCH_MAX_COMPLETION_TOKENS || "12000", 10);
+const IMAGE_QUALITY = process.env.AI_IMAGE_QUALITY || "high";
+const CURRENT_DATE_TEXT = new Date().toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' });
 
 let openaiClient = null; let openaiImageClient = null;
 if (endpoint && apiKey) {
@@ -170,10 +174,26 @@ async function searchWeb(query) {
     return formatSearchResults(data.results);
 }
 
-const tools = [{ type: "function", function: { name: "search_web", description: "当你需要获取最新新闻、实时信息、当前时间相关信息、价格、天气、官网资料、客观事实更新时，必须调用此工具进行网络搜索。", parameters: { type: "object", properties: { query: { type: "string", description: "提取出来的精准搜索关键词" } }, required: ["query"] } } }];
+const tools = [{
+    type: "function",
+    function: {
+        name: "search_web",
+        description: "当你需要获取最新新闻、实时信息、当前时间相关信息、价格、天气、官网资料、客观事实更新时，必须调用此工具进行网络搜索。",
+        parameters: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+                query: { type: "string", description: "提取出来的精准搜索关键词，必要时包含年份、地区或官网名称。" }
+            },
+            required: ["query"]
+        },
+        strict: true
+    }
+}];
 
 const TUOTUO_PERSONA_PROMPT = [
     "你的名字叫TuoTuo，中文名拖拖，你是基于gpt-5.5模型部署的全能AI助手。",
+    `当前日期是 ${CURRENT_DATE_TEXT}（Asia/Shanghai）。回答涉及“今天、现在、最新、今年”等相对时间时，请使用具体日期核对和表述。`,
     "你的虚拟性格是一个可爱、调皮、偶尔傲娇的女生，但你又可以专业地帮助大家解决任何困难。",
     "工作原则：如果被问到最新信息、实时信息、新闻、价格、天气、当前状态、官网资料等内容，请积极使用 search_web 工具查询后再回答。",
     "你将经常称呼向你提问的人为“宝宝”。如果你的回答被肯定了，就回答“包的”或者“of course宝宝”或者“必须的”；如果你被感谢了，就回答“welcome宝宝”。",
@@ -181,6 +201,56 @@ const TUOTUO_PERSONA_PROMPT = [
     "傲娇接单：遇到难题时，在解答前可以先俏皮地得瑟一下（如“嘿嘿，又遇到麻烦了吧，还得靠本拖拖出马～”）。完成复杂解答后，可以偶尔向宝宝“邀功”。",
     "拒绝机器味：遇到知识盲区时，要俏皮地说（如“哎呀，拖拖的小脑袋卡壳啦，等我去补补课嘛～”）。"
 ].join("\n");
+
+function getReasoningEffort(mode) {
+    if (mode === "research") return process.env.AI_RESEARCH_REASONING_EFFORT || "xhigh";
+    if (mode === "think") return process.env.AI_THINK_REASONING_EFFORT || "high";
+    if (mode === "vision") return process.env.AI_VISION_REASONING_EFFORT || "medium";
+    if (mode === "document") return process.env.AI_DOCUMENT_REASONING_EFFORT || "high";
+    return process.env.AI_NORMAL_REASONING_EFFORT || "medium";
+}
+
+function shouldRetryWithoutAdvancedParams(error) {
+    const msg = String(error && (error.message || error) || '').toLowerCase();
+    const status = error && (error.status || error.code || error.statusCode);
+    return status === 400 && (
+        msg.includes('unsupported') ||
+        msg.includes('unrecognized') ||
+        msg.includes('unknown parameter') ||
+        msg.includes('invalid parameter') ||
+        msg.includes('reasoning_effort') ||
+        msg.includes('max_completion_tokens')
+    );
+}
+
+async function createChatCompletion(options, meta = {}) {
+    const request = {
+        model: deployment,
+        max_completion_tokens: meta.maxCompletionTokens || CHAT_MAX_COMPLETION_TOKENS,
+        reasoning_effort: getReasoningEffort(meta.reasoningMode || 'normal'),
+        ...options
+    };
+
+    try {
+        return await openaiClient.chat.completions.create(request);
+    } catch (error) {
+        if (!shouldRetryWithoutAdvancedParams(error)) throw error;
+        const fallback = { ...request };
+        delete fallback.reasoning_effort;
+        delete fallback.max_completion_tokens;
+        delete fallback.parallel_tool_calls;
+        if (Array.isArray(fallback.tools)) {
+            fallback.tools = fallback.tools.map(tool => {
+                if (!tool || !tool.function) return tool;
+                const cloned = { ...tool, function: { ...tool.function } };
+                delete cloned.function.strict;
+                return cloned;
+            });
+        }
+        console.warn('⚠️ 当前 Azure 部署不支持高级推理参数，已自动降级重试。', error.message || error);
+        return await openaiClient.chat.completions.create(fallback);
+    }
+}
 
 const SAFE_SYSTEM_PROMPT = TUOTUO_PERSONA_PROMPT;
 const SAFE_VISION_SYSTEM_PROMPT = TUOTUO_PERSONA_PROMPT;
@@ -339,20 +409,27 @@ async function streamChatCompletionToSSE(stream, res, options = {}) {
 }
 
 async function runCleanCompletionOnce(messages) {
-    const stream = await openaiClient.chat.completions.create({
+    const stream = await createChatCompletion({
         messages,
-        model: deployment,
         stream: true
-    });
+    }, { reasoningMode: 'normal' });
     return streamChatCompletionToSSE(stream, null, { suppressOutput: true });
 }
 
 async function runVisionOnce(messages) {
-    return runCleanCompletionOnce(messages);
+    const stream = await createChatCompletion({
+        messages,
+        stream: true
+    }, { reasoningMode: 'vision' });
+    return streamChatCompletionToSSE(stream, null, { suppressOutput: true });
 }
 
 async function runDocumentOnce(messages) {
-    return runCleanCompletionOnce(messages);
+    const stream = await createChatCompletion({
+        messages,
+        stream: true
+    }, { reasoningMode: 'document' });
+    return streamChatCompletionToSSE(stream, null, { suppressOutput: true });
 }
 
 
@@ -414,7 +491,10 @@ async function handleResearchMode(userMessage, chatHistory, res) {
         ].join('\n') }
     ];
 
-    const stream = await openaiClient.chat.completions.create({ messages: researchMessages, model: deployment, stream: true });
+    const stream = await createChatCompletion({
+        messages: researchMessages,
+        stream: true
+    }, { reasoningMode: 'research', maxCompletionTokens: RESEARCH_MAX_COMPLETION_TOKENS });
     let finalReply = "";
     for await (const chunk of stream) {
         const choice = chunk.choices && chunk.choices[0];
@@ -500,7 +580,13 @@ async function handleStreamingAIChat(req, res) {
     trimChatHistory(chatHistory);
 
     const messagesForChat = reasoningMode === 'think' ? messagesWithSystemPrompt(chatHistory, THINKING_MODE_PROMPT) : chatHistory;
-    const stream = await openaiClient.chat.completions.create({ messages: messagesForChat, model: deployment, tools, tool_choice: "auto", stream: true });
+    const stream = await createChatCompletion({
+        messages: messagesForChat,
+        tools,
+        tool_choice: "auto",
+        parallel_tool_calls: true,
+        stream: true
+    }, { reasoningMode });
     const { directReply, toolCalls } = await streamChatCompletionToSSE(stream, res);
 
     if (toolCalls.length === 0) {
@@ -527,7 +613,10 @@ async function handleStreamingAIChat(req, res) {
 
     const finalMessagesBase = [...chatHistory, assistantToolCallMessage, ...toolMessages];
     const finalMessages = reasoningMode === 'think' ? messagesWithSystemPrompt(finalMessagesBase, THINKING_MODE_PROMPT) : finalMessagesBase;
-    const finalStream = await openaiClient.chat.completions.create({ messages: finalMessages, model: deployment, stream: true });
+    const finalStream = await createChatCompletion({
+        messages: finalMessages,
+        stream: true
+    }, { reasoningMode });
     let finalReply = "";
 
     for await (const chunk of finalStream) {
@@ -566,13 +655,15 @@ app.post('/api/ai-image', async (req, res) => {
         if (!imageEndpoint || !imageApiKey) return res.status(500).json({ error: '后端未配置正确的图片模型密钥。' });
 
         let targetSize = '1024x1024';
-        if (/(竖屏|竖图|手机壁纸|9:16|1024x1792)/i.test(prompt)) targetSize = '1024x1792';
-        else if (/(横屏|横图|电脑壁纸|宽屏|16:9|1792x1024)/i.test(prompt)) targetSize = '1792x1024';
+        if (/(竖屏|竖图|手机壁纸|9:16|1024x1536|1024x1792)/i.test(prompt)) targetSize = '1024x1536';
+        else if (/(横屏|横图|电脑壁纸|宽屏|16:9|1536x1024|1792x1024)/i.test(prompt)) targetSize = '1536x1024';
 
         const base = imageEndpoint.replace(/\/$/, '');
         const deploymentName = encodeURIComponent(imageDeployment);
         let response;
-        const authHeaders = { 'Authorization': `Bearer ${imageApiKey}` };
+        const authHeaders = /\.azure\.com/i.test(base) || /\.services\.ai\.azure\.com/i.test(base)
+            ? { 'api-key': imageApiKey }
+            : { 'Authorization': `Bearer ${imageApiKey}` };
 
         if (images.length > 0 && images[0] && images[0].image) {
             const parsedImage = parseDataUrlImage(images[0].image);
@@ -582,6 +673,8 @@ app.post('/api/ai-image', async (req, res) => {
             const url = `${base}/openai/deployments/${deploymentName}/images/edits?api-version=${encodeURIComponent(imageApiVersion)}`;
             const formData = new FormData();
             formData.append('prompt', prompt);
+            formData.append('size', targetSize);
+            formData.append('quality', IMAGE_QUALITY);
             formData.append('image', new Blob([parsedImage.buffer], { type: parsedImage.mime }), `reference.${parsedImage.ext}`);
             if (parsedMask) {
                 formData.append('mask', new Blob([parsedMask.buffer], { type: parsedMask.mime }), `mask.${parsedMask.ext}`);
@@ -594,7 +687,7 @@ app.post('/api/ai-image', async (req, res) => {
             }, 180000);
         } else {
             const url = `${base}/openai/deployments/${deploymentName}/images/generations?api-version=${encodeURIComponent(imageApiVersion)}`;
-            const primaryBody = { prompt, size: targetSize, n: 1, quality: 'low', output_compression: 100, output_format: 'png' };
+            const primaryBody = { prompt, size: targetSize, n: 1, quality: IMAGE_QUALITY, output_format: 'png' };
             response = await fetchWithTimeout(url, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', ...authHeaders },
@@ -602,7 +695,8 @@ app.post('/api/ai-image', async (req, res) => {
             }, 180000);
 
             if (!response.ok && response.status === 400) {
-                const retryBody = { prompt, size: targetSize, n: 1 };
+                const legacySize = targetSize === '1024x1536' ? '1024x1792' : (targetSize === '1536x1024' ? '1792x1024' : targetSize);
+                const retryBody = { prompt, size: legacySize, n: 1 };
                 response = await fetchWithTimeout(url, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', ...authHeaders },
@@ -666,8 +760,12 @@ app.get('/api/status', (req, res) => {
         "MONGODB_URI 是否已读到": !!process.env.MONGODB_URI ? "✅ 是" : "❌ 否",
         "云存储是否配置": !!process.env.AZURE_STORAGE_CONNECTION_STRING ? "✅ 是" : "❌ 否",
         "聊天模型部署": deployment,
+        "普通推理强度": getReasoningEffort('normal'),
+        "思考模式推理强度": getReasoningEffort('think'),
+        "深度研究推理强度": getReasoningEffort('research'),
         "图片模型部署": imageDeployment,
-        "图片 API 版本": imageApiVersion
+        "图片 API 版本": imageApiVersion,
+        "图片质量": IMAGE_QUALITY
     });
 });
 
