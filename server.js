@@ -774,9 +774,19 @@ app.post('/api/ai-image', async (req, res) => {
             const parsedImage = parseDataUrlImage(images[0].image);
             if (!parsedImage) return res.status(400).json({ error: '参考图片格式无效，请重新上传图片。' });
 
-            const parsedMask = parseDataUrlImage(images[0].mask || '');
+            const parsedMask = images[0].mask ? parseDataUrlImage(images[0].mask) : null;
+            if (images[0].mask && !parsedMask) return res.status(400).json({ error: '参考图片的 mask 格式无效，请重新上传图片。' });
             const { url, authHeaders, azure } = buildImageRequest(base, 'edit');
             requestUrl = url;
+            console.log('🎨 AI 图生图请求:', {
+                imageBytes: parsedImage.buffer.length,
+                imageMime: parsedImage.mime,
+                maskBytes: parsedMask ? parsedMask.buffer.length : 0,
+                ratio: imageOptions.ratio,
+                size: targetSize,
+                apiVersion: imageEditApiVersion,
+                url
+            });
             response = await fetchWithTimeout(url, {
                 method: 'POST',
                 headers: authHeaders,
@@ -785,6 +795,13 @@ app.post('/api/ai-image', async (req, res) => {
         } else {
             const { url, authHeaders } = buildImageRequest(base, 'generation');
             requestUrl = url;
+            console.log('🎨 AI 文生图请求:', {
+                ratio: imageOptions.ratio,
+                size: targetSize,
+                quality: imageOptions.quality,
+                apiVersion: imageApiVersion,
+                url
+            });
             const primaryBody = buildImageGenerationBody(prompt, targetSize, imageOptions.quality, true);
             response = await fetchWithTimeout(url, {
                 method: 'POST',
