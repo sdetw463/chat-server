@@ -83,7 +83,13 @@ function parseDataUrlImage(dataUrl) {
 
 async function readAzureError(response, context = {}) {
     const text = await response.text();
-    const hint = context.url ? `；请求路径：${context.url}` : '';
+    const hintParts = [];
+    if (context.url) hintParts.push(`请求路径：${context.url}`);
+    if (context.mode) hintParts.push(`模式：${context.mode}`);
+    if (context.mode === 'edit' && response.status === 404) {
+        hintParts.push('提示：Foundry 的 images.generate 示例只对应文生图；如果该部署未开放 /images/edits，上传参考图会 404，需要在 Foundry 中确认是否另有图片编辑示例或部署。');
+    }
+    const hint = hintParts.length ? `；${hintParts.join('；')}` : '';
     if (!text) return `Azure 请求失败 (${response.status})${hint}`;
     try {
         const obj = JSON.parse(text);
@@ -116,20 +122,16 @@ function isAzureImageEndpoint(base) {
     return /\.azure\.com/i.test(base) || /\.services\.ai\.azure\.com/i.test(base);
 }
 
-function buildImageRequest(base, endpointType, overrideApiVersion = null) {
+function buildImageRequest(base, endpointType) {
     const azure = isAzureImageEndpoint(base);
     const deploymentName = encodeURIComponent(imageDeployment);
     const path = endpointType === 'edit' ? 'edits' : 'generations';
-    const apiVersionForRequest = overrideApiVersion || (endpointType === 'edit' ? imageEditApiVersion : imageApiVersion);
+    const apiVersionForRequest = endpointType === 'edit' ? imageEditApiVersion : imageApiVersion;
     const url = azure
         ? `${base}/openai/deployments/${deploymentName}/images/${path}?api-version=${encodeURIComponent(apiVersionForRequest)}`
         : `${base.replace(/\/v1$/i, '')}/v1/images/${path}`;
     const authHeaders = { 'Authorization': `Bearer ${imageApiKey}` };
     return { url, authHeaders, azure, apiVersion: apiVersionForRequest };
-}
-
-function uniqueList(items) {
-    return Array.from(new Set(items.filter(Boolean)));
 }
 
 function buildImageEditFormData(parsedImage, parsedMask, prompt, azure) {
@@ -157,8 +159,8 @@ function resolveImageOptions(reqBody = {}, prompt = '') {
         else if (/(横屏|横图|电脑壁纸|宽屏|16:9|4:3|1536x1024|1792x1024)/i.test(prompt)) size = '1536x1024';
     }
 
-    const qualityRaw = String(reqBody.quality || IMAGE_QUALITY || 'high').toLowerCase();
-    const quality = ['low', 'medium', 'high', 'auto'].includes(qualityRaw) ? qualityRaw : 'high';
+    const qualityRaw = String(reqBody.quality || IMAGE_QUALITY || 'low').toLowerCase();
+    const quality = ['low', 'medium', 'high', 'auto'].includes(qualityRaw) ? qualityRaw : 'low';
     const resolutionRaw = String(reqBody.resolution || '').toLowerCase();
     const wants4k = resolutionRaw === '4k' || /\b(4k|uhd|超高清|高清|高分辨率)\b/i.test(prompt);
     return { ratio, size, quality, wants4k };
@@ -174,9 +176,8 @@ function buildImageGenerationBody(prompt, targetSize, quality, includeAdvancedPa
     const body = { prompt, size: targetSize, n: 1 };
     if (!isAzureImageEndpoint((imageEndpoint || '').replace(/\/$/, ''))) body.model = imageDeployment;
     if (includeAdvancedParams) {
+        body.style = 'vivid';
         body.quality = quality;
-        body.output_compression = 100;
-        body.output_format = 'png';
     }
     return body;
 }
@@ -185,18 +186,18 @@ function buildImageGenerationBody(prompt, targetSize, quality, includeAdvancedPa
 // 2. 完整保留的 AI 接口和搜索逻辑
 // ==========================================
 const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
-const apiKey = process.env.AZURE_OPENAI_KEY;
-const apiVersion = process.env.AZURE_OPENAI_API_VERSION || "2024-12-01-preview";
-const deployment = process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-5.5";
+const apiKey = process.env.AZURE_OPENAI_KEY || process.env.AZURE_OPENAI_API_KEY;
+const apiVersion = process.env.AZURE_OPENAI_API_VERSION || process.env.OPENAI_API_VERSION || "2024-12-01-preview";
+const deployment = process.env.AZURE_OPENAI_DEPLOYMENT || process.env.DEPLOYMENT_NAME || "gpt-5.5";
 const imageEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || endpoint;
-const imageApiKey = process.env.AZURE_OPENAI_IMAGE_KEY || apiKey;
-const imageDeployment = process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT || "gpt-image-2";
-const imageApiVersion = process.env.AZURE_OPENAI_IMAGE_API_VERSION || "2025-04-01-preview";
+const imageApiKey = process.env.AZURE_OPENAI_IMAGE_KEY || process.env.AZURE_OPENAI_API_KEY || apiKey;
+const imageDeployment = process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT || process.env.DEPLOYMENT_NAME || "gpt-image-2";
+const imageApiVersion = process.env.AZURE_OPENAI_IMAGE_API_VERSION || process.env.OPENAI_API_VERSION || "2025-04-01-preview";
 const imageEditApiVersion = process.env.AZURE_OPENAI_IMAGE_EDIT_API_VERSION || imageApiVersion;
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 const CHAT_MAX_COMPLETION_TOKENS = Number.parseInt(process.env.AI_MAX_COMPLETION_TOKENS || "8192", 10);
 const RESEARCH_MAX_COMPLETION_TOKENS = Number.parseInt(process.env.AI_RESEARCH_MAX_COMPLETION_TOKENS || "12000", 10);
-const IMAGE_QUALITY = process.env.AI_IMAGE_QUALITY || "high";
+const IMAGE_QUALITY = process.env.AI_IMAGE_QUALITY || "low";
 const IMAGE_TIMEOUT_MS = Number.parseInt(process.env.AI_IMAGE_TIMEOUT_MS || "600000", 10);
 const CURRENT_DATE_TEXT = new Date().toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' });
 
@@ -774,42 +775,13 @@ app.post('/api/ai-image', async (req, res) => {
             if (!parsedImage) return res.status(400).json({ error: '参考图片格式无效，请重新上传图片。' });
 
             const parsedMask = parseDataUrlImage(images[0].mask || '');
-            const editApiVersions = uniqueList([
-                imageEditApiVersion,
-                '2025-04-01-preview',
-                '2025-01-01-preview',
-                '2024-12-01-preview',
-                imageApiVersion,
-                '2024-02-01'
-            ]);
-            const editAttempts = [];
-
-            for (const version of editApiVersions) {
-                const { url, authHeaders, azure } = buildImageRequest(base, 'edit', version);
-                requestUrl = url;
-                response = await fetchWithTimeout(url, {
-                    method: 'POST',
-                    headers: authHeaders,
-                    body: buildImageEditFormData(parsedImage, parsedMask, prompt, azure)
-                }, IMAGE_TIMEOUT_MS);
-
-                if (response.ok) break;
-
-                const errorText = await response.text();
-                editAttempts.push(`${response.status} ${url} ${errorText}`);
-                if (response.status !== 404) {
-                    throw new Error(`Azure 图片编辑请求失败 (${response.status})：${errorText || '未知错误'}；请求路径：${url}`);
-                }
-                console.warn(`⚠️ 图片编辑接口 404，尝试下一个 API 版本: ${version}`, errorText);
-            }
-
-            if (!response || !response.ok) {
-                throw new Error([
-                    'Azure 图片编辑接口仍然返回 404。这个部署很可能没有启用 images/edits 路由，或 Azure 门户里的示例只对另一个资源/部署有效。',
-                    `已尝试路径：${editAttempts.join(' | ')}`,
-                    '请在 Azure AI Foundry 的该部署页面确认是否有“编辑图像 / image edits”示例；如果没有，需要单独部署支持编辑的 gpt-image-2 或设置 AZURE_OPENAI_IMAGE_EDIT_API_VERSION 为门户示例中的版本。'
-                ].join(' '));
-            }
+            const { url, authHeaders, azure } = buildImageRequest(base, 'edit');
+            requestUrl = url;
+            response = await fetchWithTimeout(url, {
+                method: 'POST',
+                headers: authHeaders,
+                body: buildImageEditFormData(parsedImage, parsedMask, prompt, azure)
+            }, IMAGE_TIMEOUT_MS);
         } else {
             const { url, authHeaders } = buildImageRequest(base, 'generation');
             requestUrl = url;
@@ -833,7 +805,7 @@ app.post('/api/ai-image', async (req, res) => {
             }
         }
 
-        if (!response.ok) throw new Error(await readAzureError(response, { url: requestUrl }));
+        if (!response.ok) throw new Error(await readAzureError(response, { url: requestUrl, mode: images.length > 0 ? 'edit' : 'generate' }));
         const data = await response.json();
         const normalized = normalizeAzureImageData(data);
         res.json({
