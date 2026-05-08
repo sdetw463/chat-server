@@ -2,8 +2,7 @@ const WebSocket = require('ws');
 const http = require('http');
 const express = require('express');
 const cors = require('cors');
-// ✨ 引入了官方库自带的文件处理神器 toFile
-const { AzureOpenAI, toFile } = require('openai');
+const { AzureOpenAI } = require('openai');
 const mongoose = require('mongoose');
 const { BlobServiceClient } = require('@azure/storage-blob');
 
@@ -72,13 +71,9 @@ const imageApiKey = process.env.AZURE_OPENAI_IMAGE_KEY || apiKey;
 const imageDeployment = process.env.DEPLOYMENT_NAME || "gpt-image-2"; 
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 
-let openaiClient = null; let openaiImageClient = null;
+let openaiClient = null; 
 if (endpoint && apiKey) {
     openaiClient = new AzureOpenAI({ endpoint, apiKey, apiVersion, deployment });
-}
-if (imageEndpoint && imageApiKey) {
-    // 强制使用最新的 api_version 以支持原生的图片编辑
-    openaiImageClient = new AzureOpenAI({ endpoint: imageEndpoint, apiKey: imageApiKey, apiVersion: "2024-02-01", deployment: imageDeployment });
 }
 
 async function searchWeb(query) {
@@ -234,19 +229,15 @@ app.post('/api/ai-chat', async (req, res) => {
     }
 });
 
-
 // ==========================================
-// ✨ 核心重构：彻底解决 Node.js 兼容性，直接调用官方 SDK 实现图生图
+// ✨ 核心重构：废弃错误百出的官方 SDK 画图功能，使用原生精确 Fetch
+// 完全对齐你的 Python 与 Curl 成功经验
 // ==========================================
 app.post('/api/ai-image', async (req, res) => {
     try {
         const prompt = req.body.prompt;
         const images = req.body.images; 
         if (!prompt) return res.status(400).json({ error: '必须告诉 TuoTuo 你想画什么哦！' });
-
-        if (!openaiImageClient) {
-            return res.status(500).json({ error: '服务器未正确连接 Azure 画图模型。' });
-        }
 
         console.log(`🎨 TuoTuo 正在后台努力画图: ${prompt}`);
 
@@ -255,69 +246,99 @@ app.post('/api/ai-image', async (req, res) => {
         if (/(竖屏|竖图|手机壁纸|9:16|1024x1792)/i.test(prompt)) targetSize = "1024x1792";
         else if (/(横屏|横图|电脑壁纸|宽屏|16:9|1792x1024)/i.test(prompt)) targetSize = "1792x1024";
 
-        let imageUrl = '';
-        let revisedPrompt = prompt;
+        const targetVersion = "2024-02-01"; 
+        let response;
 
         // 【分支 1：图生图】如果有上传图片
         if (images && images.length > 0) {
             console.log("👀 检测到参考图，正在原生调用图生图 (edits) 接口...");
-            const imgObj = images[0]; 
             
-            // 提取纯 Base64 数据并转换为 Buffer
+            // 完美对齐你的 curl 接口地址
+            const url = `${imageEndpoint.replace(/\/$/, '')}/openai/deployments/${imageDeployment}/images/edits?api-version=${targetVersion}`;
+            
+            const formData = new FormData();
+            formData.append('prompt', prompt);
+            formData.append('n', "1");
+            formData.append('size', "1024x1024"); // edits 接口严格要求正方形
+            
+            const imgObj = images[0]; 
             let base64Data = imgObj.image || imgObj;
             base64Data = base64Data.replace(/^data:image\/\w+;base64,/, "");
             const buffer = Buffer.from(base64Data, 'base64');
-            
-            // 🔥 黑科技：用官方 toFile 把内存中的 Buffer 直接伪装成物理文件，避开环境限制
-            const imageFile = await toFile(buffer, 'image.png', { type: 'image/png' });
+            // 将内存数据打包为原生 Blob 对象，完美兼容 FormData
+            formData.append('image', new Blob([buffer], { type: 'image/png' }), 'image.png');
 
-            const editParams = {
-                model: imageDeployment,
-                image: imageFile,
-                prompt: prompt,
-                n: 1,
-                size: "1024x1024" // edits 原生接口强制要求正方形
-            };
-
-            // 如果传了遮罩图 (局部重绘)
             if (imgObj.mask) {
                 const maskBase64 = imgObj.mask.replace(/^data:image\/\w+;base64,/, "");
                 const maskBuffer = Buffer.from(maskBase64, 'base64');
-                editParams.mask = await toFile(maskBuffer, 'mask.png', { type: 'image/png' });
+                formData.append('mask', new Blob([maskBuffer], { type: 'image/png' }), 'mask.png');
             }
 
-            // 直接走 openai 官方的 edits 接口
-            const response = await openaiImageClient.images.edit(editParams);
-            
-            // 处理返回的链接或 Base64
-            const imgData = response.data[0];
-            imageUrl = imgData.url || (imgData.b64_json ? 'data:image/png;base64,' + imgData.b64_json : '');
-            revisedPrompt = imgData.revised_prompt || prompt;
+            response = await fetch(url, {
+                method: 'POST',
+                headers: { 
+                    'api-key': imageApiKey, 
+                    'Authorization': `Bearer ${imageApiKey}` 
+                },
+                body: formData 
+            });
 
-        } 
-        // 【分支 2：文生图】如果没有图片
-        else {
+        } else {
+            // 【分支 2：文生图】如果没有图片
             console.log("✨ 纯文字要求，调用文生图 (generations) 接口...");
             
-            const response = await openaiImageClient.images.generate({
-                model: imageDeployment,
-                prompt: prompt,
-                n: 1,
-                size: targetSize
-            });
+            // 完美对齐你的 python 接口地址
+            const url = `${imageEndpoint.replace(/\/$/, '')}/openai/deployments/${imageDeployment}/images/generations?api-version=${targetVersion}`;
             
-            const imgData = response.data[0];
-            imageUrl = imgData.url || (imgData.b64_json ? 'data:image/png;base64,' + imgData.b64_json : '');
-            revisedPrompt = imgData.revised_prompt || prompt;
+            // 完美对齐你的 python 参数配置
+            const requestBody = { 
+                prompt: prompt, 
+                size: targetSize, 
+                n: 1,
+                style: "vivid",
+                quality: "standard"
+            };
+
+            response = await fetch(url, {
+                method: 'POST',
+                headers: { 
+                    'Content-Type': 'application/json', 
+                    'api-key': imageApiKey, 
+                    'Authorization': `Bearer ${imageApiKey}` 
+                },
+                body: JSON.stringify(requestBody)
+            });
         }
 
+        // 强力报错捕获，提取最精确的提示信息
+        if (!response.ok) {
+            let errText = await response.text();
+            try {
+                const errObj = JSON.parse(errText);
+                if (errObj.error && errObj.error.message) {
+                    errText = errObj.error.message;
+                }
+            } catch(e) {} // 解析失败则保留原样
+            console.error("🔥 Azure 返回了错误:", errText);
+            throw new Error(errText);
+        }
+
+        const data = await response.json();
+        let imageUrl = '';
+        if (data.data && data.data[0].b64_json) { 
+            imageUrl = 'data:image/png;base64,' + data.data[0].b64_json; 
+        } else if (data.data && data.data[0].url) { 
+            imageUrl = data.data[0].url; 
+        } else { 
+            throw new Error("模型没有返回有效的图片数据"); 
+        }
+
+        const revisedPrompt = data.data[0].revised_prompt || prompt;
         res.json({ url: imageUrl, revised_prompt: revisedPrompt });
 
     } catch (error) {
         console.error("🔥 AI 画图接口崩溃:", error);
-        // 精准抓取 Azure 返回的真实报错原因
-        const errorMsg = error.response?.data?.error?.message || error.message || 'AI 画家开小差了，请稍后再试~';
-        res.status(500).json({ error: errorMsg });
+        res.status(500).json({ error: error.message || 'AI 画家开小差了，请稍后再试~' });
     }
 });
 
