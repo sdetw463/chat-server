@@ -81,15 +81,16 @@ function parseDataUrlImage(dataUrl) {
     return { mime, buffer, ext };
 }
 
-async function readAzureError(response) {
+async function readAzureError(response, context = {}) {
     const text = await response.text();
-    if (!text) return `Azure 请求失败 (${response.status})`;
+    const hint = context.url ? `；请求路径：${context.url}` : '';
+    if (!text) return `Azure 请求失败 (${response.status})${hint}`;
     try {
         const obj = JSON.parse(text);
         const msg = obj.error?.message || obj.message || text;
-        return `Azure 请求失败 (${response.status})：${msg}`;
+        return `Azure 请求失败 (${response.status})：${msg}${hint}`;
     } catch {
-        return `Azure 请求失败 (${response.status})：${text}`;
+        return `Azure 请求失败 (${response.status})：${text}${hint}`;
     }
 }
 
@@ -119,12 +120,11 @@ function buildImageRequest(base, endpointType) {
     const azure = isAzureImageEndpoint(base);
     const deploymentName = encodeURIComponent(imageDeployment);
     const path = endpointType === 'edit' ? 'edits' : 'generations';
+    const apiVersionForRequest = endpointType === 'edit' ? imageEditApiVersion : imageApiVersion;
     const url = azure
-        ? `${base}/openai/deployments/${deploymentName}/images/${path}?api-version=${encodeURIComponent(imageApiVersion)}`
+        ? `${base}/openai/deployments/${deploymentName}/images/${path}?api-version=${encodeURIComponent(apiVersionForRequest)}`
         : `${base.replace(/\/v1$/i, '')}/v1/images/${path}`;
-    const authHeaders = azure
-        ? { 'api-key': imageApiKey, 'Authorization': `Bearer ${imageApiKey}` }
-        : { 'Authorization': `Bearer ${imageApiKey}` };
+    const authHeaders = { 'Authorization': `Bearer ${imageApiKey}` };
     return { url, authHeaders, azure };
 }
 
@@ -179,6 +179,7 @@ const imageEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || endpoint;
 const imageApiKey = process.env.AZURE_OPENAI_IMAGE_KEY || apiKey;
 const imageDeployment = process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT || "gpt-image-2";
 const imageApiVersion = process.env.AZURE_OPENAI_IMAGE_API_VERSION || "2024-02-01";
+const imageEditApiVersion = process.env.AZURE_OPENAI_IMAGE_EDIT_API_VERSION || imageApiVersion;
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 const CHAT_MAX_COMPLETION_TOKENS = Number.parseInt(process.env.AI_MAX_COMPLETION_TOKENS || "8192", 10);
 const RESEARCH_MAX_COMPLETION_TOKENS = Number.parseInt(process.env.AI_RESEARCH_MAX_COMPLETION_TOKENS || "12000", 10);
@@ -753,6 +754,7 @@ app.post('/api/ai-image', async (req, res) => {
 
         const base = imageEndpoint.replace(/\/$/, '');
         let response;
+        let requestUrl = '';
 
         if (images.length > 0 && images[0] && images[0].image) {
             const parsedImage = parseDataUrlImage(images[0].image);
@@ -760,40 +762,25 @@ app.post('/api/ai-image', async (req, res) => {
 
             const parsedMask = parseDataUrlImage(images[0].mask || '');
             const { url, authHeaders, azure } = buildImageRequest(base, 'edit');
+            requestUrl = url;
             const formData = new FormData();
             if (!azure) formData.append('model', imageDeployment);
-            formData.append('prompt', prompt);
-            formData.append('size', targetSize);
-            formData.append('quality', imageOptions.quality);
-            formData.append('output_compression', '100');
-            formData.append('output_format', 'png');
-            formData.append('image', new Blob([parsedImage.buffer], { type: parsedImage.mime }), `reference.${parsedImage.ext}`);
+            // 严格按 Azure 官方 edits 示例提交：Authorization Bearer + multipart 的 image/mask/prompt。
+            // 不在 edits 首次请求里附加 size/quality/output_format，避免 Azure 把编辑请求路由或参数判定为无效。
+            formData.append('image', new Blob([parsedImage.buffer], { type: parsedImage.mime }), `image_to_edit.${parsedImage.ext}`);
             if (parsedMask) {
                 formData.append('mask', new Blob([parsedMask.buffer], { type: parsedMask.mime }), `mask.${parsedMask.ext}`);
             }
+            formData.append('prompt', prompt);
 
             response = await fetchWithTimeout(url, {
                 method: 'POST',
                 headers: authHeaders,
                 body: formData
             }, IMAGE_TIMEOUT_MS);
-
-            if (!response.ok && response.status === 400) {
-                const errorText = await response.text();
-                console.warn('⚠️ 图片编辑高级参数不兼容，准备降级重试:', errorText);
-                const fallbackFormData = new FormData();
-                if (!azure) fallbackFormData.append('model', imageDeployment);
-                fallbackFormData.append('prompt', prompt);
-                fallbackFormData.append('image', new Blob([parsedImage.buffer], { type: parsedImage.mime }), `reference.${parsedImage.ext}`);
-                if (parsedMask) fallbackFormData.append('mask', new Blob([parsedMask.buffer], { type: parsedMask.mime }), `mask.${parsedMask.ext}`);
-                response = await fetchWithTimeout(url, {
-                    method: 'POST',
-                    headers: authHeaders,
-                    body: fallbackFormData
-                }, IMAGE_TIMEOUT_MS);
-            }
         } else {
             const { url, authHeaders } = buildImageRequest(base, 'generation');
+            requestUrl = url;
             const primaryBody = buildImageGenerationBody(prompt, targetSize, imageOptions.quality, true);
             response = await fetchWithTimeout(url, {
                 method: 'POST',
@@ -814,7 +801,7 @@ app.post('/api/ai-image', async (req, res) => {
             }
         }
 
-        if (!response.ok) throw new Error(await readAzureError(response));
+        if (!response.ok) throw new Error(await readAzureError(response, { url: requestUrl }));
         const data = await response.json();
         const normalized = normalizeAzureImageData(data);
         res.json({
@@ -881,7 +868,8 @@ app.get('/api/status', (req, res) => {
         "思考模式推理强度": getReasoningEffort('think'),
         "深度研究推理强度": getReasoningEffort('research'),
         "图片模型部署": imageDeployment,
-        "图片 API 版本": imageApiVersion,
+        "图片生成 API 版本": imageApiVersion,
+        "图片编辑 API 版本": imageEditApiVersion,
         "图片质量": IMAGE_QUALITY,
         "图片超时秒数": Math.round(IMAGE_TIMEOUT_MS / 1000),
         "支持图片比例": ["auto", "1:1", "3:4", "9:16", "4:3", "16:9"],
