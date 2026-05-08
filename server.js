@@ -230,8 +230,7 @@ app.post('/api/ai-chat', async (req, res) => {
 });
 
 // ==========================================
-// ✨ 核心重构：废弃错误百出的官方 SDK 画图功能，使用原生精确 Fetch
-// 完全对齐你的 Python 与 Curl 成功经验
+// ✨ 核心重构：彻底解决 Azure 参数洁癖与 404 问题
 // ==========================================
 app.post('/api/ai-image', async (req, res) => {
     try {
@@ -246,69 +245,59 @@ app.post('/api/ai-image', async (req, res) => {
         if (/(竖屏|竖图|手机壁纸|9:16|1024x1792)/i.test(prompt)) targetSize = "1024x1792";
         else if (/(横屏|横图|电脑壁纸|宽屏|16:9|1792x1024)/i.test(prompt)) targetSize = "1792x1024";
 
-        const targetVersion = "2024-02-01"; 
-        let response;
+        let finalPrompt = prompt;
 
-        // 【分支 1：图生图】如果有上传图片
-        if (images && images.length > 0) {
-            console.log("👀 检测到参考图，正在原生调用图生图 (edits) 接口...");
-            
-            // 完美对齐你的 curl 接口地址
-            const url = `${imageEndpoint.replace(/\/$/, '')}/openai/deployments/${imageDeployment}/images/edits?api-version=${targetVersion}`;
-            
-            const formData = new FormData();
-            formData.append('prompt', prompt);
-            formData.append('n', "1");
-            formData.append('size', "1024x1024"); // edits 接口严格要求正方形
-            
-            const imgObj = images[0]; 
-            let base64Data = imgObj.image || imgObj;
-            base64Data = base64Data.replace(/^data:image\/\w+;base64,/, "");
-            const buffer = Buffer.from(base64Data, 'base64');
-            // 将内存数据打包为原生 Blob 对象，完美兼容 FormData
-            formData.append('image', new Blob([buffer], { type: 'image/png' }), 'image.png');
+        // 【黑科技分支】：如果传了图片，使用视觉模型“看图写提示词”
+        if (images && images.length > 0 && openaiClient) {
+            try {
+                console.log("👀 检测到参考图，启动视觉模型解析以替代原生 edits 接口...");
+                const imgObj = images[0]; 
+                let base64Data = imgObj.image || imgObj;
+                
+                // 确保有正确的 data:image 前缀
+                if (!base64Data.startsWith('http') && !base64Data.startsWith('data:image')) {
+                    base64Data = `data:image/png;base64,${base64Data}`;
+                }
 
-            if (imgObj.mask) {
-                const maskBase64 = imgObj.mask.replace(/^data:image\/\w+;base64,/, "");
-                const maskBuffer = Buffer.from(maskBase64, 'base64');
-                formData.append('mask', new Blob([maskBuffer], { type: 'image/png' }), 'mask.png');
+                const visionRes = await openaiClient.chat.completions.create({
+                    model: deployment,
+                    messages: [
+                        { role: "system", content: "你是一个专业的AI绘画提示词优化专家。用户上传了一张参考图和一段修改需求。请仔细观察图片，然后结合用户的需求，写出一段详细的英文绘画提示词（Prompt），要求包含原图的核心特征和用户的修改要求。只输出纯英文提示词，不要任何解释或多余的文字。" },
+                        { role: "user", content: [
+                            { type: "text", text: `用户的修改需求是：${prompt}` },
+                            { type: "image_url", image_url: { url: base64Data } }
+                        ]}
+                    ],
+                    max_tokens: 500
+                });
+                
+                finalPrompt = visionRes.choices[0].message.content.trim();
+                console.log(`✨ 视觉模型融合后的最终提示词: ${finalPrompt}`);
+            } catch (visionErr) {
+                console.error("⚠️ 视觉模型解析图片失败，将直接使用原文字需求:", visionErr.message);
             }
-
-            response = await fetch(url, {
-                method: 'POST',
-                headers: { 
-                    'api-key': imageApiKey, 
-                    'Authorization': `Bearer ${imageApiKey}` 
-                },
-                body: formData 
-            });
-
-        } else {
-            // 【分支 2：文生图】如果没有图片
-            console.log("✨ 纯文字要求，调用文生图 (generations) 接口...");
-            
-            // 完美对齐你的 python 接口地址
-            const url = `${imageEndpoint.replace(/\/$/, '')}/openai/deployments/${imageDeployment}/images/generations?api-version=${targetVersion}`;
-            
-            // 完美对齐你的 python 参数配置
-            const requestBody = { 
-                prompt: prompt, 
-                size: targetSize, 
-                n: 1,
-                style: "vivid",
-                quality: "standard"
-            };
-
-            response = await fetch(url, {
-                method: 'POST',
-                headers: { 
-                    'Content-Type': 'application/json', 
-                    'api-key': imageApiKey, 
-                    'Authorization': `Bearer ${imageApiKey}` 
-                },
-                body: JSON.stringify(requestBody)
-            });
         }
+
+        // ✨ 终极修复：统一走 /images/generations 接口，彻底规避 404 Resource not found
+        // ✨ 删除了会引起 Unknown parameter 报错的 style 和 quality
+        const targetVersion = "2024-02-01";
+        const url = `${imageEndpoint.replace(/\/$/, '')}/openai/deployments/${imageDeployment}/images/generations?api-version=${targetVersion}`;
+        
+        const requestBody = { 
+            prompt: finalPrompt, 
+            size: targetSize, 
+            n: 1
+        };
+
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: { 
+                'Content-Type': 'application/json', 
+                'api-key': imageApiKey, 
+                'Authorization': `Bearer ${imageApiKey}` 
+            },
+            body: JSON.stringify(requestBody)
+        });
 
         // 强力报错捕获，提取最精确的提示信息
         if (!response.ok) {
@@ -318,7 +307,7 @@ app.post('/api/ai-image', async (req, res) => {
                 if (errObj.error && errObj.error.message) {
                     errText = errObj.error.message;
                 }
-            } catch(e) {} // 解析失败则保留原样
+            } catch(e) {} 
             console.error("🔥 Azure 返回了错误:", errText);
             throw new Error(errText);
         }
@@ -333,7 +322,7 @@ app.post('/api/ai-image', async (req, res) => {
             throw new Error("模型没有返回有效的图片数据"); 
         }
 
-        const revisedPrompt = data.data[0].revised_prompt || prompt;
+        const revisedPrompt = data.data[0].revised_prompt || finalPrompt;
         res.json({ url: imageUrl, revised_prompt: revisedPrompt });
 
     } catch (error) {
