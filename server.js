@@ -116,16 +116,29 @@ function isAzureImageEndpoint(base) {
     return /\.azure\.com/i.test(base) || /\.services\.ai\.azure\.com/i.test(base);
 }
 
-function buildImageRequest(base, endpointType) {
+function buildImageRequest(base, endpointType, overrideApiVersion = null) {
     const azure = isAzureImageEndpoint(base);
     const deploymentName = encodeURIComponent(imageDeployment);
     const path = endpointType === 'edit' ? 'edits' : 'generations';
-    const apiVersionForRequest = endpointType === 'edit' ? imageEditApiVersion : imageApiVersion;
+    const apiVersionForRequest = overrideApiVersion || (endpointType === 'edit' ? imageEditApiVersion : imageApiVersion);
     const url = azure
         ? `${base}/openai/deployments/${deploymentName}/images/${path}?api-version=${encodeURIComponent(apiVersionForRequest)}`
         : `${base.replace(/\/v1$/i, '')}/v1/images/${path}`;
     const authHeaders = { 'Authorization': `Bearer ${imageApiKey}` };
-    return { url, authHeaders, azure };
+    return { url, authHeaders, azure, apiVersion: apiVersionForRequest };
+}
+
+function uniqueList(items) {
+    return Array.from(new Set(items.filter(Boolean)));
+}
+
+function buildImageEditFormData(parsedImage, parsedMask, prompt, azure) {
+    const formData = new FormData();
+    if (!azure) formData.append('model', imageDeployment);
+    formData.append('image', new Blob([parsedImage.buffer], { type: parsedImage.mime }), `image_to_edit.${parsedImage.ext}`);
+    if (parsedMask) formData.append('mask', new Blob([parsedMask.buffer], { type: parsedMask.mime }), `mask.${parsedMask.ext}`);
+    formData.append('prompt', prompt);
+    return formData;
 }
 
 function resolveImageOptions(reqBody = {}, prompt = '') {
@@ -761,23 +774,42 @@ app.post('/api/ai-image', async (req, res) => {
             if (!parsedImage) return res.status(400).json({ error: '参考图片格式无效，请重新上传图片。' });
 
             const parsedMask = parseDataUrlImage(images[0].mask || '');
-            const { url, authHeaders, azure } = buildImageRequest(base, 'edit');
-            requestUrl = url;
-            const formData = new FormData();
-            if (!azure) formData.append('model', imageDeployment);
-            // 严格按 Azure 官方 edits 示例提交：Authorization Bearer + multipart 的 image/mask/prompt。
-            // 不在 edits 首次请求里附加 size/quality/output_format，避免 Azure 把编辑请求路由或参数判定为无效。
-            formData.append('image', new Blob([parsedImage.buffer], { type: parsedImage.mime }), `image_to_edit.${parsedImage.ext}`);
-            if (parsedMask) {
-                formData.append('mask', new Blob([parsedMask.buffer], { type: parsedMask.mime }), `mask.${parsedMask.ext}`);
-            }
-            formData.append('prompt', prompt);
+            const editApiVersions = uniqueList([
+                imageEditApiVersion,
+                '2025-04-01-preview',
+                '2025-01-01-preview',
+                '2024-12-01-preview',
+                imageApiVersion,
+                '2024-02-01'
+            ]);
+            const editAttempts = [];
 
-            response = await fetchWithTimeout(url, {
-                method: 'POST',
-                headers: authHeaders,
-                body: formData
-            }, IMAGE_TIMEOUT_MS);
+            for (const version of editApiVersions) {
+                const { url, authHeaders, azure } = buildImageRequest(base, 'edit', version);
+                requestUrl = url;
+                response = await fetchWithTimeout(url, {
+                    method: 'POST',
+                    headers: authHeaders,
+                    body: buildImageEditFormData(parsedImage, parsedMask, prompt, azure)
+                }, IMAGE_TIMEOUT_MS);
+
+                if (response.ok) break;
+
+                const errorText = await response.text();
+                editAttempts.push(`${response.status} ${url} ${errorText}`);
+                if (response.status !== 404) {
+                    throw new Error(`Azure 图片编辑请求失败 (${response.status})：${errorText || '未知错误'}；请求路径：${url}`);
+                }
+                console.warn(`⚠️ 图片编辑接口 404，尝试下一个 API 版本: ${version}`, errorText);
+            }
+
+            if (!response || !response.ok) {
+                throw new Error([
+                    'Azure 图片编辑接口仍然返回 404。这个部署很可能没有启用 images/edits 路由，或 Azure 门户里的示例只对另一个资源/部署有效。',
+                    `已尝试路径：${editAttempts.join(' | ')}`,
+                    '请在 Azure AI Foundry 的该部署页面确认是否有“编辑图像 / image edits”示例；如果没有，需要单独部署支持编辑的 gpt-image-2 或设置 AZURE_OPENAI_IMAGE_EDIT_API_VERSION 为门户示例中的版本。'
+                ].join(' '));
+            }
         } else {
             const { url, authHeaders } = buildImageRequest(base, 'generation');
             requestUrl = url;
