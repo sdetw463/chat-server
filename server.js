@@ -122,6 +122,52 @@ function resolveImageSize(ratio, prompt, requestedSize) {
     return "1024x1024";
 }
 
+function roundToMultipleOf16(value) {
+    return Math.max(16, Math.round(Number(value || 0) / 16) * 16);
+}
+
+function sizeFromReferenceDimensions(width, height) {
+    width = Number(width);
+    height = Number(height);
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
+
+    const maxLongEdge = 2048;
+    const minLongEdge = 1024;
+    const ratio = width / height;
+    let targetLongEdge = Math.min(maxLongEdge, Math.max(minLongEdge, Math.max(width, height)));
+    let outWidth;
+    let outHeight;
+
+    if (ratio >= 1) {
+        outWidth = roundToMultipleOf16(targetLongEdge);
+        outHeight = roundToMultipleOf16(targetLongEdge / ratio);
+    } else {
+        outHeight = roundToMultipleOf16(targetLongEdge);
+        outWidth = roundToMultipleOf16(targetLongEdge * ratio);
+    }
+
+    const pixels = outWidth * outHeight;
+    if (pixels < 655360) {
+        const scale = Math.sqrt(655360 / pixels);
+        outWidth = roundToMultipleOf16(outWidth * scale);
+        outHeight = roundToMultipleOf16(outHeight * scale);
+    }
+
+    if (outWidth * outHeight > 8294400) {
+        const scale = Math.sqrt(8294400 / (outWidth * outHeight));
+        outWidth = roundToMultipleOf16(outWidth * scale);
+        outHeight = roundToMultipleOf16(outHeight * scale);
+    }
+
+    if (!isValidGptImage2Size(outWidth, outHeight)) return null;
+    return `${outWidth}x${outHeight}`;
+}
+
+function resolveEditImageSize(ratio, prompt, requestedSize, referenceImage) {
+    if (requestedSize || (ratio && ratio !== "auto")) return resolveImageSize(ratio, prompt, requestedSize);
+    return sizeFromReferenceDimensions(referenceImage && referenceImage.width, referenceImage && referenceImage.height);
+}
+
 function parseDataImage(input, fallbackName = "image") {
     const imageData = typeof input === "string" ? input : input && input.image;
     if (!imageData || typeof imageData !== "string") {
@@ -170,7 +216,19 @@ async function requestAzureImage(builders) {
     for (let i = 0; i < builders.length; i++) {
         const { url, options, label } = builders[i]();
         console.log(`🖼️ Azure 图片请求通道: ${label}`);
-        const response = await fetch(url, options);
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 210000);
+        let response;
+        try {
+            response = await fetch(url, { ...options, signal: controller.signal });
+        } catch (error) {
+            if (error.name === "AbortError") {
+                throw new Error("Azure 图片编辑超过 210 秒未返回，已主动停止。请稍后再试，或换一张更简单的参考图。");
+            }
+            throw error;
+        } finally {
+            clearTimeout(timeout);
+        }
         if (response.ok) return response.json();
 
         const message = await readAzureImageError(response);
@@ -359,13 +417,20 @@ app.post('/api/ai-image', async (req, res) => {
 
         const baseUrl = getImageBaseUrl();
         const targetSize = resolveImageSize(ratio, prompt, req.body.size);
-        const quality = isSupportedImageQuality(req.body.quality) ? String(req.body.quality).toLowerCase() : imageQuality;
-        const safeQuality = isSupportedImageQuality(quality) ? String(quality).toLowerCase() : "medium";
+        const requestedQuality = isSupportedImageQuality(req.body.quality) ? String(req.body.quality).toLowerCase() : null;
+        const configuredQuality = isSupportedImageQuality(imageQuality) ? String(imageQuality).toLowerCase() : "medium";
 
         if (images && images.length > 0) {
             console.log("👀 检测到参考图，启动原生 edits 接口进行图像编辑...");
             const parsedImages = images.slice(0, 5).map((img, index) => parseDataImage(img, `reference_${index + 1}`));
             const firstMask = images[0] && images[0].mask ? parseDataImage({ image: images[0].mask, name: "mask.png" }, "mask") : null;
+            const editSize = resolveEditImageSize(ratio, prompt, req.body.size, images[0]);
+            const editQuality = requestedQuality || "medium";
+            const editPrompt = [
+                "Edit the uploaded reference image instead of creating a new unrelated image.",
+                "Preserve the main subject, identity, pose, composition, camera angle, and important background details unless the user explicitly asks to change them.",
+                `User request: ${prompt}`
+            ].join("\n");
 
             const buildEditForm = (imageFieldName, includeModel) => {
                 const formData = new FormData();
@@ -373,11 +438,11 @@ app.post('/api/ai-image', async (req, res) => {
                 if (firstMask && firstMask.mimeType === "image/png" && firstMask.buffer.length <= 4 * 1024 * 1024) {
                     appendImageBlob(formData, "mask", firstMask);
                 }
-                formData.append("prompt", prompt);
+                formData.append("prompt", editPrompt);
                 if (includeModel) formData.append("model", imageDeployment);
                 formData.append("n", "1");
-                formData.append("size", targetSize);
-                formData.append("quality", safeQuality);
+                if (editSize) formData.append("size", editSize);
+                formData.append("quality", editQuality);
                 return formData;
             };
 
@@ -409,7 +474,9 @@ app.post('/api/ai-image', async (req, res) => {
             if (!imageUrl) throw new Error("模型没有返回有效的图片数据");
             return res.json({
                 url: imageUrl,
-                revised_prompt: imageItem.revised_prompt || prompt
+                revised_prompt: imageItem.revised_prompt || prompt,
+                ratio,
+                size: editSize || "auto"
             });
 
         } else {
@@ -419,7 +486,7 @@ app.post('/api/ai-image', async (req, res) => {
                     prompt,
                     size: targetSize,
                     n: 1,
-                    quality: safeQuality
+                    quality: requestedQuality || configuredQuality
                 };
                 if (includeModel) body.model = imageDeployment;
                 return body;
@@ -460,7 +527,9 @@ app.post('/api/ai-image', async (req, res) => {
             if (!imageUrl) throw new Error("模型没有返回有效的图片数据");
             return res.json({
                 url: imageUrl,
-                revised_prompt: imageItem.revised_prompt || prompt
+                revised_prompt: imageItem.revised_prompt || prompt,
+                ratio,
+                size: targetSize
             });
         }
 
