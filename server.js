@@ -230,76 +230,89 @@ app.post('/api/ai-chat', async (req, res) => {
 });
 
 // ==========================================
-// ✨ 核心重构：彻底解决 Azure 参数洁癖与 404 问题
+// ✨ 核心重构：彻底解决 Azure 参数洁癖与 404 问题，原生支持文生图与图生图
 // ==========================================
 app.post('/api/ai-image', async (req, res) => {
     try {
         const prompt = req.body.prompt;
         const images = req.body.images; 
+        const ratio = req.body.ratio || "auto"; // 接收前端传来的比例参数
+
         if (!prompt) return res.status(400).json({ error: '必须告诉 TuoTuo 你想画什么哦！' });
 
-        console.log(`🎨 TuoTuo 正在后台努力画图: ${prompt}`);
+        console.log(`🎨 TuoTuo 正在后台努力画图: [${prompt}], 比例设定: [${ratio}]`);
 
-        // 智能分析需求比例
+        // 1. 智能分析需求比例，映射到模型支持的标准尺寸
         let targetSize = "1024x1024";
-        if (/(竖屏|竖图|手机壁纸|9:16|1024x1792)/i.test(prompt)) targetSize = "1024x1792";
-        else if (/(横屏|横图|电脑壁纸|宽屏|16:9|1792x1024)/i.test(prompt)) targetSize = "1792x1024";
-
-        let finalPrompt = prompt;
-
-        // 【黑科技分支】：如果传了图片，使用视觉模型“看图写提示词”
-        if (images && images.length > 0 && openaiClient) {
-            try {
-                console.log("👀 检测到参考图，启动视觉模型解析以替代原生 edits 接口...");
-                const imgObj = images[0]; 
-                let base64Data = imgObj.image || imgObj;
-                
-                // 确保有正确的 data:image 前缀
-                if (!base64Data.startsWith('http') && !base64Data.startsWith('data:image')) {
-                    base64Data = `data:image/png;base64,${base64Data}`;
-                }
-
-                const visionRes = await openaiClient.chat.completions.create({
-                    model: deployment,
-                    messages: [
-                        { role: "system", content: "你是一个专业的AI绘画提示词优化专家。用户上传了一张参考图和一段修改需求。请仔细观察图片，然后结合用户的需求，写出一段详细的英文绘画提示词（Prompt），要求包含原图的核心特征和用户的修改要求。只输出纯英文提示词，不要任何解释或多余的文字。" },
-                        { role: "user", content: [
-                            { type: "text", text: `用户的修改需求是：${prompt}` },
-                            { type: "image_url", image_url: { url: base64Data } }
-                        ]}
-                    ],
-                    max_tokens: 500
-                });
-                
-                finalPrompt = visionRes.choices[0].message.content.trim();
-                console.log(`✨ 视觉模型融合后的最终提示词: ${finalPrompt}`);
-            } catch (visionErr) {
-                console.error("⚠️ 视觉模型解析图片失败，将直接使用原文字需求:", visionErr.message);
-            }
+        if (ratio === "9:16" || ratio === "3:4" || /(竖屏|竖图|手机壁纸|9:16|1024x1792)/i.test(prompt)) {
+            targetSize = "1024x1792";
+        } else if (ratio === "16:9" || ratio === "4:3" || /(横屏|横图|电脑壁纸|宽屏|16:9|1792x1024)/i.test(prompt)) {
+            targetSize = "1792x1024";
         }
 
-        // ✨ 终极修复：统一走 /images/generations 接口，彻底规避 404 Resource not found
-        // ✨ 删除了会引起 Unknown parameter 报错的 style 和 quality
         const targetVersion = "2024-02-01";
-        const url = `${imageEndpoint.replace(/\/$/, '')}/openai/deployments/${imageDeployment}/images/generations?api-version=${targetVersion}`;
-        
-        const requestBody = { 
-            prompt: finalPrompt, 
-            size: targetSize, 
-            n: 1
-        };
+        let url, options;
 
-        const response = await fetch(url, {
-            method: 'POST',
-            headers: { 
-                'Content-Type': 'application/json', 
-                'api-key': imageApiKey, 
-                'Authorization': `Bearer ${imageApiKey}` 
-            },
-            body: JSON.stringify(requestBody)
-        });
+        if (images && images.length > 0) {
+            // =============== 分支 A：图生图 (Edits) 原生接口 ===============
+            console.log("👀 检测到参考图，启动原生 edits 接口进行图像编辑...");
+            const imgObj = images[0]; 
+            let base64Data = imgObj.image || imgObj;
+            
+            // 剥离 base64 的 metadata 前缀，并推断文件类型
+            const matches = base64Data.match(/^data:image\/(\w+);base64,/);
+            const ext = matches ? matches[1] : 'png';
+            const mimeType = ext === 'jpeg' ? 'image/jpeg' : `image/${ext}`;
+            const base64String = base64Data.replace(/^data:image\/\w+;base64,/, "");
+            
+            // 转换为二进制 Buffer 和 Blob
+            const buffer = Buffer.from(base64String, 'base64');
+            const blob = new Blob([buffer], { type: mimeType });
 
-        // 强力报错捕获，提取最精确的提示信息
+            // 构建表单数据 FormData (要求 Node.js 版本 >= 18)
+            const formData = new FormData();
+            formData.append('image', blob, `image.${ext}`);
+            formData.append('prompt', prompt);
+            formData.append('n', '1');
+            formData.append('size', targetSize);
+
+            // 拼接 edits 终端
+            url = `${imageEndpoint.replace(/\/$/, '')}/openai/deployments/${imageDeployment}/images/edits?api-version=${targetVersion}`;
+            options = {
+                method: 'POST',
+                headers: { 
+                    'api-key': imageApiKey, 
+                    'Authorization': `Bearer ${imageApiKey}` 
+                    // ⚠️ 注意：绝不能在这里手动写 'Content-Type': 'multipart/form-data'
+                    // Fetch 会自动帮你带上带有 boundary 的正确 Header
+                },
+                body: formData
+            };
+
+        } else {
+            // =============== 分支 B：文生图 (Generations) 原生接口 ===============
+            console.log("✨ 纯文字描述，启动原生 generations 接口...");
+            url = `${imageEndpoint.replace(/\/$/, '')}/openai/deployments/${imageDeployment}/images/generations?api-version=${targetVersion}`;
+            
+            options = {
+                method: 'POST',
+                headers: { 
+                    'Content-Type': 'application/json', 
+                    'api-key': imageApiKey, 
+                    'Authorization': `Bearer ${imageApiKey}` 
+                },
+                body: JSON.stringify({
+                    prompt: prompt, 
+                    size: targetSize, 
+                    n: 1
+                })
+            };
+        }
+
+        // 2. 发起最终请求
+        const response = await fetch(url, options);
+
+        // 3. 强力报错捕获，提取最精确的提示信息以便排错
         if (!response.ok) {
             let errText = await response.text();
             try {
@@ -312,6 +325,7 @@ app.post('/api/ai-image', async (req, res) => {
             throw new Error(errText);
         }
 
+        // 4. 数据解析与回传给前端
         const data = await response.json();
         let imageUrl = '';
         if (data.data && data.data[0].b64_json) { 
@@ -322,7 +336,7 @@ app.post('/api/ai-image', async (req, res) => {
             throw new Error("模型没有返回有效的图片数据"); 
         }
 
-        const revisedPrompt = data.data[0].revised_prompt || finalPrompt;
+        const revisedPrompt = data.data[0].revised_prompt || prompt;
         res.json({ url: imageUrl, revised_prompt: revisedPrompt });
 
     } catch (error) {
