@@ -62,18 +62,136 @@ async function uploadBase64ToBlob(base64Str) {
 // ==========================================
 // 2. AI 接口和搜索逻辑
 // ==========================================
-const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
-const apiKey = process.env.AZURE_OPENAI_KEY;
+const endpoint = process.env.AZURE_OPENAI_ENDPOINT || process.env.AZURE_OPENAI_API_BASE;
+const apiKey = process.env.AZURE_OPENAI_KEY || process.env.AZURE_OPENAI_API_KEY;
 const apiVersion = "2024-12-01-preview";
 const deployment = "gpt-5.5";
 const imageEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || endpoint;
-const imageApiKey = process.env.AZURE_OPENAI_IMAGE_KEY || apiKey;
-const imageDeployment = process.env.DEPLOYMENT_NAME || "gpt-image-2"; 
+const imageApiKey = process.env.AZURE_OPENAI_IMAGE_KEY || process.env.AZURE_OPENAI_IMAGE_API_KEY || apiKey;
+const imageDeployment = process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT || process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT_NAME || process.env.DEPLOYMENT_NAME || "gpt-image-2";
+const imageApiVersion = process.env.AZURE_OPENAI_IMAGE_API_VERSION || "2025-04-01-preview";
+const imageQuality = process.env.AZURE_OPENAI_IMAGE_QUALITY || "medium";
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 
 let openaiClient = null; 
 if (endpoint && apiKey) {
     openaiClient = new AzureOpenAI({ endpoint, apiKey, apiVersion, deployment });
+}
+
+function getImageBaseUrl() {
+    if (!imageEndpoint || !imageApiKey) {
+        throw new Error('后端未配置正确的 Azure 图片模型 endpoint 或 key。');
+    }
+    return imageEndpoint.replace(/\/+$/, '');
+}
+
+function isSupportedImageQuality(value) {
+    return ["low", "medium", "high"].includes(String(value || "").toLowerCase());
+}
+
+function isValidGptImage2Size(width, height) {
+    const pixels = width * height;
+    const longEdge = Math.max(width, height);
+    const shortEdge = Math.min(width, height);
+    return width % 16 === 0
+        && height % 16 === 0
+        && longEdge <= 3840
+        && longEdge / shortEdge <= 3
+        && pixels >= 655360
+        && pixels <= 8294400;
+}
+
+function parseSizeString(value) {
+    const match = String(value || "").match(/^(\d{3,4})\s*x\s*(\d{3,4})$/i);
+    if (!match) return null;
+    const width = Number(match[1]);
+    const height = Number(match[2]);
+    if (!isValidGptImage2Size(width, height)) return null;
+    return `${width}x${height}`;
+}
+
+function resolveImageSize(ratio, prompt, requestedSize) {
+    const explicitSize = parseSizeString(requestedSize) || parseSizeString(ratio);
+    if (explicitSize) return explicitSize;
+
+    const source = `${ratio || ""} ${prompt || ""}`;
+    if (/(9\s*:\s*16|竖屏|竖图|手机壁纸|story|portrait|vertical)/i.test(source)) return "1008x1792";
+    if (/(3\s*:\s*4)/i.test(source)) return "1152x1536";
+    if (/(16\s*:\s*9|横屏|横图|电脑壁纸|宽屏|landscape|wide)/i.test(source)) return "1792x1008";
+    if (/(4\s*:\s*3)/i.test(source)) return "1536x1152";
+    return "1024x1024";
+}
+
+function parseDataImage(input, fallbackName = "image") {
+    const imageData = typeof input === "string" ? input : input && input.image;
+    if (!imageData || typeof imageData !== "string") {
+        throw new Error("参考图数据格式不正确。");
+    }
+
+    const match = imageData.match(/^data:(image\/(?:png|jpe?g));base64,([\s\S]+)$/i);
+    if (!match) {
+        throw new Error("参考图必须是 PNG 或 JPG 格式。");
+    }
+
+    const mimeType = match[1].toLowerCase() === "image/jpg" ? "image/jpeg" : match[1].toLowerCase();
+    const extension = mimeType === "image/jpeg" ? "jpg" : "png";
+    const buffer = Buffer.from(match[2], "base64");
+    if (!buffer.length) throw new Error("参考图内容为空。");
+
+    const safeName = String((input && input.name) || fallbackName).replace(/[^\w.-]+/g, "_").slice(0, 80) || fallbackName;
+    const fileName = /\.[a-z0-9]+$/i.test(safeName) ? safeName : `${safeName}.${extension}`;
+    return { buffer, mimeType, fileName };
+}
+
+function appendImageBlob(formData, fieldName, image) {
+    formData.append(fieldName, new Blob([image.buffer], { type: image.mimeType }), image.fileName);
+}
+
+async function readAzureImageError(response) {
+    const text = await response.text();
+    if (!text) return `Azure 图片接口请求失败：HTTP ${response.status}`;
+    try {
+        const parsed = JSON.parse(text);
+        return parsed.error?.message || parsed.message || (typeof parsed.error === "string" ? parsed.error : JSON.stringify(parsed.error || parsed));
+    } catch {
+        return text;
+    }
+}
+
+function shouldRetryImageRequest(response, message) {
+    const text = String(message || "");
+    return response.status === 404
+        || /deploymentnotfound|resource not found|not found|route/i.test(text)
+        || (response.status === 400 && /(model.*(required|missing)|missing.*model|image.*(required|missing)|missing.*image|invalid multipart|unrecognized.*model|unknown.*model)/i.test(text));
+}
+
+async function requestAzureImage(builders) {
+    let lastError = null;
+    for (let i = 0; i < builders.length; i++) {
+        const { url, options, label } = builders[i]();
+        console.log(`🖼️ Azure 图片请求通道: ${label}`);
+        const response = await fetch(url, options);
+        if (response.ok) return response.json();
+
+        const message = await readAzureImageError(response);
+        lastError = new Error(message);
+        console.error(`🔥 Azure 图片接口 ${label} 返回错误:`, message);
+
+        if (i < builders.length - 1 && shouldRetryImageRequest(response, message)) {
+            console.log("↪️ 当前路径不可用，尝试兼容 /openai/v1 图片接口...");
+            continue;
+        }
+        throw lastError;
+    }
+    throw lastError || new Error("Azure 图片接口请求失败。");
+}
+
+function getImageUrlFromResponse(data) {
+    const imageItem = data && data.data && data.data[0];
+    if (!imageItem) return null;
+    if (imageItem.b64_json) return `data:image/png;base64,${imageItem.b64_json}`;
+    if (imageItem.url) return imageItem.url;
+    return null;
 }
 
 async function searchWeb(query) {
@@ -229,115 +347,122 @@ app.post('/api/ai-chat', async (req, res) => {
     }
 });
 
-// ==========================================
-// ✨ 核心重构：彻底解决 Azure 参数洁癖与 404 问题，原生支持文生图与图生图
-// ==========================================
 app.post('/api/ai-image', async (req, res) => {
     try {
         const prompt = req.body.prompt;
-        const images = req.body.images; 
-        const ratio = req.body.ratio || "auto"; // 接收前端传来的比例参数
+        const images = Array.isArray(req.body.images) ? req.body.images : (req.body.images ? [req.body.images] : []);
+        const ratio = req.body.ratio || "auto";
 
         if (!prompt) return res.status(400).json({ error: '必须告诉 TuoTuo 你想画什么哦！' });
 
         console.log(`🎨 TuoTuo 正在后台努力画图: [${prompt}], 比例设定: [${ratio}]`);
 
-        // 1. 智能分析需求比例，映射到模型支持的标准尺寸
-        let targetSize = "1024x1024";
-        if (ratio === "9:16" || ratio === "3:4" || /(竖屏|竖图|手机壁纸|9:16|1024x1792)/i.test(prompt)) {
-            targetSize = "1024x1792";
-        } else if (ratio === "16:9" || ratio === "4:3" || /(横屏|横图|电脑壁纸|宽屏|16:9|1792x1024)/i.test(prompt)) {
-            targetSize = "1792x1024";
-        }
-
-        const targetVersion = "2024-12-01-preview";
-        let url, options;
+        const baseUrl = getImageBaseUrl();
+        const targetSize = resolveImageSize(ratio, prompt, req.body.size);
+        const quality = isSupportedImageQuality(req.body.quality) ? String(req.body.quality).toLowerCase() : imageQuality;
+        const safeQuality = isSupportedImageQuality(quality) ? String(quality).toLowerCase() : "medium";
 
         if (images && images.length > 0) {
-            // =============== 分支 A：图生图 (Edits) 原生接口 ===============
             console.log("👀 检测到参考图，启动原生 edits 接口进行图像编辑...");
-            const imgObj = images[0]; 
-            let base64Data = imgObj.image || imgObj;
-            
-            // 剥离 base64 的 metadata 前缀，并推断文件类型
-            const matches = base64Data.match(/^data:image\/(\w+);base64,/);
-            const ext = matches ? matches[1] : 'png';
-            const mimeType = ext === 'jpeg' ? 'image/jpeg' : `image/${ext}`;
-            const base64String = base64Data.replace(/^data:image\/\w+;base64,/, "");
-            
-            // 转换为二进制 Buffer 和 Blob
-            const buffer = Buffer.from(base64String, 'base64');
-            const blob = new Blob([buffer], { type: mimeType });
+            const parsedImages = images.slice(0, 5).map((img, index) => parseDataImage(img, `reference_${index + 1}`));
+            const firstMask = images[0] && images[0].mask ? parseDataImage({ image: images[0].mask, name: "mask.png" }, "mask") : null;
 
-            // 构建表单数据 FormData (要求 Node.js 版本 >= 18)
-            const formData = new FormData();
-            formData.append('image', blob, `image.${ext}`);
-            formData.append('prompt', prompt);
-            formData.append('n', '1');
-            formData.append('size', targetSize);
-
-            // 拼接 edits 终端
-            url = `${imageEndpoint.replace(/\/$/, '')}/openai/deployments/${imageDeployment}/images/edits?api-version=${targetVersion}`;
-            options = {
-                method: 'POST',
-                headers: { 
-                    'api-key': imageApiKey, 
-                    'Authorization': `Bearer ${imageApiKey}` 
-                    // ⚠️ 注意：绝不能在这里手动写 'Content-Type': 'multipart/form-data'
-                    // Fetch 会自动帮你带上带有 boundary 的正确 Header
-                },
-                body: formData
+            const buildEditForm = (imageFieldName, includeModel) => {
+                const formData = new FormData();
+                parsedImages.forEach(img => appendImageBlob(formData, imageFieldName, img));
+                if (firstMask && firstMask.mimeType === "image/png" && firstMask.buffer.length <= 4 * 1024 * 1024) {
+                    appendImageBlob(formData, "mask", firstMask);
+                }
+                formData.append("prompt", prompt);
+                if (includeModel) formData.append("model", imageDeployment);
+                formData.append("n", "1");
+                formData.append("size", targetSize);
+                formData.append("quality", safeQuality);
+                return formData;
             };
+
+            const data = await requestAzureImage([
+                () => ({
+                    label: `deployments/${imageDeployment}/images/edits`,
+                    url: `${baseUrl}/openai/deployments/${encodeURIComponent(imageDeployment)}/images/edits?api-version=${encodeURIComponent(imageApiVersion)}`,
+                    options: { method: "POST", headers: { "api-key": imageApiKey }, body: buildEditForm("image", false) }
+                }),
+                () => ({
+                    label: `deployments/${imageDeployment}/images/edits image[]`,
+                    url: `${baseUrl}/openai/deployments/${encodeURIComponent(imageDeployment)}/images/edits?api-version=${encodeURIComponent(imageApiVersion)}`,
+                    options: { method: "POST", headers: { "api-key": imageApiKey }, body: buildEditForm("image[]", false) }
+                }),
+                () => ({
+                    label: `deployments/${imageDeployment}/images/edits model`,
+                    url: `${baseUrl}/openai/deployments/${encodeURIComponent(imageDeployment)}/images/edits?api-version=${encodeURIComponent(imageApiVersion)}`,
+                    options: { method: "POST", headers: { "api-key": imageApiKey }, body: buildEditForm("image", true) }
+                }),
+                () => ({
+                    label: "openai/v1/images/edits",
+                    url: `${baseUrl}/openai/v1/images/edits?api-version=preview`,
+                    options: { method: "POST", headers: { "api-key": imageApiKey }, body: buildEditForm("image", true) }
+                })
+            ]);
+
+            const imageItem = data.data && data.data[0];
+            const imageUrl = getImageUrlFromResponse(data);
+            if (!imageUrl) throw new Error("模型没有返回有效的图片数据");
+            return res.json({
+                url: imageUrl,
+                revised_prompt: imageItem.revised_prompt || prompt
+            });
 
         } else {
-            // =============== 分支 B：文生图 (Generations) 原生接口 ===============
             console.log("✨ 纯文字描述，启动原生 generations 接口...");
-            url = `${imageEndpoint.replace(/\/$/, '')}/openai/deployments/${imageDeployment}/images/generations?api-version=${targetVersion}`;
-            
-            options = {
-                method: 'POST',
-                headers: { 
-                    'Content-Type': 'application/json', 
-                    'api-key': imageApiKey, 
-                    'Authorization': `Bearer ${imageApiKey}` 
-                },
-                body: JSON.stringify({
-                    prompt: prompt, 
-                    size: targetSize, 
-                    n: 1
-                })
+            const buildGenerationBody = (includeModel) => {
+                const body = {
+                    prompt,
+                    size: targetSize,
+                    n: 1,
+                    quality: safeQuality
+                };
+                if (includeModel) body.model = imageDeployment;
+                return body;
             };
+
+            const data = await requestAzureImage([
+                () => ({
+                    label: `deployments/${imageDeployment}/images/generations`,
+                    url: `${baseUrl}/openai/deployments/${encodeURIComponent(imageDeployment)}/images/generations?api-version=${encodeURIComponent(imageApiVersion)}`,
+                    options: {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json", "api-key": imageApiKey },
+                        body: JSON.stringify(buildGenerationBody(false))
+                    }
+                }),
+                () => ({
+                    label: `deployments/${imageDeployment}/images/generations model`,
+                    url: `${baseUrl}/openai/deployments/${encodeURIComponent(imageDeployment)}/images/generations?api-version=${encodeURIComponent(imageApiVersion)}`,
+                    options: {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json", "api-key": imageApiKey },
+                        body: JSON.stringify(buildGenerationBody(true))
+                    }
+                }),
+                () => ({
+                    label: "openai/v1/images/generations",
+                    url: `${baseUrl}/openai/v1/images/generations?api-version=preview`,
+                    options: {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json", "api-key": imageApiKey },
+                        body: JSON.stringify(buildGenerationBody(true))
+                    }
+                })
+            ]);
+
+            const imageItem = data.data && data.data[0];
+            const imageUrl = getImageUrlFromResponse(data);
+            if (!imageUrl) throw new Error("模型没有返回有效的图片数据");
+            return res.json({
+                url: imageUrl,
+                revised_prompt: imageItem.revised_prompt || prompt
+            });
         }
-
-        // 2. 发起最终请求
-        const response = await fetch(url, options);
-
-        // 3. 强力报错捕获，提取最精确的提示信息以便排错
-        if (!response.ok) {
-            let errText = await response.text();
-            try {
-                const errObj = JSON.parse(errText);
-                if (errObj.error && errObj.error.message) {
-                    errText = errObj.error.message;
-                }
-            } catch(e) {} 
-            console.error("🔥 Azure 返回了错误:", errText);
-            throw new Error(errText);
-        }
-
-        // 4. 数据解析与回传给前端
-        const data = await response.json();
-        let imageUrl = '';
-        if (data.data && data.data[0].b64_json) { 
-            imageUrl = 'data:image/png;base64,' + data.data[0].b64_json; 
-        } else if (data.data && data.data[0].url) { 
-            imageUrl = data.data[0].url; 
-        } else { 
-            throw new Error("模型没有返回有效的图片数据"); 
-        }
-
-        const revisedPrompt = data.data[0].revised_prompt || prompt;
-        res.json({ url: imageUrl, revised_prompt: revisedPrompt });
 
     } catch (error) {
         console.error("🔥 AI 画图接口崩溃:", error);
