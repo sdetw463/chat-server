@@ -547,25 +547,45 @@ app.post('/api/sessions', async (req, res) => {
         const { sessions, userName } = req.body; 
         if (!userName) return res.json({ success: false, msg: "缺少用户身份" });
 
-        for (const s of sessions) {
-            for (const msg of s.messages) {
-                if (msg.mediaHtml && msg.mediaHtml.includes('data:image')) {
-                    const matches = msg.mediaHtml.match(/src="(data:image[^"]+)"/g);
-                    if (matches) {
-                        for (const match of matches) {
-                            const b64 = match.replace('src="', '').replace('"', '');
-                            const url = await uploadBase64ToBlob(b64);
-                            msg.mediaHtml = msg.mediaHtml.replace(b64, url);
+        if(process.env.MONGODB_URI) {
+            // 第一步：获取前端传过来的所有有效的 sessionId
+            const currentSessionIds = sessions.map(s => s.id);
+
+            // 第二步：关键修复！删除数据库中那些【属于该用户】但【不在当前列表】里的会话
+            await AiSession.deleteMany({ 
+                userName: userName, 
+                sessionId: { $nin: currentSessionIds } 
+            });
+
+            // 第三步：再执行原有的循环保存逻辑
+            for (const s of sessions) {
+                // 处理图片链接（保持你原有的逻辑不变）
+                for (const msg of s.messages) {
+                    if (msg.mediaHtml && msg.mediaHtml.includes('data:image')) {
+                        const matches = msg.mediaHtml.match(/src="(data:image[^"]+)"/g);
+                        if (matches) {
+                            for (const match of matches) {
+                                const b64 = match.replace('src="', '').replace('"', '');
+                                const url = await uploadBase64ToBlob(b64);
+                                msg.mediaHtml = msg.mediaHtml.replace(b64, url);
+                            }
                         }
                     }
                 }
-            }
-            if(process.env.MONGODB_URI) {
-                await AiSession.findOneAndUpdate({ sessionId: s.id, userName: userName }, { sessionId: s.id, userName: userName, data: s }, { upsert: true });
+                
+                // 更新或插入
+                await AiSession.findOneAndUpdate(
+                    { sessionId: s.id, userName: userName }, 
+                    { sessionId: s.id, userName: userName, data: s }, 
+                    { upsert: true }
+                );
             }
         }
         res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) { 
+        console.error("同步 AI 会话失败:", err);
+        res.status(500).json({ error: err.message }); 
+    }
 });
 
 app.get('/api/sessions', async (req, res) => {
