@@ -613,6 +613,7 @@ wss.on('connection', async (ws, req) => {
         if(process.env.MONGODB_URI) {
             const history = await WsMessage.find().sort({ _id: -1 }).limit(800).lean();
             history.reverse();
+            
             history.forEach(item => {
                 // 将安全的 entryId 恢复给 id，如果早期数据没有，就用 _id 兜底
                 if (item.entryId) {
@@ -624,8 +625,6 @@ wss.on('connection', async (ws, req) => {
 
             ws.send(JSON.stringify({ type: 'history', data: history }));
         }
-            ws.send(JSON.stringify({ type: 'history', data: history }));
-        }
     } catch (err) { console.error("读取历史记录失败", err); }
     
     broadcastUserList();
@@ -633,14 +632,12 @@ wss.on('connection', async (ws, req) => {
     ws.on('message', async (message) => {
         try {
             const data = JSON.parse(message);
-            // 👇 插入这一小段：把前端传来的 id 保护起来，存入 schema 中定义的 entryId 字段
+            
+            // 👇 保护前端传来的 id，存入 schema 中定义的 entryId 字段
             if (data.id) {
                 data.entryId = data.id;
             }
             
-            if (data.msg && data.msg.startsWith('data:image')) {
-                data.msg = await uploadBase64ToBlob(data.msg);
-            }
             if (data.msg && data.msg.startsWith('data:image')) {
                 data.msg = await uploadBase64ToBlob(data.msg);
             }
@@ -655,6 +652,7 @@ wss.on('connection', async (ws, req) => {
             broadcast(JSON.stringify({ type: 'message', ...data }));
         } catch (e) { console.error(e); }
     });
+    
     ws.on('close', () => { clients.delete(ws); broadcastUserList(); });
 });
 
