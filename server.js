@@ -250,7 +250,7 @@ app.post('/api/ai-image', async (req, res) => {
             targetSize = "1792x1024";
         }
 
-        const targetVersion = "2024-10-21";
+        const targetVersion = "2024-12-01-preview";
         let url, options;
 
         if (images && images.length > 0) {
