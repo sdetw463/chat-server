@@ -548,14 +548,19 @@ app.post('/api/sessions', async (req, res) => {
         if (!userName) return res.json({ success: false, msg: "缺少用户身份" });
 
         if(process.env.MONGODB_URI) {
-            // 第一步：获取前端传过来的所有有效的 sessionId
             const currentSessionIds = sessions.map(s => s.id);
 
-            // 第二步：关键修复！删除数据库中那些【属于该用户】但【不在当前列表】里的会话
-            await AiSession.deleteMany({ 
-                userName: userName, 
-                sessionId: { $nin: currentSessionIds } 
-            });
+            // 【增加安全保护】：只有当前端确实传了有效会话时，才执行差异化删除
+            // 防止前端因网络延迟还未拉取到数据时，发生意外的"清库"惨剧
+            if (currentSessionIds.length > 0) {
+                await AiSession.deleteMany({ 
+                    userName: userName, 
+                    sessionId: { $nin: currentSessionIds } 
+                });
+            } else if (sessions.length === 0 && req.body.forceDeleteAll === true) {
+                // 如果以后需要做"清空所有记录"的功能，可以靠这个显式字段来控制
+                await AiSession.deleteMany({ userName: userName });
+            }
 
             // 第三步：再执行原有的循环保存逻辑
             for (const s of sessions) {
