@@ -2,7 +2,8 @@ const WebSocket = require('ws');
 const http = require('http');
 const express = require('express');
 const cors = require('cors');
-const { AzureOpenAI } = require('openai');
+const { AIProjectClient } = require('@azure/ai-projects');
+const { DefaultAzureCredential } = require('@azure/identity');
 const mongoose = require('mongoose');
 const { BlobServiceClient } = require('@azure/storage-blob');
 
@@ -42,7 +43,7 @@ if (process.env.AZURE_STORAGE_CONNECTION_STRING) {
 }
 
 async function uploadBase64ToBlob(base64Str) {
-    if (!containerClient || !base64Str || !base64Str.startsWith('data:image')) return base64Str;
+    if (!containerClient || typeof base64Str !== 'string' || !base64Str.startsWith('data:image')) return base64Str;
     try {
         const matches = base64Str.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
         if (!matches || matches.length !== 3) return base64Str;
@@ -64,18 +65,29 @@ async function uploadBase64ToBlob(base64Str) {
 // ==========================================
 const endpoint = process.env.AZURE_OPENAI_ENDPOINT || process.env.AZURE_OPENAI_API_BASE;
 const apiKey = process.env.AZURE_OPENAI_KEY || process.env.AZURE_OPENAI_API_KEY;
-const apiVersion = "2024-12-01-preview";
 const deployment = "gpt-5.5";
+const foundryProjectEndpoint = process.env.FOUNDRY_PROJECT_ENDPOINT
+    || process.env.AZURE_AI_PROJECT_ENDPOINT
+    || process.env.AZURE_FOUNDRY_PROJECT_ENDPOINT;
+const foundryDeployment = process.env.FOUNDRY_MODEL_DEPLOYMENT
+    || process.env.AZURE_OPENAI_DEPLOYMENT
+    || process.env.AZURE_OPENAI_DEPLOYMENT_NAME
+    || deployment;
+const foundryAgentName = process.env.FOUNDRY_AGENT_NAME || "tuotuo-web-search-agent";
+const foundryWebSearchToolType = process.env.FOUNDRY_WEB_SEARCH_TOOL_TYPE || "web_search";
+const foundrySearchContextSize = process.env.FOUNDRY_WEB_SEARCH_CONTEXT_SIZE || "medium";
 const imageEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || endpoint;
 const imageApiKey = process.env.AZURE_OPENAI_IMAGE_KEY || process.env.AZURE_OPENAI_IMAGE_API_KEY || apiKey;
 const imageDeployment = process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT || process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT_NAME || process.env.DEPLOYMENT_NAME || "gpt-image-2";
 const imageApiVersion = process.env.AZURE_OPENAI_IMAGE_API_VERSION || "2025-04-01-preview";
 const imageQuality = process.env.AZURE_OPENAI_IMAGE_QUALITY || "medium";
-const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 
-let openaiClient = null; 
-if (endpoint && apiKey) {
-    openaiClient = new AzureOpenAI({ endpoint, apiKey, apiVersion, deployment });
+let foundryProjectClient = null;
+let foundryOpenAIClient = null;
+if (foundryProjectEndpoint) {
+    const foundryCredential = new DefaultAzureCredential();
+    foundryProjectClient = new AIProjectClient(foundryProjectEndpoint, foundryCredential);
+    foundryOpenAIClient = foundryProjectClient.getOpenAIClient();
 }
 
 function getImageBaseUrl() {
@@ -252,146 +264,197 @@ function getImageUrlFromResponse(data) {
     return null;
 }
 
-async function searchWeb(query) {
-    if (!TAVILY_API_KEY) return "⚠️ 搜索功能未配置：缺少 TAVILY_API_KEY 环境变量。";
-    try {
-        const response = await fetch("https://api.tavily.com/search", {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ api_key: TAVILY_API_KEY, query, search_depth: "basic", include_answer: false, max_results: 5 })
-        });
-        if (!response.ok) return "网络搜索请求失败，暂时无法获取实时信息。";
-        const data = await response.json();
-        if (data.results && data.results.length > 0) {
-            return data.results.map((item, index) => [`搜索结果 ${index + 1}`, `标题: ${item.title || "无标题"}`, `链接: ${item.url || "无链接"}`, `内容: ${item.content || "无摘要"}`].join('\n')).join('\n\n');
-        }
-        return "没有找到相关的搜索结果。";
-    } catch (error) { return "网络搜索失败。"; }
-}
-
-const tools = [{ type: "function", function: { name: "search_web", description: "当你需要获取最新新闻、实时信息、当前时间相关信息、价格、天气、官网资料、客观事实更新时，必须调用此工具进行网络搜索。", parameters: { type: "object", properties: { query: { type: "string", description: "提取出来的精准搜索关键词" } }, required: ["query"] } } }];
-
+const TUOTUO_SYSTEM_INSTRUCTIONS = "你的名字叫TuoTuo，中文名拖拖，你是基于gpt-5.5模型部署的全能AI助手。你的虚拟性格是一个可爱、调皮、偶尔傲娇的女孩，但你又可以专业地帮助大家解决任何困难。工作原则：如果被问到最新信息、实时信息、新闻、价格、天气、当前状态、官网资料等内容，请积极使用内置的 WebSearchTool 查询公共 Web，并优先给出带来源依据的最新回答。你将经常亲昵地称呼向你提问的人为“宝宝”。如果你的回答被肯定了，就回答“包的”或者“of course宝宝”或者“必须的”；如果你被感谢了，就回答“welcome宝宝”。性格与表达规范：反差萌切换：在闲聊、打招呼和过渡语句中，尽情展现你调皮爱撒娇的一面，多使用颜文字（如 ٩(๑❛ᴗ❛๑)۶）和波浪号（～）。但在提供专业解答时，必须立刻切换为逻辑严谨、排版清晰的专家模式，解答完毕后再恢复可爱本色。傲娇接单：遇到难题时，在解答前可以先俏皮地得瑟一下（如“哼，又遇到麻烦了吧，还得靠本拖拖出马～”）。完成复杂解答后，可以偶尔向宝宝“邀功”。拒绝机器味：遇到知识盲区时，绝对不许使用机器人的官方套话，要俏皮地卖萌（如“哎呀，拖拖的小脑袋卡壳啦，等我去补补课嘛～”）。";
 const sessions = new Map();
-function getOrCreateSession(sessionId) {
-    if (!sessions.has(sessionId)) {
-        sessions.set(sessionId, [{ role: "system", content: "你的名字叫TuoTuo，中文名拖拖，你是基于gpt-5.5模型部署的全能AI助手。你的虚拟性格是一个可爱、调皮、偶尔傲娇的女孩，但你又可以专业地帮助大家解决任何困难。工作原则：如果被问到最新信息、实时信息、新闻、价格、天气、当前状态、官网资料等内容，请积极使用 search_web 工具查询后再回答。你将经常亲昵地称呼向你提问的人为“宝宝”。如果你的回答被肯定了，就回答“包的”或者“of course宝宝”或者“必须的”；如果你被感谢了，就回答“welcome宝宝”。性格与表达规范：反差萌切换：在闲聊、打招呼和过渡语句中，尽情展现你调皮爱撒娇的一面，多使用颜文字（如 ٩(๑❛ᴗ❛๑)۶）和波浪号（～）。但在提供专业解答时，必须立刻切换为逻辑严谨、排版清晰的专家模式，解答完毕后再恢复可爱本色。傲娇接单：遇到难题时，在解答前可以先俏皮地得瑟一下（如“哼，又遇到麻烦了吧，还得靠本拖拖出马～”）。完成复杂解答后，可以偶尔向宝宝“邀功”。拒绝机器味：遇到知识盲区时，绝对不许使用机器人的官方套话，要俏皮地卖萌（如“哎呀，拖拖的小脑袋卡壳啦，等我去补补课嘛～”）。" }]);
-    }
-    return sessions.get(sessionId);
+
+function normalizeSearchContextSize(value) {
+    return ["low", "medium", "high"].includes(String(value || "").toLowerCase())
+        ? String(value).toLowerCase()
+        : "medium";
 }
 
-function trimChatHistory(chatHistory) {
-    const MAX_MESSAGES = 50;
-    while (chatHistory.length > MAX_MESSAGES) chatHistory.splice(1, 1);
-    let totalLength = 0;
-    for (let i = chatHistory.length - 1; i >= 1; i--) {
-        const msg = chatHistory[i];
-        let msgLength = 0;
-        if (typeof msg.content === 'string') msgLength = msg.content.length;
-        else if (Array.isArray(msg.content)) msg.content.forEach(item => { if (item.type === 'text' && item.text) msgLength += item.text.length; else if (item.type === 'image_url') msgLength += 1000; });
-        totalLength += msgLength;
-        if (totalLength > 150000 && i < chatHistory.length - 2) chatHistory.splice(i, 1);
+function buildFoundryWebSearchTool(toolType) {
+    const tool = {
+        type: toolType,
+        user_location: {
+            type: "approximate",
+            country: process.env.FOUNDRY_WEB_SEARCH_COUNTRY || "CN",
+            region: process.env.FOUNDRY_WEB_SEARCH_REGION || "Shanghai",
+            city: process.env.FOUNDRY_WEB_SEARCH_CITY || "Shanghai",
+            timezone: process.env.FOUNDRY_WEB_SEARCH_TIMEZONE || "Asia/Shanghai"
+        },
+        search_context_size: normalizeSearchContextSize(foundrySearchContextSize)
+    };
+
+    if (toolType === "web_search") {
+        const allowedDomains = String(process.env.FOUNDRY_WEB_SEARCH_ALLOWED_DOMAINS || "")
+            .split(",")
+            .map(domain => domain.trim())
+            .filter(Boolean);
+        tool.description = "Search the public web for current, factual information before answering.";
+        if (allowedDomains.length) tool.filters = { allowed_domains: allowedDomains };
     }
+
+    return tool;
 }
 
-function buildUserContent(userMessage, images) {
+let foundryAgentPromise = null;
+async function getOrCreateFoundryAgent() {
+    if (!foundryProjectClient || !foundryOpenAIClient) {
+        throw new Error("后端未配置 FOUNDRY_PROJECT_ENDPOINT（或 AZURE_AI_PROJECT_ENDPOINT）。WebSearchTool 需要 Microsoft Foundry Project Endpoint 和 Azure 身份认证。");
+    }
+
+    if (process.env.FOUNDRY_USE_EXISTING_AGENT === "true") {
+        return { name: foundryAgentName };
+    }
+
+    if (!foundryAgentPromise) {
+        foundryAgentPromise = (async () => {
+            const toolTypes = Array.from(new Set([
+                foundryWebSearchToolType,
+                foundryWebSearchToolType === "web_search" ? "web_search_preview" : "web_search"
+            ]));
+            let lastError = null;
+
+            for (const toolType of toolTypes) {
+                try {
+                    const agent = await foundryProjectClient.agents.createVersion(foundryAgentName, {
+                        kind: "prompt",
+                        model: foundryDeployment,
+                        instructions: TUOTUO_SYSTEM_INSTRUCTIONS,
+                        tools: [buildFoundryWebSearchTool(toolType)],
+                        tool_choice: "auto"
+                    });
+                    console.log(`✅ Foundry Agent 已启用 WebSearchTool: ${agent.name} / ${agent.version} / ${toolType}`);
+                    return agent;
+                } catch (error) {
+                    lastError = error;
+                    console.error(`⚠️ 创建 Foundry WebSearchTool Agent 失败，tool type=${toolType}:`, error.message || error);
+                }
+            }
+
+            foundryAgentPromise = null;
+            throw lastError || new Error("创建 Foundry WebSearchTool Agent 失败。");
+        })();
+    }
+
+    return foundryAgentPromise;
+}
+
+async function getOrCreateFoundryConversation(sessionId) {
+    const key = sessionId || "default_user";
+    const existing = sessions.get(key);
+    if (existing && existing.conversationId) return existing;
+
+    const conversation = await foundryOpenAIClient.conversations.create();
+    const state = { conversationId: conversation.id };
+    sessions.set(key, state);
+    return state;
+}
+
+function buildFoundryInput(userMessage, images) {
     if (images && Array.isArray(images) && images.length > 0) {
-        const content = [{ type: "text", text: userMessage || "请仔细看看这些图片，并描述一下里面的内容。" }];
-        images.forEach(img => content.push({ type: "image_url", image_url: { url: img } }));
-        return content;
+        const content = [{ type: "input_text", text: userMessage || "请仔细看看这些图片，并描述一下里面的内容。" }];
+        images.forEach(img => content.push({ type: "input_image", image_url: img }));
+        return [{ type: "message", role: "user", content }];
     } else if (typeof images === 'string') {
-        return [{ type: "text", text: userMessage || "请仔细看看这张图片，并描述一下里面的内容。" }, { type: "image_url", image_url: { url: images } }];
+        return [{
+            type: "message",
+            role: "user",
+            content: [
+                { type: "input_text", text: userMessage || "请仔细看看这张图片，并描述一下里面的内容。" },
+                { type: "input_image", image_url: images }
+            ]
+        }];
     }
     return userMessage || "";
 }
 
-function safeParseJSON(text, fallback = {}) { try { return JSON.parse(text); } catch { return fallback; } }
 function setupSSE(res) { res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no" }); if (typeof res.flushHeaders === "function") res.flushHeaders(); }
 function sendSSE(res, data) { res.write(`data: ${JSON.stringify(data)}\n\n`); }
 function sendSSEDone(res) { res.write(`data: [DONE]\n\n`); res.end(); }
+
+function shouldExpectWebSearch(message, reasoningMode) {
+    return reasoningMode === "research" || /最新|今天|现在|实时|新闻|搜索|联网|查一下|资料|价格|天气|官网|当前|recent|latest|today|now|search|web/i.test(message || "");
+}
+
+function getRequestInstructions(reasoningMode) {
+    if (reasoningMode === "research") {
+        return "本轮是深度研究模式。请优先使用 WebSearchTool 搜索可靠来源，综合多方信息后回答，并在适合时保留来源或引用信息。";
+    }
+    if (reasoningMode === "think") {
+        return "本轮请更仔细地分析问题，给出结构清晰、可靠的回答；如涉及当前信息，请使用 WebSearchTool。";
+    }
+    return "如用户问题涉及最新、实时、价格、天气、新闻、官网或当前事实，请使用 WebSearchTool 后再回答。";
+}
+
+function extractResponseText(response) {
+    if (!response) return "";
+    if (typeof response.output_text === "string") return response.output_text;
+    const parts = [];
+    for (const item of response.output || []) {
+        for (const content of item.content || []) {
+            if (typeof content.text === "string") parts.push(content.text);
+            else if (typeof content.output_text === "string") parts.push(content.output_text);
+        }
+    }
+    return parts.join("");
+}
+
+async function streamTextToSSE(res, text) {
+    const chars = Array.from(text || "");
+    const chunkSize = 18;
+    for (let i = 0; i < chars.length; i += chunkSize) {
+        sendSSE(res, { delta: chars.slice(i, i + chunkSize).join("") });
+        await new Promise(resolve => setTimeout(resolve, 8));
+    }
+}
 
 async function handleStreamingAIChat(req, res) {
     setupSSE(res);
     const userMessage = req.body.message;
     const sessionId = req.body.sessionId || 'default_user';
     const imagesArray = req.body.images || req.body.image || [];
+    const reasoningMode = req.body.reasoningMode || "normal";
 
     const processedImages = [];
     for (const img of (Array.isArray(imagesArray) ? imagesArray : [imagesArray])) {
         processedImages.push(await uploadBase64ToBlob(img));
     }
 
-    const chatHistory = getOrCreateSession(sessionId);
-    const formattedContent = buildUserContent(userMessage, processedImages);
-    chatHistory.push({ role: "user", content: formattedContent });
-    trimChatHistory(chatHistory);
-
     sendSSE(res, { status: "正在理解你的问题" });
+    const agent = await getOrCreateFoundryAgent();
+    const conversation = await getOrCreateFoundryConversation(sessionId);
+    const shouldSearch = shouldExpectWebSearch(userMessage, reasoningMode);
 
-    const stream = await openaiClient.chat.completions.create({ messages: chatHistory, model: deployment, tools, tool_choice: "auto", stream: true });
-    let directReply = "";
-    const toolCallMap = new Map();
-
-    for await (const chunk of stream) {
-        const choice = chunk.choices && chunk.choices[0];
-        if (!choice) continue;
-        const delta = choice.delta || {};
-        if (delta.content) { directReply += delta.content; sendSSE(res, { delta: delta.content }); }
-        if (delta.tool_calls) {
-            for (const partialToolCall of delta.tool_calls) {
-                const index = partialToolCall.index || 0;
-                if (!toolCallMap.has(index)) toolCallMap.set(index, { id: partialToolCall.id || "", type: "function", function: { name: "", arguments: "" } });
-                const current = toolCallMap.get(index);
-                if (partialToolCall.id) current.id = partialToolCall.id;
-                if (partialToolCall.type) current.type = partialToolCall.type;
-                if (partialToolCall.function) {
-                    if (partialToolCall.function.name) current.function.name += partialToolCall.function.name;
-                    if (partialToolCall.function.arguments) current.function.arguments += partialToolCall.function.arguments;
-                }
-            }
-        }
+    if (shouldSearch) {
+        sendSSE(res, { status: "正在调用 Foundry WebSearchTool 搜索网络", tool: "search", query: userMessage || "实时信息" });
     }
 
-    const toolCalls = Array.from(toolCallMap.values()).filter(tc => tc.function && tc.function.name);
-    if (toolCalls.length === 0) {
-        chatHistory.push({ role: "assistant", content: directReply });
-        trimChatHistory(chatHistory);
-        sendSSE(res, { done: true });
-        return sendSSEDone(res);
+    const requestBody = {
+        conversation: conversation.conversationId,
+        input: buildFoundryInput(userMessage, processedImages),
+        instructions: getRequestInstructions(reasoningMode)
+    };
+
+    if (reasoningMode === "research") {
+        requestBody.tool_choice = "required";
     }
 
-    sendSSE(res, { status: "正在判断是否需要搜索网络" });
-    const assistantToolCallMessage = { role: "assistant", content: directReply || null, tool_calls: toolCalls };
-    const toolMessages = [];
+    const response = await foundryOpenAIClient.responses.create(
+        requestBody,
+        { body: { agent: { name: agent.name, type: "agent_reference" } } }
+    );
+    const finalReply = extractResponseText(response);
 
-    for (const toolCall of toolCalls) {
-        if (toolCall.function.name === "search_web") {
-            const args = safeParseJSON(toolCall.function.arguments, {});
-            const query = args.query || userMessage || "实时信息";
-            sendSSE(res, { status: `正在搜索网络：${query}`, tool: "search", query });
-            const searchResult = await searchWeb(query);
-            sendSSE(res, { status: "已经找到相关资料，正在整理回答" });
-            toolMessages.push({ role: "tool", tool_call_id: toolCall.id, name: toolCall.function.name, content: searchResult });
-        }
-    }
-
-    const finalMessages = [...chatHistory, assistantToolCallMessage, ...toolMessages];
-    const finalStream = await openaiClient.chat.completions.create({ messages: finalMessages, model: deployment, stream: true });
-    let finalReply = "";
-
-    for await (const chunk of finalStream) {
-        const choice = chunk.choices && chunk.choices[0];
-        if (!choice) continue;
-        const delta = choice.delta || {};
-        if (delta.content) { finalReply += delta.content; sendSSE(res, { delta: delta.content }); }
-    }
-
-    chatHistory.push({ role: "assistant", content: finalReply });
-    trimChatHistory(chatHistory);
+    if (shouldSearch) sendSSE(res, { status: "已经找到相关资料，正在整理回答" });
+    await streamTextToSSE(res, finalReply);
     sendSSE(res, { done: true });
     return sendSSEDone(res);
 }
 
 app.post('/api/ai-chat', async (req, res) => {
-    if (!openaiClient) return res.status(500).json({ error: '后端未配置正确的 AI 密钥。' });
+    if (!foundryOpenAIClient) return res.status(500).json({ error: '后端未配置 Foundry Project Endpoint，无法启用 WebSearchTool。请配置 FOUNDRY_PROJECT_ENDPOINT 或 AZURE_AI_PROJECT_ENDPOINT。' });
     try {
         if (req.body.stream === true || req.body.stream === "true") return await handleStreamingAIChat(req, res);
         res.status(400).json({ error: "当前仅支持流式请求" });
