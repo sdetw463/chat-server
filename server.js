@@ -449,7 +449,7 @@ async function handleStreamingAIChat(req, res) {
 
     const response = await foundryOpenAIClient.responses.create(
         requestBody,
-        { body: { agent: { name: agent.name, type: "agent_reference" } } }
+        { body: { agent_reference: { name: agent.name, type: "agent_reference" } } }
     );
     const finalReply = extractResponseText(response);
 
