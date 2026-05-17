@@ -31,7 +31,14 @@ const wsMsgSchema = new mongoose.Schema({
 }, { strict: false, timestamps: true });
 const WsMessage = mongoose.model('WsMessage', wsMsgSchema, 'chat_history');
 
-const aiSessionSchema = new mongoose.Schema({ sessionId: String, userName: String, data: Object }, { strict: false });
+const aiSessionSchema = new mongoose.Schema({
+    sessionId: String,
+    userName: String,
+    data: Object,
+    foundryConversationId: String,
+    foundryVectorStoreId: String,
+    foundryFileIds: [String]
+}, { strict: false, timestamps: true });
 const AiSession = mongoose.model('AiSession', aiSessionSchema, 'ai_sessions');
 
 let containerClient = null;
@@ -74,8 +81,11 @@ const foundryDeployment = process.env.FOUNDRY_MODEL_DEPLOYMENT
     || process.env.AZURE_OPENAI_DEPLOYMENT_NAME
     || deployment;
 const foundryAgentName = process.env.FOUNDRY_AGENT_NAME || "tuotuo-web-search-agent";
+const foundryFileAgentName = process.env.FOUNDRY_FILE_AGENT_NAME || `${foundryAgentName}-files`;
 const foundryWebSearchToolType = process.env.FOUNDRY_WEB_SEARCH_TOOL_TYPE || "web_search_preview";
 const foundrySearchContextSize = process.env.FOUNDRY_WEB_SEARCH_CONTEXT_SIZE || "medium";
+const foundryUseExistingAgent = process.env.FOUNDRY_USE_EXISTING_AGENT === "true";
+const foundryEnableFileSearch = process.env.FOUNDRY_ENABLE_FILE_SEARCH !== "false";
 const imageEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || endpoint;
 const imageApiKey = process.env.AZURE_OPENAI_IMAGE_KEY || process.env.AZURE_OPENAI_IMAGE_API_KEY || apiKey;
 const imageDeployment = process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT || process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT_NAME || process.env.DEPLOYMENT_NAME || "gpt-image-2";
@@ -289,56 +299,116 @@ function buildFoundryWebSearchTool(toolType) {
     return tool;
 }
 
+function getAgentReference(agent) {
+    return { name: agent.name || agent, type: "agent_reference" };
+}
+
+function buildAgentTools(toolType, vectorStoreId) {
+    const tools = [buildFoundryWebSearchTool(toolType)];
+    if (vectorStoreId) {
+        tools.push({ type: "file_search", vector_store_ids: [vectorStoreId] });
+    }
+    return tools;
+}
+
 let foundryAgentPromise = null;
-async function getOrCreateFoundryAgent() {
+const foundryFileAgentPromises = new Map();
+async function getOrCreateFoundryAgent(vectorStoreId = null) {
     if (!foundryProjectClient || !foundryOpenAIClient) {
         throw new Error("后端未配置 FOUNDRY_PROJECT_ENDPOINT（或 AZURE_AI_PROJECT_ENDPOINT）。WebSearchTool 需要 Microsoft Foundry Project Endpoint 和 Azure 身份认证。");
     }
 
-    if (process.env.FOUNDRY_USE_EXISTING_AGENT === "true") {
-        return { name: foundryAgentName };
+    if (foundryUseExistingAgent) {
+        return { name: vectorStoreId ? foundryFileAgentName : foundryAgentName };
+    }
+
+    if (vectorStoreId && foundryFileAgentPromises.has(vectorStoreId)) {
+        return foundryFileAgentPromises.get(vectorStoreId);
+    }
+
+    const createAgent = async (agentName, vectorId = null) => {
+        const toolTypes = Array.from(new Set([
+            foundryWebSearchToolType,
+            foundryWebSearchToolType === "web_search_preview" ? "web_search_preview_2025_03_11" : "web_search_preview"
+        ]));
+        let lastError = null;
+
+        for (const toolType of toolTypes) {
+            try {
+                const agent = await foundryProjectClient.agents.createVersion(agentName, {
+                    kind: "prompt",
+                    model: foundryDeployment,
+                    instructions: TUOTUO_SYSTEM_INSTRUCTIONS,
+                    tools: buildAgentTools(toolType, vectorId)
+                });
+                console.log(`✅ Foundry Agent 已启用工具: ${agent.name} / ${agent.version} / ${toolType}${vectorId ? " / file_search" : ""}`);
+                return agent;
+            } catch (error) {
+                lastError = error;
+                console.error(`⚠️ 创建 Foundry Agent 失败，tool type=${toolType}:`, error.message || error);
+            }
+        }
+
+        throw lastError || new Error("创建 Foundry Agent 失败。");
+    };
+
+    if (vectorStoreId) {
+        const promise = createAgent(`${foundryFileAgentName}-${String(vectorStoreId).slice(-8)}`, vectorStoreId)
+            .catch(error => {
+                foundryFileAgentPromises.delete(vectorStoreId);
+                throw error;
+            });
+        foundryFileAgentPromises.set(vectorStoreId, promise);
+        return promise;
     }
 
     if (!foundryAgentPromise) {
-        foundryAgentPromise = (async () => {
-            const toolTypes = Array.from(new Set([
-                foundryWebSearchToolType,
-                foundryWebSearchToolType === "web_search_preview" ? "web_search_preview_2025_03_11" : "web_search_preview"
-            ]));
-            let lastError = null;
-
-            for (const toolType of toolTypes) {
-                try {
-                    const agent = await foundryProjectClient.agents.createVersion(foundryAgentName, {
-                        kind: "prompt",
-                        model: foundryDeployment,
-                        instructions: TUOTUO_SYSTEM_INSTRUCTIONS,
-                        tools: [buildFoundryWebSearchTool(toolType)]
-                    });
-                    console.log(`✅ Foundry Agent 已启用 WebSearchTool: ${agent.name} / ${agent.version} / ${toolType}`);
-                    return agent;
-                } catch (error) {
-                    lastError = error;
-                    console.error(`⚠️ 创建 Foundry WebSearchTool Agent 失败，tool type=${toolType}:`, error.message || error);
-                }
-            }
-
+        foundryAgentPromise = createAgent(foundryAgentName).catch(error => {
             foundryAgentPromise = null;
-            throw lastError || new Error("创建 Foundry WebSearchTool Agent 失败。");
-        })();
+            throw error;
+        });
     }
 
     return foundryAgentPromise;
 }
 
-async function getOrCreateFoundryConversation(sessionId) {
+async function saveFoundrySessionState(sessionId, state) {
+    if (!sessionId || !process.env.MONGODB_URI) return;
+    try {
+        const update = {};
+        if (state.conversationId) update.foundryConversationId = state.conversationId;
+        if (state.vectorStoreId) update.foundryVectorStoreId = state.vectorStoreId;
+        if (state.fileIds) update.foundryFileIds = state.fileIds;
+        if (Object.keys(update).length) {
+            await AiSession.findOneAndUpdate({ sessionId }, { $set: update }, { upsert: false });
+        }
+    } catch (error) {
+        console.error("保存 Foundry 会话状态失败:", error.message || error);
+    }
+}
+
+async function getOrCreateFoundryConversation(sessionId, userName) {
     const key = sessionId || "default_user";
     const existing = sessions.get(key);
     if (existing && existing.conversationId) return existing;
 
+    if (process.env.MONGODB_URI && sessionId) {
+        const doc = await AiSession.findOne({ sessionId, ...(userName ? { userName } : {}) }).lean();
+        if (doc && doc.foundryConversationId) {
+            const state = {
+                conversationId: doc.foundryConversationId,
+                vectorStoreId: doc.foundryVectorStoreId || null,
+                fileIds: doc.foundryFileIds || []
+            };
+            sessions.set(key, state);
+            return state;
+        }
+    }
+
     const conversation = await foundryOpenAIClient.conversations.create();
-    const state = { conversationId: conversation.id };
+    const state = { conversationId: conversation.id, vectorStoreId: null, fileIds: [] };
     sessions.set(key, state);
+    await saveFoundrySessionState(sessionId, state);
     return state;
 }
 
@@ -365,6 +435,55 @@ function buildFoundryInput(userMessage, images, reasoningMode) {
         }];
     }
     return text;
+}
+
+function safeFileName(name, fallback = "attachment.txt") {
+    const cleaned = String(name || fallback).replace(/[^\w.\-()\u4e00-\u9fa5]+/g, "_").slice(0, 120);
+    return cleaned || fallback;
+}
+
+async function ensureVectorStoreForSession(sessionId, state) {
+    if (!foundryEnableFileSearch) return null;
+    if (state.vectorStoreId) return state.vectorStoreId;
+    if (!foundryOpenAIClient || !foundryOpenAIClient.vectorStores) return null;
+
+    const vectorStore = await foundryOpenAIClient.vectorStores.create({
+        name: `tuotuo-${String(sessionId || "session").slice(-36)}`
+    });
+    state.vectorStoreId = vectorStore.id;
+    state.fileIds = state.fileIds || [];
+    await saveFoundrySessionState(sessionId, state);
+    return state.vectorStoreId;
+}
+
+async function attachDocumentsToVectorStore(sessionId, state, documents) {
+    const docs = Array.isArray(documents) ? documents.filter(doc => doc && doc.content) : [];
+    if (!docs.length) return { vectorStoreId: state.vectorStoreId || null, fallbackText: "" };
+
+    let fallbackText = "";
+    try {
+        const vectorStoreId = await ensureVectorStoreForSession(sessionId, state);
+        if (!vectorStoreId || !foundryOpenAIClient.vectorStores?.files?.uploadAndPoll) {
+            throw new Error("当前 OpenAI client 不支持 vectorStores.files.uploadAndPoll。");
+        }
+
+        for (const doc of docs.slice(0, 5)) {
+            const name = safeFileName(doc.name || "attachment.txt");
+            const content = String(doc.content || "").slice(0, 240000);
+            const file = new File([content], name, { type: "text/plain" });
+            const uploaded = await foundryOpenAIClient.vectorStores.files.uploadAndPoll(vectorStoreId, file);
+            if (uploaded && uploaded.id) state.fileIds.push(uploaded.id);
+        }
+
+        await saveFoundrySessionState(sessionId, state);
+        return { vectorStoreId, fallbackText: "" };
+    } catch (error) {
+        console.error("Foundry File Search 附件上传失败，回退为文本上下文:", error.message || error);
+        fallbackText = docs.slice(0, 5)
+            .map(doc => `\n\n【附件：${safeFileName(doc.name)}】\n${String(doc.content || "").slice(0, 60000)}`)
+            .join("");
+        return { vectorStoreId: state.vectorStoreId || null, fallbackText };
+    }
 }
 
 function setupSSE(res) { res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no" }); if (typeof res.flushHeaders === "function") res.flushHeaders(); }
@@ -398,6 +517,83 @@ function extractResponseText(response) {
     return parts.join("");
 }
 
+function extractCitationSources(response) {
+    const sources = [];
+    const seen = new Set();
+    const visit = value => {
+        if (!value || typeof value !== "object") return;
+        if (Array.isArray(value)) {
+            value.forEach(visit);
+            return;
+        }
+
+        const url = value.url || value.uri;
+        const title = value.title || value.name || value.text || value.file_name;
+        if (url && /^https?:\/\//i.test(String(url))) {
+            const key = String(url);
+            if (!seen.has(key)) {
+                seen.add(key);
+                sources.push({ title: String(title || url).slice(0, 180), url: key });
+            }
+        }
+
+        if (value.type && /citation|annotation|file_search|web_search/i.test(String(value.type)) && title && !url) {
+            const key = `${value.type}:${title}`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                sources.push({ title: String(title).slice(0, 180), type: String(value.type) });
+            }
+        }
+
+        for (const child of Object.values(value)) visit(child);
+    };
+    visit(response);
+    return sources.slice(0, 12);
+}
+
+function handleStreamEvent(event, state, res) {
+    if (!event || typeof event !== "object") return;
+    const type = event.type || "";
+
+    if (type === "response.output_text.delta" && event.delta) {
+        state.fullText += event.delta;
+        sendSSE(res, { delta: event.delta });
+        return;
+    }
+
+    if ((type === "response.output_text.done" || type === "response.text.done") && event.text && !state.fullText) {
+        state.fullText = event.text;
+        sendSSE(res, { delta: event.text });
+        return;
+    }
+
+    if (/web_search/i.test(type)) {
+        state.usedWebSearch = true;
+        sendSSE(res, { status: "正在搜索网络", tool: "search" });
+    } else if (/file_search/i.test(type)) {
+        state.usedFileSearch = true;
+        sendSSE(res, { status: "正在检索上传文件", tool: "file_search" });
+    } else if (type === "response.completed" && event.response) {
+        state.completedResponse = event.response;
+    } else if (type === "response.failed" && event.response?.error) {
+        throw event.response.error;
+    }
+}
+
+async function createFoundryResponseStream(requestBody, agent) {
+    return foundryOpenAIClient.responses.create(
+        { ...requestBody, stream: true },
+        { body: { agent_reference: getAgentReference(agent) } }
+    );
+}
+
+async function createFoundryResponse(requestBody, agent) {
+    return foundryOpenAIClient.responses.create(
+        requestBody,
+        { body: { agent_reference: getAgentReference(agent) } }
+    );
+}
+
 function formatAIError(error) {
     const parts = [];
     if (error.status) parts.push(`HTTP ${error.status}`);
@@ -425,7 +621,9 @@ async function handleStreamingAIChat(req, res) {
     setupSSE(res);
     const userMessage = req.body.message;
     const sessionId = req.body.sessionId || 'default_user';
+    const userName = req.body.userName || "";
     const imagesArray = req.body.images || req.body.image || [];
+    const documents = Array.isArray(req.body.documents) ? req.body.documents : [];
     const reasoningMode = req.body.reasoningMode || "normal";
 
     const processedImages = [];
@@ -434,27 +632,46 @@ async function handleStreamingAIChat(req, res) {
     }
 
     sendSSE(res, { status: "正在理解你的问题" });
-    const agent = await getOrCreateFoundryAgent();
-    const conversation = await getOrCreateFoundryConversation(sessionId);
+    const conversation = await getOrCreateFoundryConversation(sessionId, userName);
+    const attachmentResult = await attachDocumentsToVectorStore(sessionId, conversation, documents);
+    const messageWithFallbackDocs = attachmentResult.fallbackText ? `${userMessage || ""}${attachmentResult.fallbackText}` : userMessage;
+    const agent = await getOrCreateFoundryAgent(attachmentResult.vectorStoreId);
     const shouldSearch = shouldExpectWebSearch(userMessage, reasoningMode);
 
     if (shouldSearch) {
         sendSSE(res, { status: "正在调用 Foundry WebSearchTool 搜索网络", tool: "search", query: userMessage || "实时信息" });
     }
+    if (documents.length) {
+        sendSSE(res, { status: attachmentResult.fallbackText ? "正在使用附件文本上下文" : "正在检索上传文件", tool: attachmentResult.fallbackText ? "document_text" : "file_search" });
+    }
 
     const requestBody = {
         conversation: conversation.conversationId,
-        input: buildFoundryInput(userMessage, processedImages, reasoningMode)
+        input: buildFoundryInput(messageWithFallbackDocs, processedImages, reasoningMode)
     };
 
-    const response = await foundryOpenAIClient.responses.create(
-        requestBody,
-        { body: { agent_reference: { name: agent.name, type: "agent_reference" } } }
-    );
-    const finalReply = extractResponseText(response);
+    const streamState = { fullText: "", usedWebSearch: false, usedFileSearch: false, completedResponse: null };
+    let finalReply = "";
+    let sources = [];
+
+    try {
+        const stream = await createFoundryResponseStream(requestBody, agent);
+        for await (const event of stream) {
+            handleStreamEvent(event, streamState, res);
+        }
+        finalReply = streamState.fullText || extractResponseText(streamState.completedResponse);
+        sources = extractCitationSources(streamState.completedResponse);
+    } catch (streamError) {
+        console.error("Foundry 真流式失败，回退为非流式响应:", streamError.message || streamError);
+        if (streamState.fullText) throw streamError;
+        const response = await createFoundryResponse(requestBody, agent);
+        finalReply = extractResponseText(response);
+        sources = extractCitationSources(response);
+        await streamTextToSSE(res, finalReply);
+    }
 
     if (shouldSearch) sendSSE(res, { status: "已经找到相关资料，正在整理回答" });
-    await streamTextToSSE(res, finalReply);
+    if (sources.length) sendSSE(res, { sources });
     sendSSE(res, { done: true });
     return sendSSEDone(res);
 }
@@ -650,7 +867,7 @@ app.post('/api/sessions', async (req, res) => {
                 // 更新或插入
                 await AiSession.findOneAndUpdate(
                     { sessionId: s.id, userName: userName }, 
-                    { sessionId: s.id, userName: userName, data: s }, 
+                    { $set: { sessionId: s.id, userName: userName, data: s } }, 
                     { upsert: true }
                 );
             }
