@@ -91,6 +91,7 @@ const imageApiKey = process.env.AZURE_OPENAI_IMAGE_KEY || process.env.AZURE_OPEN
 const imageDeployment = process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT || process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT_NAME || process.env.DEPLOYMENT_NAME || "gpt-image-2";
 const imageApiVersion = process.env.AZURE_OPENAI_IMAGE_API_VERSION || "2025-04-01-preview";
 const imageQuality = process.env.AZURE_OPENAI_IMAGE_QUALITY || "medium";
+const imageMaxRetries = Math.max(0, Number(process.env.AZURE_OPENAI_IMAGE_MAX_RETRIES || 2));
 
 let foundryProjectClient = null;
 let foundryOpenAIClient = null;
@@ -226,6 +227,38 @@ async function readAzureImageError(response) {
     }
 }
 
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function parseRetryAfterMs(response) {
+    const retryAfter = response.headers.get("retry-after");
+    if (!retryAfter) return null;
+
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+        return Math.min(seconds * 1000, 30000);
+    }
+
+    const retryAt = Date.parse(retryAfter);
+    if (Number.isFinite(retryAt)) {
+        return Math.min(Math.max(retryAt - Date.now(), 0), 30000);
+    }
+
+    return null;
+}
+
+function shouldBackoffImageRequest(response, message) {
+    const text = String(message || "");
+    return [408, 409, 425, 429, 500, 502, 503, 504].includes(response.status)
+        || /too many requests|currently servicing too many requests|rate limit|temporarily unavailable|server busy|overloaded|try again later/i.test(text);
+}
+
+function formatAzureImageBusyMessage(message, label) {
+    const detail = String(message || "").trim();
+    return `Azure 图片模型当前比较拥堵（${label}）。系统已经自动重试过，但这次还是没抢到算力。请过一会儿再试，或先把图片质量改低一点再试。原始提示：${detail}`;
+}
+
 function shouldRetryImageRequest(response, message) {
     const text = String(message || "");
     return response.status === 404
@@ -236,32 +269,53 @@ function shouldRetryImageRequest(response, message) {
 async function requestAzureImage(builders) {
     let lastError = null;
     for (let i = 0; i < builders.length; i++) {
-        const { url, options, label } = builders[i]();
-        console.log(`🖼️ Azure 图片请求通道: ${label}`);
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 210000);
-        let response;
-        try {
-            response = await fetch(url, { ...options, signal: controller.signal });
-        } catch (error) {
-            if (error.name === "AbortError") {
-                throw new Error("Azure 图片编辑超过 210 秒未返回，已主动停止。请稍后再试，或换一张更简单的参考图。");
+        for (let attempt = 0; attempt <= imageMaxRetries; attempt++) {
+            const { url, options, label } = builders[i]();
+            console.log(`🖼️ Azure 图片请求通道: ${label}（尝试 ${attempt + 1}/${imageMaxRetries + 1}）`);
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 210000);
+            let response;
+            try {
+                response = await fetch(url, { ...options, signal: controller.signal });
+            } catch (error) {
+                clearTimeout(timeout);
+                if (error.name === "AbortError") {
+                    throw new Error("Azure 图片编辑超过 210 秒未返回，已主动停止。请稍后再试，或换一张更简单的参考图。");
+                }
+                if (attempt < imageMaxRetries) {
+                    const waitMs = Math.min(2000 * (attempt + 1), 8000);
+                    console.error(`⚠️ Azure 图片请求网络波动，${waitMs}ms 后重试:`, error.message || error);
+                    await sleep(waitMs);
+                    continue;
+                }
+                throw error;
             }
-            throw error;
-        } finally {
             clearTimeout(timeout);
-        }
-        if (response.ok) return response.json();
 
-        const message = await readAzureImageError(response);
-        lastError = new Error(message);
-        console.error(`🔥 Azure 图片接口 ${label} 返回错误:`, message);
+            if (response.ok) return response.json();
 
-        if (i < builders.length - 1 && shouldRetryImageRequest(response, message)) {
-            console.log("↪️ 当前路径不可用，尝试兼容 /openai/v1 图片接口...");
-            continue;
+            const message = await readAzureImageError(response);
+            lastError = new Error(message);
+            console.error(`🔥 Azure 图片接口 ${label} 返回错误:`, response.status, message);
+
+            if (shouldBackoffImageRequest(response, message) && attempt < imageMaxRetries) {
+                const waitMs = parseRetryAfterMs(response) || Math.min(3000 * (attempt + 1), 12000);
+                console.log(`⏳ Azure 图片接口繁忙，等待 ${waitMs}ms 后重试...`);
+                await sleep(waitMs);
+                continue;
+            }
+
+            if (shouldBackoffImageRequest(response, message) && attempt >= imageMaxRetries) {
+                throw new Error(formatAzureImageBusyMessage(message, label));
+            }
+
+            if (i < builders.length - 1 && shouldRetryImageRequest(response, message)) {
+                console.log("↪️ 当前路径不可用，尝试兼容 /openai/v1 图片接口...");
+                break;
+            }
+
+            throw lastError;
         }
-        throw lastError;
     }
     throw lastError || new Error("Azure 图片接口请求失败。");
 }
