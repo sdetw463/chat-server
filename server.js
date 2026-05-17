@@ -74,7 +74,7 @@ const foundryDeployment = process.env.FOUNDRY_MODEL_DEPLOYMENT
     || process.env.AZURE_OPENAI_DEPLOYMENT_NAME
     || deployment;
 const foundryAgentName = process.env.FOUNDRY_AGENT_NAME || "tuotuo-web-search-agent";
-const foundryWebSearchToolType = process.env.FOUNDRY_WEB_SEARCH_TOOL_TYPE || "web_search";
+const foundryWebSearchToolType = process.env.FOUNDRY_WEB_SEARCH_TOOL_TYPE || "web_search_preview";
 const foundrySearchContextSize = process.env.FOUNDRY_WEB_SEARCH_CONTEXT_SIZE || "medium";
 const imageEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || endpoint;
 const imageApiKey = process.env.AZURE_OPENAI_IMAGE_KEY || process.env.AZURE_OPENAI_IMAGE_API_KEY || apiKey;
@@ -286,15 +286,6 @@ function buildFoundryWebSearchTool(toolType) {
         search_context_size: normalizeSearchContextSize(foundrySearchContextSize)
     };
 
-    if (toolType === "web_search") {
-        const allowedDomains = String(process.env.FOUNDRY_WEB_SEARCH_ALLOWED_DOMAINS || "")
-            .split(",")
-            .map(domain => domain.trim())
-            .filter(Boolean);
-        tool.description = "Search the public web for current, factual information before answering.";
-        if (allowedDomains.length) tool.filters = { allowed_domains: allowedDomains };
-    }
-
     return tool;
 }
 
@@ -312,7 +303,7 @@ async function getOrCreateFoundryAgent() {
         foundryAgentPromise = (async () => {
             const toolTypes = Array.from(new Set([
                 foundryWebSearchToolType,
-                foundryWebSearchToolType === "web_search" ? "web_search_preview" : "web_search"
+                foundryWebSearchToolType === "web_search_preview" ? "web_search_preview_2025_03_11" : "web_search_preview"
             ]));
             let lastError = null;
 
@@ -322,8 +313,7 @@ async function getOrCreateFoundryAgent() {
                         kind: "prompt",
                         model: foundryDeployment,
                         instructions: TUOTUO_SYSTEM_INSTRUCTIONS,
-                        tools: [buildFoundryWebSearchTool(toolType)],
-                        tool_choice: "auto"
+                        tools: [buildFoundryWebSearchTool(toolType)]
                     });
                     console.log(`✅ Foundry Agent 已启用 WebSearchTool: ${agent.name} / ${agent.version} / ${toolType}`);
                     return agent;
@@ -352,9 +342,16 @@ async function getOrCreateFoundryConversation(sessionId) {
     return state;
 }
 
-function buildFoundryInput(userMessage, images) {
+function buildFoundryText(userMessage, reasoningMode) {
+    const modeInstruction = getRequestInstructions(reasoningMode);
+    const text = userMessage || "";
+    return `${modeInstruction}\n\n用户问题：${text}`.trim();
+}
+
+function buildFoundryInput(userMessage, images, reasoningMode) {
+    const text = buildFoundryText(userMessage, reasoningMode);
     if (images && Array.isArray(images) && images.length > 0) {
-        const content = [{ type: "input_text", text: userMessage || "请仔细看看这些图片，并描述一下里面的内容。" }];
+        const content = [{ type: "input_text", text: text || "请仔细看看这些图片，并描述一下里面的内容。" }];
         images.forEach(img => content.push({ type: "input_image", image_url: img }));
         return [{ type: "message", role: "user", content }];
     } else if (typeof images === 'string') {
@@ -362,12 +359,12 @@ function buildFoundryInput(userMessage, images) {
             type: "message",
             role: "user",
             content: [
-                { type: "input_text", text: userMessage || "请仔细看看这张图片，并描述一下里面的内容。" },
+                { type: "input_text", text: text || "请仔细看看这张图片，并描述一下里面的内容。" },
                 { type: "input_image", image_url: images }
             ]
         }];
     }
-    return userMessage || "";
+    return text;
 }
 
 function setupSSE(res) { res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no" }); if (typeof res.flushHeaders === "function") res.flushHeaders(); }
@@ -399,6 +396,20 @@ function extractResponseText(response) {
         }
     }
     return parts.join("");
+}
+
+function formatAIError(error) {
+    const parts = [];
+    if (error.status) parts.push(`HTTP ${error.status}`);
+    if (error.code) parts.push(`code=${error.code}`);
+    if (error.message) parts.push(error.message);
+    if (error.request_id) parts.push(`request_id=${error.request_id}`);
+    if (error.error) {
+        try {
+            parts.push(typeof error.error === "string" ? error.error : JSON.stringify(error.error));
+        } catch {}
+    }
+    return parts.filter(Boolean).join(" | ") || "AI 思考时出错了，请稍后再试~";
 }
 
 async function streamTextToSSE(res, text) {
@@ -433,13 +444,8 @@ async function handleStreamingAIChat(req, res) {
 
     const requestBody = {
         conversation: conversation.conversationId,
-        input: buildFoundryInput(userMessage, processedImages),
-        instructions: getRequestInstructions(reasoningMode)
+        input: buildFoundryInput(userMessage, processedImages, reasoningMode)
     };
-
-    if (reasoningMode === "research") {
-        requestBody.tool_choice = "required";
-    }
 
     const response = await foundryOpenAIClient.responses.create(
         requestBody,
@@ -460,7 +466,7 @@ app.post('/api/ai-chat', async (req, res) => {
         res.status(400).json({ error: "当前仅支持流式请求" });
     } catch (error) {
         console.error("🔥 流式对话崩溃:", error);
-        const errorMessage = error.message ? error.message : 'AI 思考时出错了，请稍后再试~';
+        const errorMessage = formatAIError(error);
         if (res.headersSent) { 
             try { sendSSE(res, { delta: `\n\n⚠️ **系统提示**：抱歉宝宝，报错原因：\`${errorMessage}\`。**建议点击左侧的【新聊天】清空记忆后再试一次哦！**` }); return sendSSEDone(res); } catch { return; } 
         }
