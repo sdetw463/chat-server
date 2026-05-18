@@ -444,7 +444,10 @@ async function saveFoundrySessionState(sessionId, state) {
 async function getOrCreateFoundryConversation(sessionId, userName) {
     const key = sessionId || "default_user";
     const existing = sessions.get(key);
-    if (existing && existing.conversationId) return existing;
+    if (existing && existing.conversationId) {
+        existing.__createdNow = false;
+        return existing;
+    }
 
     if (process.env.MONGODB_URI && sessionId) {
         const doc = await AiSession.findOne({ sessionId, ...(userName ? { userName } : {}) }).lean();
@@ -452,7 +455,8 @@ async function getOrCreateFoundryConversation(sessionId, userName) {
             const state = {
                 conversationId: doc.foundryConversationId,
                 vectorStoreId: doc.foundryVectorStoreId || null,
-                fileIds: doc.foundryFileIds || []
+                fileIds: doc.foundryFileIds || [],
+                __createdNow: false
             };
             sessions.set(key, state);
             return state;
@@ -460,10 +464,33 @@ async function getOrCreateFoundryConversation(sessionId, userName) {
     }
 
     const conversation = await foundryOpenAIClient.conversations.create();
-    const state = { conversationId: conversation.id, vectorStoreId: null, fileIds: [] };
+    const state = { conversationId: conversation.id, vectorStoreId: null, fileIds: [], __createdNow: true };
     sessions.set(key, state);
     await saveFoundrySessionState(sessionId, state);
     return state;
+}
+
+function buildConversationSeedItems(historyMessages) {
+    return (Array.isArray(historyMessages) ? historyMessages : [])
+        .map(message => {
+            const role = message && message.role === 'assistant' ? 'assistant' : (message && message.role === 'user' ? 'user' : null);
+            const content = String(message && (message.content || message.userText) || '').trim();
+            if (!role || !content) return null;
+            return { type: "message", role, content };
+        })
+        .filter(Boolean);
+}
+
+async function seedConversationWithHistory(conversationId, historyMessages) {
+    const items = buildConversationSeedItems(historyMessages);
+    if (!conversationId || items.length === 0) return;
+
+    const chunkSize = 12;
+    for (let i = 0; i < items.length; i += chunkSize) {
+        await foundryOpenAIClient.conversations.items.create(conversationId, {
+            items: items.slice(i, i + chunkSize)
+        });
+    }
 }
 
 function buildFoundryText(userMessage, reasoningMode) {
@@ -678,6 +705,7 @@ async function handleStreamingAIChat(req, res) {
     const userName = req.body.userName || "";
     const imagesArray = req.body.images || req.body.image || [];
     const documents = Array.isArray(req.body.documents) ? req.body.documents : [];
+    const historyMessages = Array.isArray(req.body.historyMessages) ? req.body.historyMessages : [];
     const reasoningMode = req.body.reasoningMode || "normal";
 
     const processedImages = [];
@@ -687,6 +715,12 @@ async function handleStreamingAIChat(req, res) {
 
     sendSSE(res, { status: "正在理解你的问题" });
     const conversation = await getOrCreateFoundryConversation(sessionId, userName);
+    const needsHistorySeed = !!conversation.__createdNow && historyMessages.length > 0;
+    if (needsHistorySeed) {
+        sendSSE(res, { status: "正在同步分叉上下文" });
+        await seedConversationWithHistory(conversation.conversationId, historyMessages);
+        conversation.__createdNow = false;
+    }
     const attachmentResult = await attachDocumentsToVectorStore(sessionId, conversation, documents);
     const messageWithFallbackDocs = attachmentResult.fallbackText ? `${userMessage || ""}${attachmentResult.fallbackText}` : userMessage;
     const agent = await getOrCreateFoundryAgent(attachmentResult.vectorStoreId);
