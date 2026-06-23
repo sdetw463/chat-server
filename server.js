@@ -364,7 +364,7 @@ function shouldExpectWebSearch(message, reasoningMode) {
 function getRequestInstructions(reasoningMode, canUseWebSearch, shouldSearch) {
     let searchInstruction = "";
     if (shouldSearch && canUseWebSearch) {
-        searchInstruction = "本轮问题需要外部检索，请调用 Web Search 工具核对公开网页信息，并尽量给出来源依据。";
+        searchInstruction = "本轮问题需要外部检索，请调用 Web Search 工具核对公开网页信息；回答必须先给出整理后的正文结论或推荐清单，再给来源依据，不能只输出参考来源链接。";
     } else if (shouldSearch && !canUseWebSearch) {
         searchInstruction = "本轮问题需要外部检索，但当前后端没有可用的 Web Search 工具；请明确说明无法即时核对，并不要编造来源。";
     } else {
@@ -660,6 +660,11 @@ async function streamResponsesToSSE(response, res) {
     }
 
     const finalText = state.fullText || extractResponseText(state.completedResponse);
+    if (!state.hasStreamedText && finalText) {
+        state.hasStreamedText = true;
+        state.fullText = finalText;
+        sendSSE(res, { delta: finalText });
+    }
     const uniqueSources = [];
     const seen = new Set();
     for (const source of state.sources) {
