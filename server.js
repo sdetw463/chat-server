@@ -89,6 +89,8 @@ const imageDeployment = process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT || process.env
 const imageApiVersion = process.env.AZURE_OPENAI_IMAGE_API_VERSION || "2025-04-01-preview";
 const imageQuality = process.env.AZURE_OPENAI_IMAGE_QUALITY || "medium";
 const imageMaxRetries = Math.max(0, Number(process.env.AZURE_OPENAI_IMAGE_MAX_RETRIES || 2));
+const chatMaxOutputTokens = Math.max(256, Number(process.env.AZURE_OPENAI_CHAT_MAX_OUTPUT_TOKENS || 1800));
+const searchMaxOutputTokens = Math.max(256, Number(process.env.AZURE_OPENAI_SEARCH_MAX_OUTPUT_TOKENS || 1200));
 const azureCredential = new DefaultAzureCredential();
 
 function getImageBaseUrl() {
@@ -404,10 +406,12 @@ function normalizeChatImage(input) {
 
 function buildResponsesInput(userMessage, images, documents, historyMessages, reasoningMode, canUseWebSearch, shouldSearch) {
     const input = [];
-    const history = Array.isArray(historyMessages) ? historyMessages.slice(-18) : [];
+    const maxHistoryMessages = Number(process.env.AZURE_OPENAI_HISTORY_MESSAGES || 8);
+    const maxHistoryChars = Number(process.env.AZURE_OPENAI_HISTORY_CHARS || 6000);
+    const history = Array.isArray(historyMessages) ? historyMessages.slice(-Math.max(0, maxHistoryMessages)) : [];
     for (const msg of history) {
         const role = msg && msg.role === "assistant" ? "assistant" : (msg && msg.role === "user" ? "user" : null);
-        const content = getTextFromMessage(msg).slice(0, 24000);
+        const content = getTextFromMessage(msg).slice(0, Math.max(1000, maxHistoryChars));
         if (role && content) input.push({ role, content });
     }
 
@@ -472,6 +476,41 @@ function selectResponsesTarget(needWebSearch) {
     throw new Error("AI 后端未配置：至少需要 AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_API_KEY，若要联网搜索还需要 FOUNDRY_PROJECT_ENDPOINT 或 AZURE_AI_PROJECT_ENDPOINT。");
 }
 
+function parseRetryAfterMs(response) {
+    const retryAfterMs = response.headers.get("retry-after-ms") || response.headers.get("x-ms-retry-after-ms");
+    if (retryAfterMs && !Number.isNaN(Number(retryAfterMs))) return Math.max(0, Number(retryAfterMs));
+    const retryAfter = response.headers.get("retry-after");
+    if (retryAfter && !Number.isNaN(Number(retryAfter))) return Math.max(0, Number(retryAfter) * 1000);
+    return null;
+}
+
+function isRateLimitMessage(message, status) {
+    return status === 429
+        || /rate limit|too many requests|tokens per minute|requests per minute|exceeded rate limit|temporarily reduced/i.test(String(message || ""));
+}
+
+class AzureResponsesError extends Error {
+    constructor(message, response, retryAfterMs = null) {
+        super(message);
+        this.name = "AzureResponsesError";
+        this.status = response?.status;
+        this.retryAfterMs = retryAfterMs;
+        this.isRateLimit = isRateLimitMessage(message, response?.status);
+        this.requestId = response?.headers?.get("apim-request-id")
+            || response?.headers?.get("x-request-id")
+            || response?.headers?.get("x-ms-request-id")
+            || null;
+        this.rateLimit = {
+            limitRequests: response?.headers?.get("x-ratelimit-limit-requests"),
+            remainingRequests: response?.headers?.get("x-ratelimit-remaining-requests"),
+            resetRequests: response?.headers?.get("x-ratelimit-reset-requests"),
+            limitTokens: response?.headers?.get("x-ratelimit-limit-tokens"),
+            remainingTokens: response?.headers?.get("x-ratelimit-remaining-tokens"),
+            resetTokens: response?.headers?.get("x-ratelimit-reset-tokens")
+        };
+    }
+}
+
 async function readAzureTextError(response) {
     const text = await response.text();
     if (!text) return `Azure Responses API 请求失败：HTTP ${response.status}`;
@@ -483,20 +522,40 @@ async function readAzureTextError(response) {
     }
 }
 
-async function postResponses(target, body) {
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function postResponses(target, body, options = {}) {
     const headers = {
         "Content-Type": "application/json",
         ...(await getResponsesAuthHeaders(target.authMode))
     };
-    const response = await fetch(`${target.baseUrl}responses`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body)
-    });
-    if (!response.ok) {
-        throw new Error(await readAzureTextError(response));
+    const maxRetries = Math.max(0, Number(options.maxRetries ?? process.env.AZURE_OPENAI_MAX_RETRIES ?? 3));
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+        const response = await fetch(`${target.baseUrl}responses`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(body)
+        });
+        if (response.ok) return response;
+
+        const message = await readAzureTextError(response);
+        const retryAfterMs = parseRetryAfterMs(response);
+        const error = new AzureResponsesError(message, response, retryAfterMs);
+        lastError = error;
+
+        const shouldRetry = error.isRateLimit || response.status === 408 || response.status === 500 || response.status === 502 || response.status === 503 || response.status === 504;
+        if (!shouldRetry || attempt >= maxRetries) throw error;
+
+        const fallbackDelay = Math.min(12000, 800 * Math.pow(2, attempt) + Math.floor(Math.random() * 400));
+        const delayMs = Math.max(500, retryAfterMs || fallbackDelay);
+        console.warn(`Azure Responses API 暂时受限/繁忙，${delayMs}ms 后重试 (${attempt + 1}/${maxRetries})：${message}`);
+        await sleep(delayMs);
     }
-    return response;
+    throw lastError || new Error("Azure Responses API 请求失败");
 }
 
 function extractResponseText(response) {
@@ -614,10 +673,24 @@ async function streamResponsesToSSE(response, res) {
 }
 
 function formatAIError(error) {
+    if (error?.isRateLimit) {
+        const retryText = error.retryAfterMs ? `建议 ${Math.ceil(error.retryAfterMs / 1000)} 秒后再试。` : "建议稍等几十秒再试。";
+        const remainTokens = error.rateLimit?.remainingTokens;
+        const resetTokens = error.rateLimit?.resetTokens;
+        const detail = [
+            error.status ? `HTTP ${error.status}` : null,
+            error.message,
+            remainTokens ? `remaining_tokens=${remainTokens}` : null,
+            resetTokens ? `reset_tokens=${resetTokens}` : null,
+            error.requestId ? `request_id=${error.requestId}` : null
+        ].filter(Boolean).join(" | ");
+        return `Azure 模型部署暂时触发限流。${retryText}${detail ? `\n${detail}` : ""}`;
+    }
     const parts = [];
     if (error.status) parts.push(`HTTP ${error.status}`);
     if (error.code) parts.push(`code=${error.code}`);
     if (error.message) parts.push(error.message);
+    if (error.requestId) parts.push(`request_id=${error.requestId}`);
     if (error.request_id) parts.push(`request_id=${error.request_id}`);
     if (error.error) {
         try { parts.push(typeof error.error === "string" ? error.error : JSON.stringify(error.error)); } catch {}
@@ -664,7 +737,8 @@ async function handleStreamingAIChat(req, res) {
         instructions: TUOTUO_SYSTEM_INSTRUCTIONS,
         input: buildResponsesInput(userMessage, processedImages, documents, historyMessages, reasoningMode, target.canUseWebSearch, shouldSearch),
         stream: true,
-        store: false
+        store: false,
+        max_output_tokens: shouldSearch ? searchMaxOutputTokens : chatMaxOutputTokens
     };
 
     if (shouldSearch && target.canUseWebSearch) {
@@ -681,10 +755,14 @@ async function handleStreamingAIChat(req, res) {
         sendSSE(res, { done: true });
         return sendSSEDone(res);
     } catch (streamError) {
-        console.error("Responses 流式失败，回退为非流式响应:", streamError.message || streamError);
+        console.error("Responses 流式失败:", streamError.message || streamError);
         if (res.writableEnded) return;
+        if (streamError instanceof AzureResponsesError || streamError.isRateLimit) {
+            throw streamError;
+        }
+        console.error("尝试回退为非流式响应...");
         const fallbackBody = { ...requestBody, stream: false };
-        const response = await postResponses(target, fallbackBody);
+        const response = await postResponses(target, fallbackBody, { maxRetries: 1 });
         const data = await response.json();
         const finalReply = extractResponseText(data);
         await streamTextToSSE(res, finalReply);
@@ -714,7 +792,8 @@ app.post('/api/ai-chat', async (req, res) => {
             instructions: TUOTUO_SYSTEM_INSTRUCTIONS,
             input: buildResponsesInput(userMessage, processedImages, req.body.documents, req.body.historyMessages, req.body.reasoningMode || "normal", target.canUseWebSearch, shouldSearch),
             stream: false,
-            store: false
+            store: false,
+            max_output_tokens: shouldSearch ? searchMaxOutputTokens : chatMaxOutputTokens
         };
         if (shouldSearch && target.canUseWebSearch) {
             requestBody.tools = [{ type: "web_search" }];
