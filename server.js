@@ -352,13 +352,22 @@ function sendSSE(res, data) { res.write(`data: ${JSON.stringify(data)}\n\n`); }
 function sendSSEDone(res) { res.write(`data: [DONE]\n\n`); res.end(); }
 
 function shouldExpectWebSearch(message, reasoningMode) {
-    return reasoningMode === "research" || /最新|今天|现在|实时|新闻|搜索|联网|查一下|资料|价格|天气|官网|当前|最近|recent|latest|today|now|search|web|news|price|weather/i.test(message || "");
+    const text = String(message || "");
+    return reasoningMode === "research"
+        || /最新|今天|现在|实时|新闻|搜索|联网|查一下|查找|检索|资料|价格|天气|官网|当前|最近|来源|出处|引用|recent|latest|today|now|search|web|news|price|weather/i.test(text)
+        || /文献|论文|文章|期刊|参考文献|DOI|PMID|CNKI|知网|万方|维普|中国农村观察|类型学|paper|article|journal|literature|citation/i.test(text)
+        || /推荐.{0,12}(几篇|一些|相关).{0,20}(文章|论文|文献|期刊)/i.test(text);
 }
 
-function getRequestInstructions(reasoningMode, canUseWebSearch) {
-    const searchInstruction = canUseWebSearch
-        ? "如果问题涉及最新/实时/新闻/价格/天气/官网/当前事实，请调用 Web Search 工具，并尽量给出来源。"
-        : "当前后端没有可用的 Web Search 工具；如果用户询问实时信息，请明确说明可能不够新。";
+function getRequestInstructions(reasoningMode, canUseWebSearch, shouldSearch) {
+    let searchInstruction = "";
+    if (shouldSearch && canUseWebSearch) {
+        searchInstruction = "本轮问题需要外部检索，请调用 Web Search 工具核对公开网页信息，并尽量给出来源依据。";
+    } else if (shouldSearch && !canUseWebSearch) {
+        searchInstruction = "本轮问题需要外部检索，但当前后端没有可用的 Web Search 工具；请明确说明无法即时核对，并不要编造来源。";
+    } else {
+        searchInstruction = "按已有知识回答；如果涉及具体文献、期次、最新目录、价格、新闻等需要核对的信息，请主动说明需要联网检索，避免声称已经查证。";
+    }
     if (reasoningMode === "research") {
         return `本轮是深度研究模式。${searchInstruction}回答要综合、可靠、结构清晰。`;
     }
@@ -393,7 +402,7 @@ function normalizeChatImage(input) {
     return input.image || input.url || input.dataUrl || input.src || null;
 }
 
-function buildResponsesInput(userMessage, images, documents, historyMessages, reasoningMode, canUseWebSearch) {
+function buildResponsesInput(userMessage, images, documents, historyMessages, reasoningMode, canUseWebSearch, shouldSearch) {
     const input = [];
     const history = Array.isArray(historyMessages) ? historyMessages.slice(-18) : [];
     for (const msg of history) {
@@ -402,7 +411,7 @@ function buildResponsesInput(userMessage, images, documents, historyMessages, re
         if (role && content) input.push({ role, content });
     }
 
-    const modeInstruction = getRequestInstructions(reasoningMode, canUseWebSearch);
+    const modeInstruction = getRequestInstructions(reasoningMode, canUseWebSearch, shouldSearch);
     const attachmentText = buildAttachmentText(documents);
     const text = `${modeInstruction}\n\n用户问题：${userMessage || ""}${attachmentText}`.trim();
     const normalizedImages = (Array.isArray(images) ? images : [images]).map(normalizeChatImage).filter(Boolean);
@@ -653,7 +662,7 @@ async function handleStreamingAIChat(req, res) {
     const requestBody = {
         model: target.model,
         instructions: TUOTUO_SYSTEM_INSTRUCTIONS,
-        input: buildResponsesInput(userMessage, processedImages, documents, historyMessages, reasoningMode, target.canUseWebSearch),
+        input: buildResponsesInput(userMessage, processedImages, documents, historyMessages, reasoningMode, target.canUseWebSearch, shouldSearch),
         stream: true,
         store: false
     };
@@ -703,7 +712,7 @@ app.post('/api/ai-chat', async (req, res) => {
         const requestBody = {
             model: target.model,
             instructions: TUOTUO_SYSTEM_INSTRUCTIONS,
-            input: buildResponsesInput(userMessage, processedImages, req.body.documents, req.body.historyMessages, req.body.reasoningMode || "normal", target.canUseWebSearch),
+            input: buildResponsesInput(userMessage, processedImages, req.body.documents, req.body.historyMessages, req.body.reasoningMode || "normal", target.canUseWebSearch, shouldSearch),
             stream: false,
             store: false
         };
