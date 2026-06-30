@@ -903,20 +903,22 @@ app.post('/api/ai-image', async (req, res) => {
 // ==========================================
 app.post('/api/sessions', async (req, res) => {
     try {
-        const { sessions, userName } = req.body; 
+        const sessions = Array.isArray(req.body.sessions) ? req.body.sessions : [];
+        const { userName } = req.body; 
         if (!userName) return res.json({ success: false, msg: "缺少用户身份" });
 
         if(process.env.MONGODB_URI) {
             const currentSessionIds = sessions.map(s => s.id);
+            const canReplaceSessionList = req.body.clientLoadedAllSessions === true;
 
             // 【增加安全保护】：只有当前端确实传了有效会话时，才执行差异化删除
             // 防止前端因网络延迟还未拉取到数据时，发生意外的"清库"惨剧
-            if (currentSessionIds.length > 0) {
+            if (canReplaceSessionList && currentSessionIds.length > 0) {
                 await AiSession.deleteMany({ 
                     userName: userName, 
                     sessionId: { $nin: currentSessionIds } 
                 });
-            } else if (sessions.length === 0 && req.body.forceDeleteAll === true) {
+            } else if (canReplaceSessionList && sessions.length === 0 && req.body.forceDeleteAll === true) {
                 // 如果以后需要做"清空所有记录"的功能，可以靠这个显式字段来控制
                 await AiSession.deleteMany({ userName: userName });
             }
