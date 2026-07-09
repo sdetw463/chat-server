@@ -400,6 +400,8 @@ function buildFoundryAgentUserMessage(userMessage, documents, reasoningMode, sho
     const toolInstruction = [
         "本轮由 Foundry Agent 处理。你可以使用该 Agent 已配置的工具，例如代码解释器和 Web 搜索。",
         "当用户要求生成、编辑、整理或转换文件时，请优先使用代码解释器创建可下载文件。",
+        "生成图表、Excel、PDF、CSV、ZIP 等文件时，必须实际在代码解释器沙盒中保存文件；不要只在文字里写“下载某文件”。",
+        "如果文件没有成功生成，请直接说明失败原因和下一步需要什么，不要声称已经提供下载。",
         "如果用户上传的附件文本已包含在消息中，请把它当作用户提供的真实文件内容来分析；需要生成新文件时，请用代码解释器重新构造并输出文件。"
     ].join("\n");
     const modeInstruction = getRequestInstructions(reasoningMode, true, shouldSearch);
@@ -459,7 +461,8 @@ function getFileNameFromPath(value, fallback = "agent-output") {
 
 function normalizeAgentFileRecord(file, index = 0) {
     if (!file || !file.fileId) return null;
-    const filename = getFileNameFromPath(file.filename || file.path || file.fileName, `agent-output-${index + 1}`);
+    const fallbackName = guessAgentFileName(file, index);
+    const filename = getFileNameFromPath(file.filename || file.path || file.fileName || file.text, fallbackName);
     const record = {
         fileId: String(file.fileId),
         containerId: file.containerId ? String(file.containerId) : "",
@@ -468,6 +471,8 @@ function normalizeAgentFileRecord(file, index = 0) {
     };
     if (record.containerId) {
         record.url = `/api/ai-agent-file/${encodeURIComponent(record.containerId)}/${encodeURIComponent(record.fileId)}?filename=${encodeURIComponent(filename)}`;
+    } else {
+        record.url = `/api/ai-agent-file/${encodeURIComponent(record.fileId)}?filename=${encodeURIComponent(filename)}`;
     }
     return record;
 }
@@ -477,14 +482,46 @@ function extractGeneratedFiles(response) {
     const seen = new Set();
 
     function addFile(raw, inheritedContainerId) {
-        const fileId = raw.file_id || raw.fileId || raw.id;
-        const filename = raw.filename || raw.file_name || raw.name || raw.path;
-        const containerId = raw.container_id || raw.containerId || inheritedContainerId || "";
-        if (!fileId || !filename) return;
+        if (!raw || typeof raw !== "object") return;
+        const filePath = raw.file_path || raw.filePath || {};
+        const file = raw.file || raw.container_file || raw.containerFile || {};
+        const fileId = raw.file_id
+            || raw.fileId
+            || raw.id
+            || raw.container_file_id
+            || raw.containerFileId
+            || filePath.file_id
+            || filePath.fileId
+            || filePath.id
+            || file.file_id
+            || file.fileId
+            || file.id;
+        const filename = raw.filename
+            || raw.file_name
+            || raw.name
+            || raw.path
+            || raw.text
+            || filePath.filename
+            || filePath.file_name
+            || filePath.path
+            || filePath.text
+            || file.filename
+            || file.file_name
+            || file.name
+            || file.path;
+        const containerId = raw.container_id
+            || raw.containerId
+            || filePath.container_id
+            || filePath.containerId
+            || file.container_id
+            || file.containerId
+            || inheritedContainerId
+            || "";
+        if (!fileId) return;
         const key = `${containerId}:${fileId}:${filename}`;
         if (seen.has(key)) return;
         seen.add(key);
-        found.push(normalizeAgentFileRecord({ fileId, containerId, filename, path: raw.path, type: raw.type }, found.length));
+        found.push(normalizeAgentFileRecord({ fileId, containerId, filename, path: raw.path, text: raw.text, type: raw.type }, found.length));
     }
 
     function visit(value, inheritedContainerId = "") {
@@ -495,13 +532,13 @@ function extractGeneratedFiles(response) {
         }
         const containerId = value.container_id || value.containerId || inheritedContainerId || "";
 
-        if (Array.isArray(value.files)) {
-            value.files.forEach(file => addFile(file, containerId));
+        if (Array.isArray(value.files)) value.files.forEach(file => addFile(file, containerId));
+        if (Array.isArray(value.annotations)) value.annotations.forEach(annotation => addFile(annotation, containerId));
+        if (Array.isArray(value.output_text_annotations)) value.output_text_annotations.forEach(annotation => addFile(annotation, containerId));
+        if (Array.isArray(value.outputTextAnnotations)) value.outputTextAnnotations.forEach(annotation => addFile(annotation, containerId));
+        if (value.file_id || value.fileId || value.container_file_id || value.containerFileId || value.file_path || value.filePath) {
+            addFile(value, containerId);
         }
-        if (Array.isArray(value.annotations)) {
-            value.annotations.forEach(annotation => addFile(annotation, containerId));
-        }
-        if (value.file_id || value.fileId) addFile(value, containerId);
 
         for (const child of Object.values(value)) {
             visit(child, containerId);
@@ -510,6 +547,18 @@ function extractGeneratedFiles(response) {
 
     visit(response);
     return found.filter(Boolean).slice(0, 12);
+}
+
+function guessAgentFileName(file, index = 0) {
+    const hint = `${file && (file.filename || file.path || file.fileName || file.text || file.type || "") || ""}`.toLowerCase();
+    const id = String(file && file.fileId || "");
+    if (/\.png\b|png|image|chart|plot|图/.test(hint)) return `agent-output-${index + 1}.png`;
+    if (/\.pdf\b|pdf/.test(hint)) return `agent-output-${index + 1}.pdf`;
+    if (/\.xlsx\b|excel|spreadsheet|表/.test(hint)) return `agent-output-${index + 1}.xlsx`;
+    if (/\.csv\b|csv/.test(hint)) return `agent-output-${index + 1}.csv`;
+    if (/\.zip\b|zip/.test(hint)) return `agent-output-${index + 1}.zip`;
+    if (/^c?file[_-]/i.test(id)) return `agent-output-${index + 1}`;
+    return `agent-output-${index + 1}`;
 }
 
 function buildAgentFallbackInput(userMessage, documents, historyMessages, reasoningMode, shouldSearch) {
@@ -574,14 +623,21 @@ async function handleFoundryAgentChatSSE({ userMessage, documents, historyMessag
 }
 
 async function downloadFoundryAgentFile(containerId, fileId) {
-    if (!containerId || !fileId) throw new Error("缺少 containerId 或 fileId，无法下载 Agent 生成文件。");
-    const encodedContainer = encodeURIComponent(containerId);
+    if (!fileId && containerId) {
+        fileId = containerId;
+        containerId = "";
+    }
+    if (!fileId) throw new Error("缺少 fileId，无法下载 Agent 生成文件。");
     const encodedFile = encodeURIComponent(fileId);
-    const candidates = [
-        `containers/${encodedContainer}/files/${encodedFile}/content`,
-        `containers/${encodedContainer}/files/${encodedFile}/content?api-version=preview`,
-        `files/${encodedFile}/content`
-    ];
+    const candidates = [];
+    if (containerId) {
+        const encodedContainer = encodeURIComponent(containerId);
+        candidates.push(
+            `containers/${encodedContainer}/files/${encodedFile}/content`,
+            `containers/${encodedContainer}/files/${encodedFile}/content?api-version=preview`
+        );
+    }
+    candidates.push(`files/${encodedFile}/content`);
     let lastError = null;
     for (const candidate of candidates) {
         try {
@@ -1217,6 +1273,19 @@ app.get('/api/ai-agent-file/:containerId/:fileId', async (req, res) => {
     try {
         const filename = getFileNameFromPath(req.query.filename || req.params.fileId, 'agent-output');
         const file = await downloadFoundryAgentFile(req.params.containerId, req.params.fileId);
+        res.setHeader('Content-Type', file.contentType || 'application/octet-stream');
+        res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
+        res.send(file.buffer);
+    } catch (err) {
+        console.error('下载 Foundry Agent 生成文件失败:', err);
+        res.status(500).json({ error: err.message || '下载文件失败' });
+    }
+});
+
+app.get('/api/ai-agent-file/:fileId', async (req, res) => {
+    try {
+        const filename = getFileNameFromPath(req.query.filename || req.params.fileId, 'agent-output');
+        const file = await downloadFoundryAgentFile("", req.params.fileId);
         res.setHeader('Content-Type', file.contentType || 'application/octet-stream');
         res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
         res.send(file.buffer);
