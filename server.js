@@ -91,6 +91,7 @@ const foundryAgentVersion = process.env.FOUNDRY_AGENT_VERSION
     || "";
 const foundryAgentEnabled = String(process.env.FOUNDRY_AGENT_ENABLED || "true").toLowerCase() !== "false";
 const foundryAgentConversations = new Map();
+const foundryGeneratedFiles = new Map();
 const imageEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || process.env.AZURE_OPENAI_ENDPOINT || process.env.AZURE_OPENAI_API_BASE;
 const imageApiKey = process.env.AZURE_OPENAI_IMAGE_KEY || process.env.AZURE_OPENAI_IMAGE_API_KEY || apiKey;
 const imageDeployment = process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT || process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT_NAME || process.env.DEPLOYMENT_NAME || "gpt-image-2";
@@ -401,8 +402,10 @@ function buildFoundryAgentUserMessage(userMessage, documents, reasoningMode, sho
         "本轮由 Foundry Agent 处理。你可以使用该 Agent 已配置的工具，例如代码解释器和 Web 搜索。",
         "当用户要求生成、编辑、整理或转换文件时，请优先使用代码解释器创建可下载文件。",
         "生成图表、Excel、PDF、CSV、ZIP 等文件时，必须实际在代码解释器沙盒中保存文件；不要只在文字里写“下载某文件”。",
+        "不要在正文中输出 sandbox:/mnt/data/... 链接，也不要把沙盒路径写成 Markdown 下载链接；网站会根据工具返回的文件注解自动显示下载卡片。",
         "如果文件没有成功生成，请直接说明失败原因和下一步需要什么，不要声称已经提供下载。",
-        "如果用户上传的附件文本已包含在消息中，请把它当作用户提供的真实文件内容来分析；需要生成新文件时，请用代码解释器重新构造并输出文件。"
+        "如果用户上传的附件文本已包含在消息中，请把它当作用户提供的真实文件内容来分析；需要生成新文件时，请用代码解释器重新构造并输出文件。",
+        "如果用户要求修改上传的 Word、Excel、CSV、PDF 等文件，请尽量保持原始内容结构，生成新的可下载文件；不要只给修改建议。"
     ].join("\n");
     const modeInstruction = getRequestInstructions(reasoningMode, true, shouldSearch);
     const attachmentText = buildAttachmentText(documents);
@@ -498,6 +501,11 @@ function normalizeAgentFileRecord(file, index = 0) {
     };
     if (record.containerId) {
         record.url = `/api/ai-agent-file/${encodeURIComponent(record.containerId)}/${encodeURIComponent(record.fileId)}?filename=${encodeURIComponent(filename)}`;
+        foundryGeneratedFiles.set(record.fileId, {
+            containerId: record.containerId,
+            filename: record.filename,
+            updatedAt: Date.now()
+        });
     }
     return record;
 }
@@ -653,6 +661,10 @@ async function downloadFoundryAgentFile(containerId, fileId) {
         containerId = "";
     }
     if (!fileId) throw new Error("缺少 fileId，无法下载 Agent 生成文件。");
+    if (!containerId && foundryGeneratedFiles.has(fileId)) {
+        const cached = foundryGeneratedFiles.get(fileId);
+        containerId = cached && cached.containerId || "";
+    }
     const encodedFile = encodeURIComponent(fileId);
     const candidates = [];
     if (containerId) {
@@ -680,6 +692,24 @@ function safeFileName(name, fallback = "attachment.txt") {
         .replace(/[^\w.\-()\u4e00-\u9fa5]+/g, "_")
         .slice(0, 120);
     return cleaned || fallback;
+}
+
+function contentTypeForFileName(filename, fallback = "application/octet-stream") {
+    const ext = String(filename || "").split(".").pop().toLowerCase();
+    const types = {
+        docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        pdf: "application/pdf",
+        png: "image/png",
+        jpg: "image/jpeg",
+        jpeg: "image/jpeg",
+        csv: "text/csv; charset=utf-8",
+        txt: "text/plain; charset=utf-8",
+        json: "application/json; charset=utf-8",
+        zip: "application/zip"
+    };
+    return types[ext] || fallback;
 }
 
 function buildAttachmentText(documents) {
@@ -1298,7 +1328,7 @@ app.get('/api/ai-agent-file/:containerId/:fileId', async (req, res) => {
     try {
         const filename = getFileNameFromPath(req.query.filename || req.params.fileId, 'agent-output');
         const file = await downloadFoundryAgentFile(req.params.containerId, req.params.fileId);
-        res.setHeader('Content-Type', file.contentType || 'application/octet-stream');
+        res.setHeader('Content-Type', contentTypeForFileName(filename, file.contentType || 'application/octet-stream'));
         res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
         res.send(file.buffer);
     } catch (err) {
@@ -1309,9 +1339,10 @@ app.get('/api/ai-agent-file/:containerId/:fileId', async (req, res) => {
 
 app.get('/api/ai-agent-file/:fileId', async (req, res) => {
     try {
-        const filename = getFileNameFromPath(req.query.filename || req.params.fileId, 'agent-output');
+        const cached = foundryGeneratedFiles.get(req.params.fileId);
+        const filename = getFileNameFromPath(req.query.filename || (cached && cached.filename) || req.params.fileId, 'agent-output');
         const file = await downloadFoundryAgentFile("", req.params.fileId);
-        res.setHeader('Content-Type', file.contentType || 'application/octet-stream');
+        res.setHeader('Content-Type', contentTypeForFileName(filename, file.contentType || 'application/octet-stream'));
         res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
         res.send(file.buffer);
     } catch (err) {
