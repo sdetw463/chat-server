@@ -409,6 +409,33 @@ function buildFoundryAgentUserMessage(userMessage, documents, reasoningMode, sho
     return `${toolInstruction}\n\n${modeInstruction}\n\n用户问题：${userMessage || ""}${attachmentText}`.trim() || "你好";
 }
 
+function isInlineInputFileDocument(doc) {
+    return !!(doc && typeof doc.fileData === "string" && /^data:[^;]+;base64,/i.test(doc.fileData));
+}
+
+function buildFoundryAgentUserContent(userMessage, documents, reasoningMode, shouldSearch) {
+    const docs = Array.isArray(documents) ? documents : [];
+    const fileDocs = docs.filter(isInlineInputFileDocument).slice(0, 5);
+    const contentDocs = docs.filter(doc => doc && doc.content);
+    const parts = [];
+
+    for (const doc of fileDocs) {
+        parts.push({
+            type: "input_file",
+            filename: safeFileName(doc.name || "attachment"),
+            file_data: doc.fileData
+        });
+    }
+
+    const fileSummary = fileDocs.length
+        ? "\n\n本轮用户上传了这些原始附件，已作为 input_file 提供给你和代码解释器：\n"
+            + fileDocs.map(doc => `- ${safeFileName(doc.name || "attachment")} (${doc.mimeType || "application/octet-stream"}, ${doc.size || 0} bytes)`).join("\n")
+        : "";
+    const text = `${buildFoundryAgentUserMessage(userMessage, contentDocs, reasoningMode, shouldSearch)}${fileSummary}`.trim() || "你好";
+    parts.push({ type: "input_text", text });
+    return parts;
+}
+
 function getFoundryOpenAIBaseUrl() {
     if (!foundryProjectEndpoint) throw new Error("未配置 FOUNDRY_PROJECT_ENDPOINT，无法调用 Foundry Agent。");
     return normalizeOpenAIBaseUrl(foundryProjectEndpoint);
@@ -567,13 +594,13 @@ function buildAgentFallbackInput(userMessage, documents, historyMessages, reason
         const content = getTextFromMessage(msg).slice(0, 24000);
         if (role && content) input.push({ role, content });
     }
-    input.push({ role: "user", content: buildFoundryAgentUserMessage(userMessage, documents, reasoningMode, shouldSearch) });
+    input.push({ role: "user", content: buildFoundryAgentUserContent(userMessage, documents, reasoningMode, shouldSearch) });
     return input;
 }
 
 async function runFoundryAgentChat({ userMessage, documents, historyMessages, reasoningMode, sessionId }) {
     const shouldSearch = shouldExpectWebSearch(userMessage, reasoningMode);
-    const content = buildFoundryAgentUserMessage(userMessage, documents, reasoningMode, shouldSearch);
+    const content = buildFoundryAgentUserContent(userMessage, documents, reasoningMode, shouldSearch);
     const agentBody = { agent_reference: buildFoundryAgentReference() };
     let conversationId = sessionId ? foundryAgentConversations.get(sessionId) : null;
     let response;
@@ -965,7 +992,7 @@ async function handleStreamingAIChat(req, res) {
     if (shouldSearch && !target.canUseWebSearch) {
         sendSSE(res, { status: "未配置 Foundry Web Search，本轮会按普通模型回答", tool: "search_unavailable" });
     }
-    if (documents.length) sendSSE(res, { status: "正在读取上传附件文本", tool: "document_text" });
+    if (documents.length) sendSSE(res, { status: "正在把上传附件交给 Agent", tool: "document_file" });
 
     const requestBody = {
         model: target.model,
