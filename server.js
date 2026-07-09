@@ -621,6 +621,9 @@ async function createFoundryFileAgent(uploadedFiles) {
                         type: "auto",
                         file_ids: fileIds
                     }
+                },
+                {
+                    type: "web_search"
                 }
             ]
         },
