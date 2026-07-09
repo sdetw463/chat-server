@@ -13,7 +13,7 @@ const allowedOrigins = String(process.env.APP_ALLOWED_ORIGINS || '')
     .map(origin => origin.trim().replace(/\/+$/, ''))
     .filter(Boolean);
 const sessionSecret = process.env.TUOTUO_SESSION_SECRET || '';
-const apiSessionTtlMs = Math.min(24, Math.max(1, Number(process.env.TUOTUO_SESSION_HOURS || 8))) * 60 * 60 * 1000;
+const apiSessionTtlMs = Math.min(365, Math.max(1, Number(process.env.TUOTUO_SESSION_DAYS || 90))) * 24 * 60 * 60 * 1000;
 const apiAccessConfigured = Boolean(sessionSecret && allowedOrigins.length);
 const loginAttempts = new Map();
 const rateLimitBuckets = new Map();
@@ -160,8 +160,9 @@ app.post('/api/auth/register', limitLoginAttempts, async (req, res) => {
         await AiUser.create({ username, passwordHash });
     } catch (error) {
         if (error && error.code === 11000) return res.status(409).json({ error: '这个用户名已被使用，请换一个。' });
-        console.error('创建 AI 用户失败:', error);
-        return res.status(500).json({ error: '创建账号失败，请稍后重试。' });
+        const requestId = crypto.randomUUID();
+        console.error(`创建 AI 用户失败 [${requestId}]:`, error);
+        return res.status(500).json({ error: `创建账号失败，请稍后重试（${requestId}）。` });
     }
     loginAttempts.delete(req.loginAttemptKey);
     return res.status(201).json({ accessToken: createApiSession(username), username, expiresInSeconds: Math.floor(apiSessionTtlMs / 1000) });
