@@ -83,6 +83,11 @@ const foundryProjectEndpoint = process.env.FOUNDRY_PROJECT_ENDPOINT
 const foundryDeployment = process.env.FOUNDRY_MODEL_DEPLOYMENT
     || process.env.AZURE_AI_MODEL_DEPLOYMENT_NAME
     || deployment;
+const foundryAgentName = process.env.FOUNDRY_AGENT_NAME
+    || process.env.AZURE_AI_AGENT_NAME
+    || "tuo-agent";
+const foundryAgentEnabled = String(process.env.FOUNDRY_AGENT_ENABLED || "true").toLowerCase() !== "false";
+const foundryAgentConversations = new Map();
 const imageEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || process.env.AZURE_OPENAI_ENDPOINT || process.env.AZURE_OPENAI_API_BASE;
 const imageApiKey = process.env.AZURE_OPENAI_IMAGE_KEY || process.env.AZURE_OPENAI_IMAGE_API_KEY || apiKey;
 const imageDeployment = process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT || process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT_NAME || process.env.DEPLOYMENT_NAME || "gpt-image-2";
@@ -381,6 +386,210 @@ function getTextFromMessage(message) {
     return String(message && (message.content || message.text || message.userText || message.message) || "").trim();
 }
 
+function shouldUseFoundryAgentForChat(processedImages) {
+    return foundryAgentEnabled
+        && !!foundryProjectEndpoint
+        && !!foundryAgentName
+        && (!processedImages || processedImages.length === 0);
+}
+
+function buildFoundryAgentUserMessage(userMessage, documents, reasoningMode, shouldSearch) {
+    const toolInstruction = [
+        "本轮由 Foundry Agent 处理。你可以使用该 Agent 已配置的工具，例如代码解释器和 Web 搜索。",
+        "当用户要求生成、编辑、整理或转换文件时，请优先使用代码解释器创建可下载文件。",
+        "如果用户上传的附件文本已包含在消息中，请把它当作用户提供的真实文件内容来分析；需要生成新文件时，请用代码解释器重新构造并输出文件。"
+    ].join("\n");
+    const modeInstruction = getRequestInstructions(reasoningMode, true, shouldSearch);
+    const attachmentText = buildAttachmentText(documents);
+    return `${toolInstruction}\n\n${modeInstruction}\n\n用户问题：${userMessage || ""}${attachmentText}`.trim() || "你好";
+}
+
+function getFoundryOpenAIBaseUrl() {
+    if (!foundryProjectEndpoint) throw new Error("未配置 FOUNDRY_PROJECT_ENDPOINT，无法调用 Foundry Agent。");
+    return normalizeOpenAIBaseUrl(foundryProjectEndpoint);
+}
+
+async function postFoundryOpenAI(pathPart, body) {
+    const cleanPath = String(pathPart || "").replace(/^\/+/, "");
+    const response = await fetch(`${getFoundryOpenAIBaseUrl()}${cleanPath}`, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            ...(await getResponsesAuthHeaders("entra"))
+        },
+        body: JSON.stringify(body || {})
+    });
+    if (!response.ok) {
+        throw new Error(await readAzureTextError(response));
+    }
+    return response.json();
+}
+
+async function getFoundryBinary(pathPart) {
+    const cleanPath = String(pathPart || "").replace(/^\/+/, "");
+    const response = await fetch(`${getFoundryOpenAIBaseUrl()}${cleanPath}`, {
+        method: "GET",
+        headers: {
+            "Accept": "application/octet-stream",
+            ...(await getResponsesAuthHeaders("entra"))
+        }
+    });
+    if (!response.ok) {
+        throw new Error(await readAzureTextError(response));
+    }
+    return {
+        buffer: Buffer.from(await response.arrayBuffer()),
+        contentType: response.headers.get("content-type") || "application/octet-stream"
+    };
+}
+
+function getFileNameFromPath(value, fallback = "agent-output") {
+    const raw = String(value || fallback).split(/[\\/]/).pop() || fallback;
+    return safeFileName(raw, fallback).slice(0, 160) || fallback;
+}
+
+function normalizeAgentFileRecord(file, index = 0) {
+    if (!file || !file.fileId) return null;
+    const filename = getFileNameFromPath(file.filename || file.path || file.fileName, `agent-output-${index + 1}`);
+    const record = {
+        fileId: String(file.fileId),
+        containerId: file.containerId ? String(file.containerId) : "",
+        filename,
+        type: file.type || "file"
+    };
+    if (record.containerId) {
+        record.url = `/api/ai-agent-file/${encodeURIComponent(record.containerId)}/${encodeURIComponent(record.fileId)}?filename=${encodeURIComponent(filename)}`;
+    }
+    return record;
+}
+
+function extractGeneratedFiles(response) {
+    const found = [];
+    const seen = new Set();
+
+    function addFile(raw, inheritedContainerId) {
+        const fileId = raw.file_id || raw.fileId || raw.id;
+        const filename = raw.filename || raw.file_name || raw.name || raw.path;
+        const containerId = raw.container_id || raw.containerId || inheritedContainerId || "";
+        if (!fileId || !filename) return;
+        const key = `${containerId}:${fileId}:${filename}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        found.push(normalizeAgentFileRecord({ fileId, containerId, filename, path: raw.path, type: raw.type }, found.length));
+    }
+
+    function visit(value, inheritedContainerId = "") {
+        if (!value || typeof value !== "object") return;
+        if (Array.isArray(value)) {
+            value.forEach(item => visit(item, inheritedContainerId));
+            return;
+        }
+        const containerId = value.container_id || value.containerId || inheritedContainerId || "";
+
+        if (Array.isArray(value.files)) {
+            value.files.forEach(file => addFile(file, containerId));
+        }
+        if (Array.isArray(value.annotations)) {
+            value.annotations.forEach(annotation => addFile(annotation, containerId));
+        }
+        if (value.file_id || value.fileId) addFile(value, containerId);
+
+        for (const child of Object.values(value)) {
+            visit(child, containerId);
+        }
+    }
+
+    visit(response);
+    return found.filter(Boolean).slice(0, 12);
+}
+
+function buildAgentFallbackInput(userMessage, documents, historyMessages, reasoningMode, shouldSearch) {
+    const input = [];
+    const history = Array.isArray(historyMessages) ? historyMessages.slice(-12) : [];
+    for (const msg of history) {
+        const role = msg && msg.role === "assistant" ? "assistant" : (msg && msg.role === "user" ? "user" : null);
+        const content = getTextFromMessage(msg).slice(0, 24000);
+        if (role && content) input.push({ role, content });
+    }
+    input.push({ role: "user", content: buildFoundryAgentUserMessage(userMessage, documents, reasoningMode, shouldSearch) });
+    return input;
+}
+
+async function runFoundryAgentChat({ userMessage, documents, historyMessages, reasoningMode, sessionId }) {
+    const shouldSearch = shouldExpectWebSearch(userMessage, reasoningMode);
+    const content = buildFoundryAgentUserMessage(userMessage, documents, reasoningMode, shouldSearch);
+    const agentBody = { agent: { name: foundryAgentName, type: "agent_reference" } };
+    let conversationId = sessionId ? foundryAgentConversations.get(sessionId) : null;
+    let response;
+
+    try {
+        if (!conversationId) {
+            const conversation = await postFoundryOpenAI("conversations", {
+                items: [{ type: "message", role: "user", content }]
+            });
+            conversationId = conversation && conversation.id;
+            if (sessionId && conversationId) foundryAgentConversations.set(sessionId, conversationId);
+        } else {
+            await postFoundryOpenAI(`conversations/${encodeURIComponent(conversationId)}/items`, {
+                items: [{ type: "message", role: "user", content }]
+            });
+        }
+
+        response = await postFoundryOpenAI("responses", {
+            conversation: conversationId,
+            stream: false,
+            ...agentBody
+        });
+    } catch (conversationError) {
+        console.error("Foundry Agent conversation 模式失败，回退为单次 responses 调用:", conversationError.message || conversationError);
+        response = await postFoundryOpenAI("responses", {
+            input: buildAgentFallbackInput(userMessage, documents, historyMessages, reasoningMode, shouldSearch),
+            stream: false,
+            ...agentBody
+        });
+    }
+
+    return {
+        reply: extractResponseText(response),
+        sources: extractCitationSources(response),
+        files: extractGeneratedFiles(response),
+        conversationId,
+        rawResponseId: response && response.id
+    };
+}
+
+async function handleFoundryAgentChatSSE({ userMessage, documents, historyMessages, reasoningMode, sessionId }, res) {
+    sendSSE(res, { status: "正在调用 Foundry Agent", tool: "agent", agent: foundryAgentName });
+    const result = await runFoundryAgentChat({ userMessage, documents, historyMessages, reasoningMode, sessionId });
+    if (result.sources.length) sendSSE(res, { sources: result.sources });
+    if (result.files.length) sendSSE(res, { files: result.files });
+    await streamTextToSSE(res, result.reply || "我没有收到有效回复，请稍后再试。");
+    if (result.files.length) sendSSE(res, { files: result.files });
+    sendSSE(res, { done: true, foundryConversationId: result.conversationId || null, foundryResponseId: result.rawResponseId || null });
+    return sendSSEDone(res);
+}
+
+async function downloadFoundryAgentFile(containerId, fileId) {
+    if (!containerId || !fileId) throw new Error("缺少 containerId 或 fileId，无法下载 Agent 生成文件。");
+    const encodedContainer = encodeURIComponent(containerId);
+    const encodedFile = encodeURIComponent(fileId);
+    const candidates = [
+        `containers/${encodedContainer}/files/${encodedFile}/content`,
+        `containers/${encodedContainer}/files/${encodedFile}/content?api-version=preview`,
+        `files/${encodedFile}/content`
+    ];
+    let lastError = null;
+    for (const candidate of candidates) {
+        try {
+            return await getFoundryBinary(candidate);
+        } catch (error) {
+            lastError = error;
+        }
+    }
+    throw lastError || new Error("下载 Agent 生成文件失败。");
+}
+
+
 function safeFileName(name, fallback = "attachment.txt") {
     const cleaned = String(name || fallback)
         .replace(/[^\w.\-()\u4e00-\u9fa5]+/g, "_")
@@ -673,6 +882,16 @@ async function handleStreamingAIChat(req, res) {
         if (image) processedImages.push(await uploadBase64ToBlob(image));
     }
 
+    if (shouldUseFoundryAgentForChat(processedImages)) {
+        return await handleFoundryAgentChatSSE({
+            userMessage,
+            documents,
+            historyMessages,
+            reasoningMode,
+            sessionId: req.body.sessionId || null
+        }, res);
+    }
+
     sendSSE(res, { status: "正在理解你的问题" });
     if (shouldSearch && target.canUseWebSearch) {
         sendSSE(res, { status: "正在调用 Foundry Web Search 搜索网络", tool: "search", query: userMessage || "实时信息" });
@@ -731,6 +950,25 @@ app.post('/api/ai-chat', async (req, res) => {
         for (const img of (Array.isArray(imagesArray) ? imagesArray : [imagesArray])) {
             const image = normalizeChatImage(img);
             if (image) processedImages.push(await uploadBase64ToBlob(image));
+        }
+
+        if (shouldUseFoundryAgentForChat(processedImages)) {
+            const result = await runFoundryAgentChat({
+                userMessage,
+                documents: Array.isArray(req.body.documents) ? req.body.documents : [],
+                historyMessages: Array.isArray(req.body.historyMessages) ? req.body.historyMessages : [],
+                reasoningMode: req.body.reasoningMode || "normal",
+                sessionId: req.body.sessionId || null
+            });
+            return res.json({
+                reply: result.reply,
+                sources: result.sources,
+                files: result.files,
+                foundryConversationId: result.conversationId || null,
+                foundryResponseId: result.rawResponseId || null,
+                usedAgent: true,
+                agentName: foundryAgentName
+            });
         }
 
         const requestBody = {
@@ -963,6 +1201,19 @@ app.get('/api/sessions', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+app.get('/api/ai-agent-file/:containerId/:fileId', async (req, res) => {
+    try {
+        const filename = getFileNameFromPath(req.query.filename || req.params.fileId, 'agent-output');
+        const file = await downloadFoundryAgentFile(req.params.containerId, req.params.fileId);
+        res.setHeader('Content-Type', file.contentType || 'application/octet-stream');
+        res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
+        res.send(file.buffer);
+    } catch (err) {
+        console.error('下载 Foundry Agent 生成文件失败:', err);
+        res.status(500).json({ error: err.message || '下载文件失败' });
+    }
+});
+
 app.get('/api/status', (req, res) => {
     res.json({
         "数据库是否连接": mongoose.connection.readyState === 1 ? "✅ 正常" : "❌ 未连接",
@@ -971,6 +1222,8 @@ app.get('/api/status', (req, res) => {
         "Azure OpenAI 聊天 endpoint": !!endpoint ? "✅ 是" : "❌ 否",
         "Azure OpenAI API key": !!apiKey ? "✅ 是" : "❌ 否",
         "Foundry Project Endpoint/Web Search": !!foundryProjectEndpoint ? "✅ 是" : "❌ 否",
+        "Foundry Agent 是否启用": shouldUseFoundryAgentForChat([]) ? "✅ 是" : "❌ 否",
+        "Foundry Agent 名称": foundryAgentName,
         "聊天模型部署名": deployment,
         "Foundry 模型部署名": foundryDeployment,
         "图片模型部署名": imageDeployment
