@@ -12,10 +12,9 @@ const allowedOrigins = String(process.env.APP_ALLOWED_ORIGINS || '')
     .split(',')
     .map(origin => origin.trim().replace(/\/+$/, ''))
     .filter(Boolean);
-const sitePassword = process.env.TUOTUO_SITE_PASSWORD || '';
 const sessionSecret = process.env.TUOTUO_SESSION_SECRET || '';
 const apiSessionTtlMs = Math.min(24, Math.max(1, Number(process.env.TUOTUO_SESSION_HOURS || 8))) * 60 * 60 * 1000;
-const apiAccessConfigured = Boolean(sitePassword && sessionSecret && allowedOrigins.length);
+const apiAccessConfigured = Boolean(sessionSecret && allowedOrigins.length);
 const loginAttempts = new Map();
 const rateLimitBuckets = new Map();
 
@@ -42,8 +41,8 @@ function signApiSessionPayload(payload) {
     return crypto.createHmac('sha256', sessionSecret).update(payload).digest('base64url');
 }
 
-function createApiSession(userId = 'personal-owner') {
-    const payload = Buffer.from(JSON.stringify({ sub: userId, exp: Date.now() + apiSessionTtlMs, v: 1 })).toString('base64url');
+function createApiSession(userId) {
+    const payload = Buffer.from(JSON.stringify({ sub: userId, exp: Date.now() + apiSessionTtlMs, v: 2 })).toString('base64url');
     return `${payload}.${signApiSessionPayload(payload)}`;
 }
 
@@ -55,7 +54,7 @@ function getApiSession(req) {
     if (!payload || !signature || !timingSafeEqualText(signature, signApiSessionPayload(payload))) return null;
     try {
         const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
-        if (!parsed || parsed.v !== 1 || !parsed.sub || Number(parsed.exp) <= Date.now()) return null;
+        if (!parsed || parsed.v !== 2 || !parsed.sub || Number(parsed.exp) <= Date.now()) return null;
         return { userId: String(parsed.sub) };
     } catch {
         return null;
@@ -64,7 +63,7 @@ function getApiSession(req) {
 
 function requireApiAccess(req, res, next) {
     if (!apiAccessConfigured) {
-        return res.status(503).json({ error: '个人 AI 访问尚未配置。请在服务端设置 TUOTUO_SITE_PASSWORD、TUOTUO_SESSION_SECRET 和 APP_ALLOWED_ORIGINS。' });
+        return res.status(503).json({ error: '账号访问尚未配置。请在服务端设置 TUOTUO_SESSION_SECRET 和 APP_ALLOWED_ORIGINS。' });
     }
     const auth = getApiSession(req);
     if (!auth) return res.status(401).json({ error: '需要个人访问验证。' });
@@ -98,19 +97,98 @@ function limitLoginAttempts(req, res, next) {
     return next();
 }
 
-app.post('/api/auth/login', limitLoginAttempts, (req, res) => {
-    if (!apiAccessConfigured) {
-        return res.status(503).json({ error: '个人 AI 访问尚未配置。' });
+function normalizeAccountUsername(value) {
+    return String(value || '').trim().toLowerCase();
+}
+
+function isValidAccountUsername(username) {
+    return /^[a-z0-9_\-\u4e00-\u9fff]{3,24}$/.test(username);
+}
+
+function isValidAccountPassword(password) {
+    return typeof password === 'string' && password.length >= 8 && password.length <= 128;
+}
+
+function derivePasswordKey(password, salt) {
+    return new Promise((resolve, reject) => {
+        crypto.scrypt(password, salt, 64, (error, key) => error ? reject(error) : resolve(key));
+    });
+}
+
+async function hashAccountPassword(password) {
+    const salt = crypto.randomBytes(16).toString('base64url');
+    const key = await derivePasswordKey(password, salt);
+    return `scrypt$${salt}$${key.toString('base64url')}`;
+}
+
+async function verifyAccountPassword(password, storedHash) {
+    const [algorithm, salt, expected] = String(storedHash || '').split('$');
+    if (algorithm !== 'scrypt' || !salt || !expected) return false;
+    const key = await derivePasswordKey(password, salt);
+    return timingSafeEqualText(key.toString('base64url'), expected);
+}
+
+function accountSetupError(res) {
+    if (!process.env.MONGODB_URI || mongoose.connection.readyState !== 1) {
+        res.status(503).json({ error: '账号数据库暂不可用，请稍后重试。' });
+        return true;
     }
+    return false;
+}
+
+function recordFailedLogin(req) {
+    const attempts = loginAttempts.get(req.loginAttemptKey) || [];
+    attempts.push(Date.now());
+    loginAttempts.set(req.loginAttemptKey, attempts);
+}
+
+app.post('/api/auth/register', limitLoginAttempts, async (req, res) => {
+    if (!apiAccessConfigured) {
+        return res.status(503).json({ error: '账号访问尚未配置。' });
+    }
+    if (accountSetupError(res)) return;
+    const username = normalizeAccountUsername(req.body && req.body.username);
     const password = String(req.body && req.body.password || '');
-    if (!timingSafeEqualText(password, sitePassword)) {
-        const attempts = loginAttempts.get(req.loginAttemptKey) || [];
-        attempts.push(Date.now());
-        loginAttempts.set(req.loginAttemptKey, attempts);
-        return res.status(401).json({ error: '访问密码不正确。' });
+    if (!isValidAccountUsername(username)) {
+        return res.status(400).json({ error: '用户名需为 3-24 位小写字母、数字、中文、下划线或连字符。' });
+    }
+    if (!isValidAccountPassword(password)) {
+        return res.status(400).json({ error: '个人密码需为 8-128 个字符。' });
+    }
+    try {
+        const passwordHash = await hashAccountPassword(password);
+        await AiUser.create({ username, passwordHash });
+    } catch (error) {
+        if (error && error.code === 11000) return res.status(409).json({ error: '这个用户名已被使用，请换一个。' });
+        console.error('创建 AI 用户失败:', error);
+        return res.status(500).json({ error: '创建账号失败，请稍后重试。' });
     }
     loginAttempts.delete(req.loginAttemptKey);
-    return res.json({ accessToken: createApiSession(), expiresInSeconds: Math.floor(apiSessionTtlMs / 1000) });
+    return res.status(201).json({ accessToken: createApiSession(username), username, expiresInSeconds: Math.floor(apiSessionTtlMs / 1000) });
+});
+
+app.post('/api/auth/login', limitLoginAttempts, async (req, res) => {
+    if (!apiAccessConfigured) return res.status(503).json({ error: '账号访问尚未配置。' });
+    if (accountSetupError(res)) return;
+    const username = normalizeAccountUsername(req.body && req.body.username);
+    const password = String(req.body && req.body.password || '');
+    if (!isValidAccountUsername(username) || !password) return res.status(400).json({ error: '请输入用户名和个人密码。' });
+    try {
+        const user = await AiUser.findOne({ username }).lean();
+        if (!user) {
+            recordFailedLogin(req);
+            return res.status(404).json({ error: '用户不存在。' });
+        }
+        if (!await verifyAccountPassword(password, user.passwordHash)) {
+            recordFailedLogin(req);
+            return res.status(401).json({ error: '用户名或密码不正确。' });
+        }
+        loginAttempts.delete(req.loginAttemptKey);
+        return res.json({ accessToken: createApiSession(username), username, expiresInSeconds: Math.floor(apiSessionTtlMs / 1000) });
+    } catch (error) {
+        console.error('AI 用户登录失败:', error);
+        return res.status(500).json({ error: '登录失败，请稍后重试。' });
+    }
 });
 
 app.get('/api/auth/session', requireApiAccess, (req, res) => {
@@ -145,6 +223,15 @@ const aiSessionSchema = new mongoose.Schema({
     foundryFileIds: [String]
 }, { strict: false, timestamps: true });
 const AiSession = mongoose.model('AiSession', aiSessionSchema, 'ai_sessions');
+
+const aiUserSchema = new mongoose.Schema({
+    username: { type: String, required: true, unique: true, index: true },
+    passwordHash: { type: String, required: true }
+}, { timestamps: true });
+const AiUser = mongoose.model('AiUser', aiUserSchema, 'ai_users');
+const ensureAiUserIndex = () => AiUser.init().catch(error => console.error('创建 AI 用户名唯一索引失败:', error));
+if (mongoose.connection.readyState === 1) ensureAiUserIndex();
+else mongoose.connection.once('connected', ensureAiUserIndex);
 
 let containerClient = null;
 if (process.env.AZURE_STORAGE_CONNECTION_STRING) {
