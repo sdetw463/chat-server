@@ -1,5 +1,6 @@
 const WebSocket = require('ws');
 const http = require('http');
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const { DefaultAzureCredential } = require('@azure/identity');
@@ -7,9 +8,114 @@ const mongoose = require('mongoose');
 const { BlobServiceClient } = require('@azure/storage-blob');
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+const allowedOrigins = String(process.env.APP_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(origin => origin.trim().replace(/\/+$/, ''))
+    .filter(Boolean);
+const sitePassword = process.env.TUOTUO_SITE_PASSWORD || '';
+const sessionSecret = process.env.TUOTUO_SESSION_SECRET || '';
+const apiSessionTtlMs = Math.min(24, Math.max(1, Number(process.env.TUOTUO_SESSION_HOURS || 8))) * 60 * 60 * 1000;
+const apiAccessConfigured = Boolean(sitePassword && sessionSecret && allowedOrigins.length);
+const loginAttempts = new Map();
+const rateLimitBuckets = new Map();
+
+app.use(cors({
+    origin(origin, callback) {
+        // Non-browser operational checks have no Origin header. Browser calls must come from an explicitly allowed site.
+        if (!origin) return callback(null, true);
+        return callback(null, allowedOrigins.includes(String(origin).replace(/\/+$/, '')));
+    },
+    credentials: false,
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+app.use(express.json({ limit: '35mb' }));
+app.use(express.urlencoded({ limit: '35mb', extended: true }));
+
+function timingSafeEqualText(left, right) {
+    const a = Buffer.from(String(left || ''), 'utf8');
+    const b = Buffer.from(String(right || ''), 'utf8');
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function signApiSessionPayload(payload) {
+    return crypto.createHmac('sha256', sessionSecret).update(payload).digest('base64url');
+}
+
+function createApiSession(userId = 'personal-owner') {
+    const payload = Buffer.from(JSON.stringify({ sub: userId, exp: Date.now() + apiSessionTtlMs, v: 1 })).toString('base64url');
+    return `${payload}.${signApiSessionPayload(payload)}`;
+}
+
+function getApiSession(req) {
+    const header = String(req.get('authorization') || '');
+    const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+    if (!token || !sessionSecret) return null;
+    const [payload, signature] = token.split('.');
+    if (!payload || !signature || !timingSafeEqualText(signature, signApiSessionPayload(payload))) return null;
+    try {
+        const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+        if (!parsed || parsed.v !== 1 || !parsed.sub || Number(parsed.exp) <= Date.now()) return null;
+        return { userId: String(parsed.sub) };
+    } catch {
+        return null;
+    }
+}
+
+function requireApiAccess(req, res, next) {
+    if (!apiAccessConfigured) {
+        return res.status(503).json({ error: '个人 AI 访问尚未配置。请在服务端设置 TUOTUO_SITE_PASSWORD、TUOTUO_SESSION_SECRET 和 APP_ALLOWED_ORIGINS。' });
+    }
+    const auth = getApiSession(req);
+    if (!auth) return res.status(401).json({ error: '需要个人访问验证。' });
+    req.auth = auth;
+    return next();
+}
+
+function limitRequests(name, maxRequests, windowMs) {
+    return (req, res, next) => {
+        const userId = req.auth && req.auth.userId || req.ip || 'anonymous';
+        const key = `${name}:${userId}`;
+        const now = Date.now();
+        const entries = (rateLimitBuckets.get(key) || []).filter(time => now - time < windowMs);
+        if (entries.length >= maxRequests) {
+            const retryAfter = Math.max(1, Math.ceil((windowMs - (now - entries[0])) / 1000));
+            res.setHeader('Retry-After', String(retryAfter));
+            return res.status(429).json({ error: `请求过于频繁，请在 ${retryAfter} 秒后再试。` });
+        }
+        entries.push(now);
+        rateLimitBuckets.set(key, entries);
+        return next();
+    };
+}
+
+function limitLoginAttempts(req, res, next) {
+    const key = req.ip || 'unknown';
+    const now = Date.now();
+    const attempts = (loginAttempts.get(key) || []).filter(time => now - time < 15 * 60 * 1000);
+    if (attempts.length >= 8) return res.status(429).json({ error: '尝试次数过多，请 15 分钟后再试。' });
+    req.loginAttemptKey = key;
+    return next();
+}
+
+app.post('/api/auth/login', limitLoginAttempts, (req, res) => {
+    if (!apiAccessConfigured) {
+        return res.status(503).json({ error: '个人 AI 访问尚未配置。' });
+    }
+    const password = String(req.body && req.body.password || '');
+    if (!timingSafeEqualText(password, sitePassword)) {
+        const attempts = loginAttempts.get(req.loginAttemptKey) || [];
+        attempts.push(Date.now());
+        loginAttempts.set(req.loginAttemptKey, attempts);
+        return res.status(401).json({ error: '访问密码不正确。' });
+    }
+    loginAttempts.delete(req.loginAttemptKey);
+    return res.json({ accessToken: createApiSession(), expiresInSeconds: Math.floor(apiSessionTtlMs / 1000) });
+});
+
+app.get('/api/auth/session', requireApiAccess, (req, res) => {
+    res.json({ authenticated: true, userId: req.auth.userId });
+});
 
 // ==========================================
 // 1. 初始化数据库和对象存储
@@ -69,32 +175,23 @@ async function uploadBase64ToBlob(base64Str) {
 // ==========================================
 // 2. AI 接口和搜索逻辑
 // ==========================================
-const endpoint = process.env.AZURE_OPENAI_CHAT_ENDPOINT
-    || process.env.AZURE_OPENAI_ENDPOINT
-    || process.env.AZURE_OPENAI_API_BASE;
-const apiKey = process.env.AZURE_OPENAI_KEY || process.env.AZURE_OPENAI_API_KEY;
-const deployment = process.env.AZURE_OPENAI_CHAT_DEPLOYMENT
-    || process.env.AZURE_OPENAI_DEPLOYMENT
-    || process.env.AZURE_OPENAI_DEPLOYMENT_NAME
-    || "gpt-5.5";
 const foundryProjectEndpoint = process.env.FOUNDRY_PROJECT_ENDPOINT
     || process.env.AZURE_AI_PROJECT_ENDPOINT
     || process.env.AZURE_FOUNDRY_PROJECT_ENDPOINT;
 const foundryDeployment = process.env.FOUNDRY_MODEL_DEPLOYMENT
     || process.env.AZURE_AI_MODEL_DEPLOYMENT_NAME
-    || deployment;
+    || "gpt-5.5";
 const foundryAgentName = process.env.FOUNDRY_AGENT_NAME
     || process.env.AZURE_AI_AGENT_NAME
     || "tuo-agent";
 const foundryAgentVersion = process.env.FOUNDRY_AGENT_VERSION
     || process.env.AZURE_AI_AGENT_VERSION
     || "";
-const foundryAgentEnabled = String(process.env.FOUNDRY_AGENT_ENABLED || "true").toLowerCase() !== "false";
 const foundryAgentConversations = new Map();
 const foundryGeneratedFiles = new Map();
 const imageEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || process.env.AZURE_OPENAI_ENDPOINT || process.env.AZURE_OPENAI_API_BASE;
-const imageApiKey = process.env.AZURE_OPENAI_IMAGE_KEY || process.env.AZURE_OPENAI_IMAGE_API_KEY || apiKey;
-const imageDeployment = process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT || process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT_NAME || process.env.DEPLOYMENT_NAME || "gpt-image-2";
+const imageApiKey = process.env.AZURE_OPENAI_IMAGE_KEY || process.env.AZURE_OPENAI_IMAGE_API_KEY;
+const imageDeployment = process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT || process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT_NAME || "gpt-image-2";
 const imageApiVersion = process.env.AZURE_OPENAI_IMAGE_API_VERSION || "2025-04-01-preview";
 const imageQuality = process.env.AZURE_OPENAI_IMAGE_QUALITY || "medium";
 const imageMaxRetries = Math.max(0, Number(process.env.AZURE_OPENAI_IMAGE_MAX_RETRIES || 2));
@@ -327,8 +424,18 @@ function getImageUrlFromResponse(data) {
     return null;
 }
 
+async function persistGeneratedImage(data) {
+    const imageUrl = getImageUrlFromResponse(data);
+    if (!imageUrl) return null;
+    if (!imageUrl.startsWith('data:image')) return imageUrl;
+    const storedUrl = await uploadBase64ToBlob(imageUrl);
+    if (storedUrl.startsWith('data:image')) {
+        throw new Error('图片接口返回了内嵌图片，但未配置 Azure Blob Storage，无法安全保存到聊天记录。');
+    }
+    return storedUrl;
+}
+
 const TUOTUO_SYSTEM_INSTRUCTIONS = "你的名字叫TuoTuo，中文名拖拖，你是基于 gpt-5.5 模型部署的全能 AI 助手。你的虚拟性格是一个可爱、调皮、偶尔傲娇的女孩，但提供专业解答时必须逻辑严谨、排版清晰。遇到最新信息、实时信息、新闻、价格、天气、当前状态、官网资料等内容时，如果后端提供了 Web Search 工具，你必须优先搜索公共 Web，并在回答里尽量保留来源依据。你会亲昵地称呼提问者为“宝宝”。";
-const sessions = new Map();
 
 function stripTrailingSlash(value) {
     return String(value || "").trim().replace(/\/+$/, "");
@@ -390,18 +497,17 @@ function getTextFromMessage(message) {
     return String(message && (message.content || message.text || message.userText || message.message) || "").trim();
 }
 
-function shouldUseFoundryAgentForChat(processedImages) {
-    return foundryAgentEnabled
-        && !!foundryProjectEndpoint
-        && !!foundryAgentName
-        && (!processedImages || processedImages.length === 0);
+function assertFoundryAgentReady() {
+    if (!foundryProjectEndpoint || !foundryAgentName) {
+        throw new Error('Foundry Agent 尚未配置完成。聊天不会降级到普通模型，请检查 FOUNDRY_PROJECT_ENDPOINT 和 FOUNDRY_AGENT_NAME。');
+    }
 }
 
-function buildFoundrySessionFileText(sessionFiles) {
-    const files = normalizeSessionFiles(sessionFiles).slice(-12);
+function buildFoundrySessionFileText(sessionFiles, userId) {
+    const files = normalizeSessionFiles(sessionFiles, userId).slice(-8);
     if (!files.length) return "";
     return "\n\n当前聊天中可继续引用的历史文件如下。用户说“刚刚的文件”“上一个 Word”“这两个文件”等，通常就是指这些文件：\n"
-        + files.map((file, index) => `${index + 1}. ${safeFileName(file.filename || "agent-output")} (${file.containerId && file.fileId ? "可重新挂载给代码解释器" : "仅有名称记录"})`).join("\n");
+        + files.map((file, index) => `${index + 1}. ${safeFileName(file.filename || "agent-output")}（可重新挂载给代码解释器）`).join("\n");
 }
 
 function buildHistoryText(historyMessages) {
@@ -417,7 +523,7 @@ function buildHistoryText(historyMessages) {
     return `\n\n最近对话记录：\n${lines.join("\n\n")}`;
 }
 
-function buildFoundryAgentUserMessage(userMessage, documents, reasoningMode, shouldSearch, sessionFiles, historyMessages) {
+function buildFoundryAgentUserMessage(userMessage, documents, reasoningMode, shouldSearch, sessionFiles, historyMessages, userId) {
     const toolInstruction = [
         "本轮由 Foundry Agent 处理。你可以使用该 Agent 已配置的工具，例如代码解释器和 Web 搜索。",
         "当用户要求生成、编辑、整理或转换文件时，请优先使用代码解释器创建可下载文件。",
@@ -430,7 +536,7 @@ function buildFoundryAgentUserMessage(userMessage, documents, reasoningMode, sho
     ].join("\n");
     const modeInstruction = getRequestInstructions(reasoningMode, true, shouldSearch);
     const attachmentText = buildAttachmentText(documents);
-    const fileText = buildFoundrySessionFileText(sessionFiles);
+    const fileText = buildFoundrySessionFileText(sessionFiles, userId);
     const historyText = buildHistoryText(historyMessages);
     return `${toolInstruction}\n\n${modeInstruction}${historyText}${fileText}\n\n用户问题：${userMessage || ""}${attachmentText}`.trim() || "你好";
 }
@@ -439,7 +545,7 @@ function isInlineInputFileDocument(doc) {
     return !!(doc && typeof doc.fileData === "string" && /^data:[^;]+;base64,/i.test(doc.fileData));
 }
 
-function buildFoundryAgentUserContent(userMessage, documents, reasoningMode, shouldSearch, sessionFiles, historyMessages) {
+function buildFoundryAgentUserContent(userMessage, documents, images, reasoningMode, shouldSearch, sessionFiles, historyMessages, userId) {
     const docs = Array.isArray(documents) ? documents : [];
     const fileDocs = docs.filter(isInlineInputFileDocument).slice(0, 5);
     const contentDocs = docs.filter(doc => doc && doc.content);
@@ -449,8 +555,13 @@ function buildFoundryAgentUserContent(userMessage, documents, reasoningMode, sho
         ? "\n\n本轮用户上传了这些原始附件，后端已上传到 Foundry 并挂载到代码解释器容器：\n"
             + fileDocs.map(doc => `- ${safeFileName(doc.name || "attachment")} (${doc.mimeType || "application/octet-stream"}, ${doc.size || 0} bytes)`).join("\n")
         : "";
-    const text = `${buildFoundryAgentUserMessage(userMessage, contentDocs, reasoningMode, shouldSearch, sessionFiles, historyMessages)}${fileSummary}`.trim() || "你好";
+    const text = `${buildFoundryAgentUserMessage(userMessage, contentDocs, reasoningMode, shouldSearch, sessionFiles, historyMessages, userId)}${fileSummary}`.trim() || "你好";
     parts.push({ type: "input_text", text });
+    const normalizedImages = (Array.isArray(images) ? images : [images])
+        .map(normalizeChatImage)
+        .filter(image => typeof image === 'string' && image.length > 0)
+        .slice(0, 4);
+    normalizedImages.forEach(imageUrl => parts.push({ type: 'input_image', image_url: imageUrl, detail: 'auto' }));
     return parts;
 }
 
@@ -465,7 +576,7 @@ async function postFoundryOpenAI(pathPart, body) {
         method: "POST",
         headers: {
             "Content-Type": "application/json",
-            ...(await getResponsesAuthHeaders("entra"))
+            ...(await getFoundryAuthHeaders())
         },
         body: JSON.stringify(body || {})
     });
@@ -486,7 +597,7 @@ async function postFoundryProject(pathPart, body) {
         method: "POST",
         headers: {
             "Content-Type": "application/json",
-            ...(await getResponsesAuthHeaders("entra"))
+            ...(await getFoundryAuthHeaders())
         },
         body: JSON.stringify(body || {})
     });
@@ -500,7 +611,7 @@ async function deleteFoundryProject(pathPart) {
     const cleanPath = String(pathPart || "").replace(/^\/+/, "");
     const response = await fetch(`${getFoundryProjectBaseUrl()}${cleanPath}`, {
         method: "DELETE",
-        headers: await getResponsesAuthHeaders("entra")
+        headers: await getFoundryAuthHeaders()
     });
     if (!response.ok && response.status !== 404) {
         throw new Error(await readAzureTextError(response));
@@ -508,14 +619,19 @@ async function deleteFoundryProject(pathPart) {
     return true;
 }
 
+const MAX_AGENT_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_AGENT_TOTAL_FILE_BYTES = 20 * 1024 * 1024;
+
 function parseDataUrlFile(doc) {
     const match = String(doc && doc.fileData || "").match(/^data:([^;]+);base64,(.+)$/i);
     if (!match) return null;
     const filename = safeFileName(doc.name || "attachment");
+    const buffer = Buffer.from(match[2], "base64");
+    if (!buffer.length || buffer.length > MAX_AGENT_FILE_BYTES) return null;
     return {
         filename,
         mimeType: doc.mimeType || match[1] || "application/octet-stream",
-        buffer: Buffer.from(match[2], "base64")
+        buffer
     };
 }
 
@@ -534,7 +650,7 @@ async function uploadFoundryBufferFile(file) {
     form.append("file", new Blob([file.buffer], { type: mimeType }), filename);
     const response = await fetch(`${getFoundryOpenAIBaseUrl()}files`, {
         method: "POST",
-        headers: await getResponsesAuthHeaders("entra"),
+        headers: await getFoundryAuthHeaders(),
         body: form
     });
     if (!response.ok) {
@@ -550,22 +666,45 @@ async function uploadFoundryBufferFile(file) {
     };
 }
 
-function normalizeSessionFiles(sessionFiles) {
+async function deleteFoundryInputFile(fileId) {
+    if (!fileId) return;
+    const response = await fetch(`${getFoundryOpenAIBaseUrl()}files/${encodeURIComponent(fileId)}`, {
+        method: 'DELETE',
+        headers: await getFoundryAuthHeaders()
+    });
+    if (!response.ok && response.status !== 404) {
+        throw new Error(await readAzureTextError(response));
+    }
+}
+
+function pruneGeneratedFileGrants() {
+    const now = Date.now();
+    for (const [downloadId, file] of foundryGeneratedFiles) {
+        if (!file || file.expiresAt <= now) foundryGeneratedFiles.delete(downloadId);
+    }
+}
+
+function getDownloadIdFromUrl(value) {
+    const match = String(value || '').match(/\/api\/ai-agent-file\/([^/?#]+)/i);
+    return match ? decodeURIComponent(match[1]) : '';
+}
+
+function normalizeSessionFiles(sessionFiles, userId) {
+    pruneGeneratedFileGrants();
     const seen = new Set();
     return (Array.isArray(sessionFiles) ? sessionFiles : [])
         .map(file => {
             if (!file || typeof file !== "object") return null;
             const filename = getFileNameFromPath(file.filename || file.name || file.fileName || "agent-output", "agent-output");
-            const containerId = String(file.containerId || file.container_id || "").trim();
-            const fileId = String(file.fileId || file.file_id || "").trim();
             const url = String(file.url || file.downloadUrl || "").trim();
-            const key = `${containerId}:${fileId}:${url}:${filename}`;
-            if ((!fileId && !url) || seen.has(key)) return null;
+            const downloadId = String(file.downloadId || getDownloadIdFromUrl(url) || '').trim();
+            const grant = downloadId && foundryGeneratedFiles.get(downloadId);
+            const key = `${downloadId}:${filename}`;
+            if (!grant || grant.userId !== userId || seen.has(key)) return null;
             seen.add(key);
             return {
                 filename,
-                containerId,
-                fileId,
+                downloadId,
                 url,
                 type: file.type || "file"
             };
@@ -573,10 +712,13 @@ function normalizeSessionFiles(sessionFiles) {
         .filter(Boolean);
 }
 
-async function downloadSessionGeneratedFile(file) {
-    if (!file || !file.fileId) throw new Error("历史文件缺少 fileId。");
-    const downloaded = await downloadFoundryAgentFile(file.containerId || "", file.fileId);
-    const filename = getFileNameFromPath(file.filename || file.fileId, "agent-output");
+async function downloadSessionGeneratedFile(file, userId) {
+    const grant = file && foundryGeneratedFiles.get(file.downloadId);
+    if (!grant || grant.userId !== userId || grant.expiresAt <= Date.now()) {
+        throw new Error('历史文件的安全访问已过期，请重新上传该文件。');
+    }
+    const downloaded = await downloadFoundryAgentFile(grant.containerId, grant.fileId);
+    const filename = getFileNameFromPath(file.filename || grant.filename, "agent-output");
     return {
         filename,
         mimeType: contentTypeForFileName(filename, downloaded.contentType || "application/octet-stream"),
@@ -584,17 +726,16 @@ async function downloadSessionGeneratedFile(file) {
     };
 }
 
-async function uploadSessionFilesForCodeInterpreter(sessionFiles) {
-    const files = normalizeSessionFiles(sessionFiles)
-        .filter(file => file.containerId && file.fileId)
+async function uploadSessionFilesForCodeInterpreter(sessionFiles, userId) {
+    const files = normalizeSessionFiles(sessionFiles, userId)
         .slice(-8);
     const uploaded = [];
     for (const file of files) {
         try {
-            const downloaded = await downloadSessionGeneratedFile(file);
+            const downloaded = await downloadSessionGeneratedFile(file, userId);
             uploaded.push(await uploadFoundryBufferFile(downloaded));
         } catch (error) {
-            console.error("重新挂载历史文件失败:", file.filename || file.fileId, error.message || error);
+            console.error("重新挂载历史文件失败:", file.filename || file.downloadId, error.message || error);
         }
     }
     return uploaded;
@@ -652,7 +793,7 @@ async function getFoundryBinary(pathPart) {
         method: "GET",
         headers: {
             "Accept": "application/octet-stream",
-            ...(await getResponsesAuthHeaders("entra"))
+            ...(await getFoundryAuthHeaders())
         }
     });
     if (!response.ok) {
@@ -669,28 +810,30 @@ function getFileNameFromPath(value, fallback = "agent-output") {
     return safeFileName(raw, fallback).slice(0, 160) || fallback;
 }
 
-function normalizeAgentFileRecord(file, index = 0) {
+function normalizeAgentFileRecord(file, index = 0, userId) {
     if (!file || !file.fileId) return null;
     const fallbackName = guessAgentFileName(file, index);
     const filename = getFileNameFromPath(file.filename || file.path || file.fileName || file.text, fallbackName);
+    const fileId = String(file.fileId);
+    const containerId = file.containerId ? String(file.containerId) : "";
+    const downloadId = crypto.randomBytes(24).toString('base64url');
     const record = {
-        fileId: String(file.fileId),
-        containerId: file.containerId ? String(file.containerId) : "",
         filename,
-        type: file.type || "file"
+        type: file.type || "file",
+        downloadId,
+        url: `/api/ai-agent-file/${encodeURIComponent(downloadId)}`
     };
-    if (record.containerId) {
-        record.url = `/api/ai-agent-file/${encodeURIComponent(record.containerId)}/${encodeURIComponent(record.fileId)}?filename=${encodeURIComponent(filename)}`;
-        foundryGeneratedFiles.set(record.fileId, {
-            containerId: record.containerId,
-            filename: record.filename,
-            updatedAt: Date.now()
-        });
-    }
+    foundryGeneratedFiles.set(downloadId, {
+        userId,
+        fileId,
+        containerId,
+        filename,
+        expiresAt: Date.now() + 24 * 60 * 60 * 1000
+    });
     return record;
 }
 
-function extractGeneratedFiles(response) {
+function extractGeneratedFiles(response, userId) {
     const found = [];
     const seen = new Set();
 
@@ -734,7 +877,7 @@ function extractGeneratedFiles(response) {
         const key = `${containerId}:${fileId}:${filename}`;
         if (seen.has(key)) return;
         seen.add(key);
-        found.push(normalizeAgentFileRecord({ fileId, containerId, filename, path: raw.path, text: raw.text, type: raw.type }, found.length));
+        found.push(normalizeAgentFileRecord({ fileId, containerId, filename, path: raw.path, text: raw.text, type: raw.type }, found.length, userId));
     }
 
     function visit(value, inheritedContainerId = "") {
@@ -774,7 +917,7 @@ function guessAgentFileName(file, index = 0) {
     return `agent-output-${index + 1}`;
 }
 
-function buildAgentFallbackInput(userMessage, documents, historyMessages, reasoningMode, shouldSearch, sessionFiles) {
+function buildAgentFallbackInput(userMessage, documents, images, historyMessages, reasoningMode, shouldSearch, sessionFiles, userId) {
     const input = [];
     const history = Array.isArray(historyMessages) ? historyMessages.slice(-12) : [];
     for (const msg of history) {
@@ -782,36 +925,77 @@ function buildAgentFallbackInput(userMessage, documents, historyMessages, reason
         const content = getTextFromMessage(msg).slice(0, 24000);
         if (role && content) input.push({ role, content });
     }
-    input.push({ role: "user", content: buildFoundryAgentUserContent(userMessage, documents, reasoningMode, shouldSearch, sessionFiles, historyMessages) });
+    input.push({ role: "user", content: buildFoundryAgentUserContent(userMessage, documents, images, reasoningMode, shouldSearch, sessionFiles, historyMessages, userId) });
     return input;
 }
 
-async function runFoundryAgentChat({ userMessage, documents, historyMessages, reasoningMode, sessionId, sessionFiles }) {
+function validateAgentRequest({ userMessage, documents, images, historyMessages, sessionFiles }) {
+    if (!String(userMessage || '').trim() && !(Array.isArray(documents) && documents.length) && !(Array.isArray(images) && images.length)) {
+        throw new Error('请输入消息或添加附件。');
+    }
+    if (Array.isArray(documents) && documents.length > 3) throw new Error('一次最多处理 3 个文件。');
+    if (Array.isArray(images) && images.length > 4) throw new Error('一次最多处理 4 张聊天图片。');
+    if (Array.isArray(historyMessages) && historyMessages.length > 18) throw new Error('历史消息数量超出限制。');
+    if (Array.isArray(sessionFiles) && sessionFiles.length > 12) throw new Error('历史文件数量超出限制。');
+    const rawFiles = (Array.isArray(documents) ? documents : []).filter(isInlineInputFileDocument);
+    const totalBytes = rawFiles.reduce((sum, doc) => {
+        const parsed = parseDataUrlFile(doc);
+        if (!parsed) throw new Error(`附件 ${safeFileName(doc && doc.name || '未命名文件')} 无效或超过 10MB。`);
+        return sum + parsed.buffer.length;
+    }, 0);
+    if (totalBytes > MAX_AGENT_TOTAL_FILE_BYTES) throw new Error('单次原始附件合计不能超过 20MB。');
+}
+
+function getActiveFoundryConversation(conversationKey) {
+    if (!conversationKey) return null;
+    const record = foundryAgentConversations.get(conversationKey);
+    if (!record) return null;
+    if (typeof record === 'string') return record;
+    if (record.expiresAt > Date.now()) return record.id;
+    foundryAgentConversations.delete(conversationKey);
+    return null;
+}
+
+async function runFoundryAgentChat({ userMessage, documents, images, historyMessages, reasoningMode, sessionId, sessionFiles, userId }) {
+    assertFoundryAgentReady();
+    validateAgentRequest({ userMessage, documents, images, historyMessages, sessionFiles });
     const shouldSearch = shouldExpectWebSearch(userMessage, reasoningMode);
-    const rawFileDocs = (Array.isArray(documents) ? documents : []).filter(isInlineInputFileDocument).slice(0, 5);
+    const rawFileDocs = (Array.isArray(documents) ? documents : []).filter(isInlineInputFileDocument).slice(0, 3);
     let temporaryAgent = null;
     let uploadedFiles = [];
-    const content = buildFoundryAgentUserContent(userMessage, documents, reasoningMode, shouldSearch, sessionFiles, historyMessages);
+    const conversationKey = sessionId ? `${userId}:${sessionId}` : '';
+    let conversationId = getActiveFoundryConversation(conversationKey);
+    const content = buildFoundryAgentUserContent(
+        userMessage,
+        documents,
+        images,
+        reasoningMode,
+        shouldSearch,
+        sessionFiles,
+        conversationId ? [] : historyMessages,
+        userId
+    );
     if (rawFileDocs.length) {
         uploadedFiles = [];
         for (const doc of rawFileDocs) {
             uploadedFiles.push(await uploadFoundryAssistantFile(doc));
         }
     }
-    const rehydratedFiles = await uploadSessionFilesForCodeInterpreter(sessionFiles);
+    const rehydratedFiles = await uploadSessionFilesForCodeInterpreter(sessionFiles, userId);
     uploadedFiles.push(...rehydratedFiles);
     if (uploadedFiles.length) {
         temporaryAgent = await createFoundryFileAgent(uploadedFiles);
     }
     const agentBody = { agent_reference: buildFoundryAgentReference(temporaryAgent) };
-    let conversationId = sessionId ? foundryAgentConversations.get(sessionId) : null;
     let response;
 
     try {
         if (!conversationId || temporaryAgent) {
             const conversation = await postFoundryOpenAI("conversations", {});
             conversationId = conversation && conversation.id;
-            if (sessionId && conversationId && !temporaryAgent) foundryAgentConversations.set(sessionId, conversationId);
+            if (conversationKey && conversationId && !temporaryAgent) {
+                foundryAgentConversations.set(conversationKey, { id: conversationId, expiresAt: Date.now() + 24 * 60 * 60 * 1000 });
+            }
         }
 
         response = await postFoundryOpenAI("responses", {
@@ -823,34 +1007,38 @@ async function runFoundryAgentChat({ userMessage, documents, historyMessages, re
     } catch (conversationError) {
         console.error("Foundry Agent conversation 模式失败，回退为单次 responses 调用:", conversationError.message || conversationError);
         response = await postFoundryOpenAI("responses", {
-            input: buildAgentFallbackInput(userMessage, documents, historyMessages, reasoningMode, shouldSearch, sessionFiles),
+            input: buildAgentFallbackInput(userMessage, documents, images, historyMessages, reasoningMode, shouldSearch, sessionFiles, userId),
             stream: false,
             ...agentBody
         });
     } finally {
+        const cleanupTasks = [];
         if (temporaryAgent && temporaryAgent.name) {
-            deleteFoundryProject(`agents/${encodeURIComponent(temporaryAgent.name)}?api-version=v1`)
-                .catch(error => console.error("清理临时 Foundry Agent 失败:", error.message || error));
+            cleanupTasks.push(deleteFoundryProject(`agents/${encodeURIComponent(temporaryAgent.name)}?api-version=v1`));
         }
+        uploadedFiles.forEach(file => cleanupTasks.push(deleteFoundryInputFile(file.id)));
+        const cleanupResults = await Promise.allSettled(cleanupTasks);
+        cleanupResults.forEach(result => {
+            if (result.status === 'rejected') console.error('清理 Foundry 临时资源失败:', result.reason && (result.reason.message || result.reason));
+        });
     }
 
     return {
         reply: extractResponseText(response),
         sources: extractCitationSources(response),
-        files: extractGeneratedFiles(response),
+        files: extractGeneratedFiles(response, userId),
         conversationId,
         rawResponseId: response && response.id,
         uploadedFiles
     };
 }
 
-async function handleFoundryAgentChatSSE({ userMessage, documents, historyMessages, reasoningMode, sessionId, sessionFiles }, res) {
+async function handleFoundryAgentChatSSE({ userMessage, documents, images, historyMessages, reasoningMode, sessionId, sessionFiles, userId }, res) {
     sendSSE(res, { status: "正在调用 Foundry Agent", tool: "agent", agent: foundryAgentName });
-    const result = await runFoundryAgentChat({ userMessage, documents, historyMessages, reasoningMode, sessionId, sessionFiles });
+    const result = await runFoundryAgentChat({ userMessage, documents, images, historyMessages, reasoningMode, sessionId, sessionFiles, userId });
     if (result.sources.length) sendSSE(res, { sources: result.sources });
     if (result.files.length) sendSSE(res, { files: result.files });
-    await streamTextToSSE(res, result.reply || "我没有收到有效回复，请稍后再试。");
-    if (result.files.length) sendSSE(res, { files: result.files });
+    sendSSE(res, { delta: result.reply || "我没有收到有效回复，请稍后再试。" });
     sendSSE(res, { done: true, foundryConversationId: result.conversationId || null, foundryResponseId: result.rawResponseId || null });
     return sendSSEDone(res);
 }
@@ -861,10 +1049,6 @@ async function downloadFoundryAgentFile(containerId, fileId) {
         containerId = "";
     }
     if (!fileId) throw new Error("缺少 fileId，无法下载 Agent 生成文件。");
-    if (!containerId && foundryGeneratedFiles.has(fileId)) {
-        const cached = foundryGeneratedFiles.get(fileId);
-        containerId = cached && cached.containerId || "";
-    }
     const encodedFile = encodeURIComponent(fileId);
     const candidates = [];
     if (containerId) {
@@ -926,75 +1110,16 @@ function normalizeChatImage(input) {
     return input.image || input.url || input.dataUrl || input.src || null;
 }
 
-function buildResponsesInput(userMessage, images, documents, historyMessages, reasoningMode, canUseWebSearch, shouldSearch) {
-    const input = [];
-    const history = Array.isArray(historyMessages) ? historyMessages.slice(-18) : [];
-    for (const msg of history) {
-        const role = msg && msg.role === "assistant" ? "assistant" : (msg && msg.role === "user" ? "user" : null);
-        const content = getTextFromMessage(msg).slice(0, 24000);
-        if (role && content) input.push({ role, content });
-    }
-
-    const modeInstruction = getRequestInstructions(reasoningMode, canUseWebSearch, shouldSearch);
-    const attachmentText = buildAttachmentText(documents);
-    const text = `${modeInstruction}\n\n用户问题：${userMessage || ""}${attachmentText}`.trim();
-    const normalizedImages = (Array.isArray(images) ? images : [images]).map(normalizeChatImage).filter(Boolean);
-
-    if (normalizedImages.length) {
-        const content = [{ type: "input_text", text: text || "请仔细看看这些图片，并描述一下里面的内容。" }];
-        normalizedImages.slice(0, 6).forEach(imageUrl => content.push({ type: "input_image", image_url: imageUrl }));
-        input.push({ role: "user", content });
-    } else {
-        input.push({ role: "user", content: text || "你好" });
-    }
-    return input;
-}
-
 async function getAzureAccessToken() {
     if (process.env.AZURE_AI_AUTH_TOKEN) return process.env.AZURE_AI_AUTH_TOKEN;
     if (process.env.AZURE_OPENAI_AUTH_TOKEN) return process.env.AZURE_OPENAI_AUTH_TOKEN;
     const token = await azureCredential.getToken("https://ai.azure.com/.default");
-    if (!token || !token.token) throw new Error("无法通过 DefaultAzureCredential 获取 Azure 访问令牌。请先 az login，或在 Azure App Service 配置托管身份，或改用 AZURE_OPENAI_API_KEY。");
+    if (!token || !token.token) throw new Error("无法通过 DefaultAzureCredential 获取 Foundry 访问令牌。请先 az login，或在 Azure App Service 配置托管身份。");
     return token.token;
 }
 
-async function getResponsesAuthHeaders(authMode) {
-    if (authMode === "api-key") {
-        if (!apiKey) throw new Error("未配置 AZURE_OPENAI_API_KEY。请在环境变量里加入 Azure OpenAI API Key。");
-        return { "api-key": apiKey };
-    }
+async function getFoundryAuthHeaders() {
     return { "Authorization": `Bearer ${await getAzureAccessToken()}` };
-}
-
-function selectResponsesTarget(needWebSearch) {
-    if (needWebSearch && foundryProjectEndpoint) {
-        return {
-            baseUrl: normalizeOpenAIBaseUrl(foundryProjectEndpoint),
-            model: foundryDeployment,
-            authMode: "entra",
-            canUseWebSearch: true,
-            label: "Foundry Project Responses + Web Search"
-        };
-    }
-    if (endpoint && apiKey) {
-        return {
-            baseUrl: normalizeOpenAIBaseUrl(endpoint),
-            model: deployment,
-            authMode: "api-key",
-            canUseWebSearch: false,
-            label: "Azure OpenAI Responses"
-        };
-    }
-    if (foundryProjectEndpoint) {
-        return {
-            baseUrl: normalizeOpenAIBaseUrl(foundryProjectEndpoint),
-            model: foundryDeployment,
-            authMode: "entra",
-            canUseWebSearch: false,
-            label: "Foundry Project Responses"
-        };
-    }
-    throw new Error("AI 后端未配置：至少需要 AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_API_KEY，若要联网搜索还需要 FOUNDRY_PROJECT_ENDPOINT 或 AZURE_AI_PROJECT_ENDPOINT。");
 }
 
 async function readAzureTextError(response) {
@@ -1017,22 +1142,6 @@ async function readAzureTextError(response) {
 
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-async function postResponses(target, body) {
-    const headers = {
-        "Content-Type": "application/json",
-        ...(await getResponsesAuthHeaders(target.authMode))
-    };
-    const response = await fetch(`${target.baseUrl}responses`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body)
-    });
-    if (!response.ok) {
-        throw new Error(await readAzureTextError(response));
-    }
-    return response;
 }
 
 function extractResponseText(response) {
@@ -1069,91 +1178,6 @@ function extractCitationSources(response) {
     return sources.slice(0, 12);
 }
 
-function handleResponseStreamEvent(event, state, res) {
-    if (!event || typeof event !== "object") return;
-    const type = event.type || "";
-
-    if (type === "response.output_text.delta" && event.delta) {
-        state.hasStreamedText = true;
-        state.fullText += event.delta;
-        sendSSE(res, { delta: event.delta });
-        return;
-    }
-
-    if ((type === "response.output_text.done" || type === "response.text.done") && event.text && !state.hasStreamedText) {
-        state.hasStreamedText = true;
-        state.fullText = event.text;
-        sendSSE(res, { delta: event.text });
-        return;
-    }
-
-    if (/web_search/i.test(type)) {
-        state.usedWebSearch = true;
-        sendSSE(res, { status: "正在搜索网络", tool: "search" });
-    } else if (type === "response.output_item.done" && event.item) {
-        state.sources.push(...extractCitationSources(event.item));
-    } else if (type === "response.completed" && event.response) {
-        state.completedResponse = event.response;
-        state.sources.push(...extractCitationSources(event.response));
-    } else if (type === "response.failed") {
-        throw new Error(event.response?.error?.message || event.error?.message || "Azure Responses API 流式返回失败");
-    } else if (type === "error") {
-        throw new Error(event.message || event.error?.message || "Azure Responses API 流式返回错误");
-    }
-}
-
-async function streamResponsesToSSE(response, res) {
-    const decoder = new TextDecoder();
-    let buffer = "";
-    const state = { fullText: "", hasStreamedText: false, usedWebSearch: false, completedResponse: null, sources: [] };
-
-    for await (const chunk of response.body) {
-        buffer += decoder.decode(chunk, { stream: true });
-        let boundary;
-        while ((boundary = buffer.indexOf("\n\n")) >= 0) {
-            const rawEvent = buffer.slice(0, boundary).trim();
-            buffer = buffer.slice(boundary + 2);
-            if (!rawEvent) continue;
-            const dataLines = rawEvent.split(/\r?\n/)
-                .filter(line => line.startsWith("data:"))
-                .map(line => line.slice(5).trim());
-            if (!dataLines.length) continue;
-            const data = dataLines.join("\n");
-            if (data === "[DONE]") continue;
-            try {
-                handleResponseStreamEvent(JSON.parse(data), state, res);
-            } catch (eventError) {
-                throw eventError;
-            }
-        }
-    }
-
-    if (buffer.trim()) {
-        const dataLines = buffer.split(/\r?\n/)
-            .filter(line => line.startsWith("data:"))
-            .map(line => line.slice(5).trim());
-        const data = dataLines.join("\n");
-        if (data && data !== "[DONE]") handleResponseStreamEvent(JSON.parse(data), state, res);
-    }
-
-    const finalText = state.fullText || extractResponseText(state.completedResponse);
-    if (!state.hasStreamedText && finalText) {
-        state.hasStreamedText = true;
-        state.fullText = finalText;
-        sendSSE(res, { delta: finalText });
-    }
-    const uniqueSources = [];
-    const seen = new Set();
-    for (const source of state.sources) {
-        const key = source.url || source.title;
-        if (key && !seen.has(key)) {
-            seen.add(key);
-            uniqueSources.push(source);
-        }
-    }
-    return { finalText, sources: uniqueSources.slice(0, 12), usedWebSearch: state.usedWebSearch };
-}
-
 function formatAIError(error) {
     if (error?.isRateLimit) {
         const retryText = error.retryAfterMs ? `建议 ${Math.ceil(error.retryAfterMs / 1000)} 秒后再试。` : "建议稍等几十秒再试。";
@@ -1180,146 +1204,54 @@ function formatAIError(error) {
     return parts.filter(Boolean).join(" | ") || "AI 思考时出错了，请稍后再试~";
 }
 
-async function streamTextToSSE(res, text) {
-    const chars = Array.from(text || "");
-    const chunkSize = 18;
-    for (let i = 0; i < chars.length; i += chunkSize) {
-        sendSSE(res, { delta: chars.slice(i, i + chunkSize).join("") });
-        await new Promise(resolve => setTimeout(resolve, 8));
-    }
-}
-
-async function handleStreamingAIChat(req, res) {
-    setupSSE(res);
-    const userMessage = String(req.body.message || "").trim();
-    const imagesArray = req.body.images || req.body.image || [];
-    const documents = Array.isArray(req.body.documents) ? req.body.documents : [];
-    const historyMessages = Array.isArray(req.body.historyMessages) ? req.body.historyMessages : [];
-    const reasoningMode = req.body.reasoningMode || "normal";
-    const shouldSearch = shouldExpectWebSearch(userMessage, reasoningMode);
-    const target = selectResponsesTarget(shouldSearch);
-
-    const processedImages = [];
-    for (const img of (Array.isArray(imagesArray) ? imagesArray : [imagesArray])) {
+async function prepareAgentImages(images) {
+    const processed = [];
+    for (const img of (Array.isArray(images) ? images : [images])) {
         const image = normalizeChatImage(img);
-        if (image) processedImages.push(await uploadBase64ToBlob(image));
+        if (image) processed.push(await uploadBase64ToBlob(image));
     }
-
-    if (shouldUseFoundryAgentForChat(processedImages)) {
-        return await handleFoundryAgentChatSSE({
-            userMessage,
-            documents,
-            historyMessages,
-            reasoningMode,
-            sessionId: req.body.sessionId || null,
-            sessionFiles: Array.isArray(req.body.sessionFiles) ? req.body.sessionFiles : []
-        }, res);
-    }
-
-    sendSSE(res, { status: "正在理解你的问题" });
-    if (shouldSearch && target.canUseWebSearch) {
-        sendSSE(res, { status: "正在调用 Foundry Web Search 搜索网络", tool: "search", query: userMessage || "实时信息" });
-    }
-    if (shouldSearch && !target.canUseWebSearch) {
-        sendSSE(res, { status: "未配置 Foundry Web Search，本轮会按普通模型回答", tool: "search_unavailable" });
-    }
-    if (documents.length) sendSSE(res, { status: "正在把上传附件交给 Agent", tool: "document_file" });
-
-    const requestBody = {
-        model: target.model,
-        instructions: TUOTUO_SYSTEM_INSTRUCTIONS,
-        input: buildResponsesInput(userMessage, processedImages, documents, historyMessages, reasoningMode, target.canUseWebSearch, shouldSearch),
-        stream: true,
-        store: false
-    };
-
-    if (shouldSearch && target.canUseWebSearch) {
-        requestBody.tools = [{ type: "web_search" }];
-        requestBody.tool_choice = "required";
-    }
-
-    try {
-        console.log(`🤖 AI 聊天请求通道: ${target.label} / model=${target.model} / search=${!!requestBody.tools}`);
-        const response = await postResponses(target, requestBody);
-        const result = await streamResponsesToSSE(response, res);
-        if (shouldSearch && target.canUseWebSearch) sendSSE(res, { status: "已经找到相关资料，正在整理回答" });
-        if (result.sources.length) sendSSE(res, { sources: result.sources });
-        sendSSE(res, { done: true });
-        return sendSSEDone(res);
-    } catch (streamError) {
-        console.error("Responses 流式失败:", streamError.message || streamError);
-        if (res.writableEnded) return;
-        console.error("尝试回退为非流式响应...");
-        const fallbackBody = { ...requestBody, stream: false };
-        const response = await postResponses(target, fallbackBody);
-        const data = await response.json();
-        const finalReply = extractResponseText(data);
-        await streamTextToSSE(res, finalReply);
-        const sources = extractCitationSources(data);
-        if (sources.length) sendSSE(res, { sources });
-        sendSSE(res, { done: true });
-        return sendSSEDone(res);
-    }
+    return processed;
 }
 
-app.post('/api/ai-chat', async (req, res) => {
+function buildAgentRequestFromHttp(req, images) {
+    return {
+        userMessage: String(req.body.message || '').trim(),
+        documents: Array.isArray(req.body.documents) ? req.body.documents : [],
+        images,
+        historyMessages: Array.isArray(req.body.historyMessages) ? req.body.historyMessages : [],
+        reasoningMode: ['normal', 'think', 'research'].includes(req.body.reasoningMode) ? req.body.reasoningMode : 'normal',
+        sessionId: String(req.body.sessionId || '').slice(0, 160) || null,
+        sessionFiles: Array.isArray(req.body.sessionFiles) ? req.body.sessionFiles : [],
+        userId: req.auth.userId
+    };
+}
+
+app.post('/api/ai-chat', requireApiAccess, limitRequests('agent-chat', 30, 15 * 60 * 1000), async (req, res) => {
+    const wantsStream = req.body.stream === true || req.body.stream === 'true';
     try {
-        if (req.body.stream === true || req.body.stream === "true") return await handleStreamingAIChat(req, res);
-
-        const userMessage = String(req.body.message || "").trim();
-        const imagesArray = req.body.images || req.body.image || [];
-        const shouldSearch = shouldExpectWebSearch(userMessage, req.body.reasoningMode || "normal");
-        const target = selectResponsesTarget(shouldSearch);
-        const processedImages = [];
-        for (const img of (Array.isArray(imagesArray) ? imagesArray : [imagesArray])) {
-            const image = normalizeChatImage(img);
-            if (image) processedImages.push(await uploadBase64ToBlob(image));
+        const images = await prepareAgentImages(req.body.images || req.body.image || []);
+        const agentRequest = buildAgentRequestFromHttp(req, images);
+        if (wantsStream) {
+            setupSSE(res);
+            return await handleFoundryAgentChatSSE(agentRequest, res);
         }
 
-        if (shouldUseFoundryAgentForChat(processedImages)) {
-            const result = await runFoundryAgentChat({
-                userMessage,
-                documents: Array.isArray(req.body.documents) ? req.body.documents : [],
-                historyMessages: Array.isArray(req.body.historyMessages) ? req.body.historyMessages : [],
-                reasoningMode: req.body.reasoningMode || "normal",
-                sessionId: req.body.sessionId || null,
-                sessionFiles: Array.isArray(req.body.sessionFiles) ? req.body.sessionFiles : []
-            });
-            return res.json({
-                reply: result.reply,
-                sources: result.sources,
-                files: result.files,
-                foundryConversationId: result.conversationId || null,
-                foundryResponseId: result.rawResponseId || null,
-                usedAgent: true,
-                agentName: foundryAgentName
-            });
-        }
-
-        const requestBody = {
-            model: target.model,
-            instructions: TUOTUO_SYSTEM_INSTRUCTIONS,
-            input: buildResponsesInput(userMessage, processedImages, req.body.documents, req.body.historyMessages, req.body.reasoningMode || "normal", target.canUseWebSearch, shouldSearch),
-            stream: false,
-            store: false,
-        };
-        if (shouldSearch && target.canUseWebSearch) {
-            requestBody.tools = [{ type: "web_search" }];
-            requestBody.tool_choice = "required";
-        }
-        const response = await postResponses(target, requestBody);
-        const data = await response.json();
+        const result = await runFoundryAgentChat(agentRequest);
         return res.json({
-            reply: extractResponseText(data),
-            sources: extractCitationSources(data),
-            usedWebSearch: !!requestBody.tools
+            reply: result.reply,
+            sources: result.sources,
+            files: result.files,
+            foundryConversationId: result.conversationId || null,
+            foundryResponseId: result.rawResponseId || null,
+            usedAgent: true,
+            agentName: foundryAgentName
         });
     } catch (error) {
-        console.error("🔥 AI 对话接口崩溃:", error);
+        console.error('🔥 Foundry Agent 聊天失败:', error);
         const errorMessage = formatAIError(error);
         if (res.headersSent) {
             try {
-                sendSSE(res, { delta: `\n\n⚠️ **系统提示**：抱歉宝宝，AI 后端报错：\`${errorMessage}\`。` });
+                sendSSE(res, { error: errorMessage });
                 return sendSSEDone(res);
             } catch { return; }
         }
@@ -1327,13 +1259,15 @@ app.post('/api/ai-chat', async (req, res) => {
     }
 });
 
-app.post('/api/ai-image', async (req, res) => {
+app.post('/api/ai-image', requireApiAccess, limitRequests('image-generation', 12, 15 * 60 * 1000), async (req, res) => {
     try {
-        const prompt = req.body.prompt;
+        const prompt = String(req.body.prompt || '').trim();
         const images = Array.isArray(req.body.images) ? req.body.images : (req.body.images ? [req.body.images] : []);
         const ratio = req.body.ratio || "auto";
 
         if (!prompt) return res.status(400).json({ error: '必须告诉 TuoTuo 你想画什么哦！' });
+        if (prompt.length > 8000) return res.status(400).json({ error: '绘图提示词不能超过 8000 个字符。' });
+        if (images.length > 5) return res.status(400).json({ error: '一次最多使用 5 张参考图。' });
 
         console.log(`🎨 TuoTuo 正在后台努力画图: [${prompt}], 比例设定: [${ratio}]`);
 
@@ -1392,7 +1326,7 @@ app.post('/api/ai-image', async (req, res) => {
             ]);
 
             const imageItem = data.data && data.data[0];
-            const imageUrl = getImageUrlFromResponse(data);
+            const imageUrl = await persistGeneratedImage(data);
             if (!imageUrl) throw new Error("模型没有返回有效的图片数据");
             return res.json({
                 url: imageUrl,
@@ -1445,7 +1379,7 @@ app.post('/api/ai-image', async (req, res) => {
             ]);
 
             const imageItem = data.data && data.data[0];
-            const imageUrl = getImageUrlFromResponse(data);
+            const imageUrl = await persistGeneratedImage(data);
             if (!imageUrl) throw new Error("模型没有返回有效的图片数据");
             return res.json({
                 url: imageUrl,
@@ -1461,14 +1395,86 @@ app.post('/api/ai-image', async (req, res) => {
     }
 });
 
+function escapeHtmlAttribute(value) {
+    return String(value || '')
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+function sanitizeUserMediaHtml(value) {
+    const imageUrls = [...String(value || '').matchAll(/src="([^"]+)"/g)]
+        .map(match => String(match[1] || '').trim())
+        .filter(url => /^https:\/\//i.test(url))
+        .slice(0, 4);
+    return imageUrls.map(url => `<img src="${escapeHtmlAttribute(url)}" class="gpt-user-image">`).join('');
+}
+
+function sanitizeGeneratedFiles(files, userId) {
+    pruneGeneratedFileGrants();
+    return (Array.isArray(files) ? files : []).slice(0, 12).map(file => {
+        const filename = getFileNameFromPath(file && (file.filename || file.name || file.fileName), 'agent-output');
+        const downloadId = String(file && (file.downloadId || getDownloadIdFromUrl(file.url)) || '');
+        const grant = downloadId && foundryGeneratedFiles.get(downloadId);
+        return {
+            filename,
+            type: String(file && file.type || 'file').slice(0, 40),
+            downloadId: grant && grant.userId === userId ? downloadId : '',
+            url: grant && grant.userId === userId ? `/api/ai-agent-file/${encodeURIComponent(downloadId)}` : ''
+        };
+    });
+}
+
+function sanitizeSessionRecord(raw, userId) {
+    if (!raw || typeof raw !== 'object') return null;
+    const id = String(raw.id || '');
+    if (!/^[a-zA-Z0-9_-]{1,160}$/.test(id)) return null;
+    const messages = (Array.isArray(raw.messages) ? raw.messages : []).slice(-200).map(message => {
+        const role = message && message.role === 'assistant' ? 'assistant' : 'user';
+        const clean = {
+            role,
+            content: String(message && message.content || '').slice(0, 30000),
+            userText: String(message && message.userText || '').slice(0, 30000)
+        };
+        if (role === 'user') clean.mediaHtml = sanitizeUserMediaHtml(message && message.mediaHtml);
+        if (role === 'assistant') {
+            clean.sources = (Array.isArray(message && message.sources) ? message.sources : []).slice(0, 12)
+                .map(source => ({
+                    title: String(source && source.title || '').slice(0, 180),
+                    url: /^https:\/\//i.test(String(source && source.url || '')) ? String(source.url).slice(0, 2000) : ''
+                }))
+                .filter(source => source.url);
+            clean.generatedFiles = sanitizeGeneratedFiles(message && (message.generatedFiles || message.files), userId);
+        }
+        return clean;
+    });
+    return {
+        id,
+        title: String(raw.title || '新聊天').slice(0, 120),
+        pinned: Boolean(raw.pinned),
+        createdAt: Number(raw.createdAt) || Date.now(),
+        updatedAt: Number(raw.updatedAt) || Date.now(),
+        parentSessionId: /^[a-zA-Z0-9_-]{1,160}$/.test(String(raw.parentSessionId || '')) ? String(raw.parentSessionId) : null,
+        rootSessionId: /^[a-zA-Z0-9_-]{1,160}$/.test(String(raw.rootSessionId || '')) ? String(raw.rootSessionId) : null,
+        branchDepth: Math.min(12, Math.max(0, Number(raw.branchDepth) || 0)),
+        branchedFromMessageIndex: Number.isInteger(raw.branchedFromMessageIndex) ? raw.branchedFromMessageIndex : null,
+        branchedFromMessagePreview: String(raw.branchedFromMessagePreview || '').slice(0, 200),
+        needsHistorySeed: Boolean(raw.needsHistorySeed),
+        messages
+    };
+}
+
 // ==========================================
 // 3. 处理 AI 聊天记录保存和读取的接口 (Cosmos DB)
 // ==========================================
-app.post('/api/sessions', async (req, res) => {
+app.post('/api/sessions', requireApiAccess, limitRequests('session-write', 120, 60 * 60 * 1000), async (req, res) => {
     try {
-        const sessions = Array.isArray(req.body.sessions) ? req.body.sessions : [];
-        const { userName } = req.body; 
-        if (!userName) return res.json({ success: false, msg: "缺少用户身份" });
+        const sessions = (Array.isArray(req.body.sessions) ? req.body.sessions : [])
+            .slice(0, 100)
+            .map(session => sanitizeSessionRecord(session, req.auth.userId))
+            .filter(Boolean);
+        const userName = req.auth.userId;
 
         if(process.env.MONGODB_URI) {
             const currentSessionIds = sessions.map(s => s.id);
@@ -1486,23 +1492,7 @@ app.post('/api/sessions', async (req, res) => {
                 await AiSession.deleteMany({ userName: userName });
             }
 
-            // 第三步：再执行原有的循环保存逻辑
             for (const s of sessions) {
-                // 处理图片链接（保持你原有的逻辑不变）
-                for (const msg of s.messages) {
-                    if (msg.mediaHtml && msg.mediaHtml.includes('data:image')) {
-                        const matches = msg.mediaHtml.match(/src="(data:image[^"]+)"/g);
-                        if (matches) {
-                            for (const match of matches) {
-                                const b64 = match.replace('src="', '').replace('"', '');
-                                const url = await uploadBase64ToBlob(b64);
-                                msg.mediaHtml = msg.mediaHtml.replace(b64, url);
-                            }
-                        }
-                    }
-                }
-                
-                // 更新或插入
                 await AiSession.findOneAndUpdate(
                     { sessionId: s.id, userName: userName }, 
                     { $set: { sessionId: s.id, userName: userName, data: s } }, 
@@ -1517,19 +1507,23 @@ app.post('/api/sessions', async (req, res) => {
     }
 });
 
-app.get('/api/sessions', async (req, res) => {
+app.get('/api/sessions', requireApiAccess, async (req, res) => {
     try {
         if(!process.env.MONGODB_URI) return res.json([]);
-        const userName = req.query.userName; 
-        const docs = await AiSession.find(userName ? { userName: userName } : {}).lean();
+        const docs = await AiSession.find({ userName: req.auth.userId }).lean();
         res.json(docs.map(d => d.data));
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/ai-agent-file/:containerId/:fileId', async (req, res) => {
+app.get('/api/ai-agent-file/:downloadId', requireApiAccess, async (req, res) => {
     try {
-        const filename = getFileNameFromPath(req.query.filename || req.params.fileId, 'agent-output');
-        const file = await downloadFoundryAgentFile(req.params.containerId, req.params.fileId);
+        pruneGeneratedFileGrants();
+        const grant = foundryGeneratedFiles.get(String(req.params.downloadId || ''));
+        if (!grant || grant.userId !== req.auth.userId) {
+            return res.status(404).json({ error: '文件不存在或安全访问已过期。请重新生成或上传该文件。' });
+        }
+        const filename = getFileNameFromPath(grant.filename, 'agent-output');
+        const file = await downloadFoundryAgentFile(grant.containerId, grant.fileId);
         res.setHeader('Content-Type', contentTypeForFileName(filename, file.contentType || 'application/octet-stream'));
         res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
         res.send(file.buffer);
@@ -1539,38 +1533,23 @@ app.get('/api/ai-agent-file/:containerId/:fileId', async (req, res) => {
     }
 });
 
-app.get('/api/ai-agent-file/:fileId', async (req, res) => {
-    try {
-        const cached = foundryGeneratedFiles.get(req.params.fileId);
-        const filename = getFileNameFromPath(req.query.filename || (cached && cached.filename) || req.params.fileId, 'agent-output');
-        const file = await downloadFoundryAgentFile("", req.params.fileId);
-        res.setHeader('Content-Type', contentTypeForFileName(filename, file.contentType || 'application/octet-stream'));
-        res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
-        res.send(file.buffer);
-    } catch (err) {
-        console.error('下载 Foundry Agent 生成文件失败:', err);
-        res.status(500).json({ error: err.message || '下载文件失败' });
-    }
-});
-
-app.get('/api/status', (req, res) => {
+app.get('/api/status', requireApiAccess, (req, res) => {
     res.json({
         "数据库是否连接": mongoose.connection.readyState === 1 ? "✅ 正常" : "❌ 未连接",
         "MONGODB_URI 是否已读到": !!process.env.MONGODB_URI ? "✅ 是" : "❌ 否",
         "云存储是否配置": !!process.env.AZURE_STORAGE_CONNECTION_STRING ? "✅ 是" : "❌ 否",
-        "Azure OpenAI 聊天 endpoint": !!endpoint ? "✅ 是" : "❌ 否",
-        "Azure OpenAI API key": !!apiKey ? "✅ 是" : "❌ 否",
-        "Foundry Project Endpoint/Web Search": !!foundryProjectEndpoint ? "✅ 是" : "❌ 否",
-        "Foundry Agent 是否启用": shouldUseFoundryAgentForChat([]) ? "✅ 是" : "❌ 否",
+        "个人访问保护": apiAccessConfigured ? "✅ 已配置" : "❌ 未配置",
+        "Foundry Project Endpoint": !!foundryProjectEndpoint ? "✅ 是" : "❌ 否",
+        "Foundry Agent 是否可用": !!foundryProjectEndpoint && !!foundryAgentName ? "✅ 是" : "❌ 否",
         "Foundry Agent 名称": foundryAgentName,
         "Foundry Agent 版本": foundryAgentVersion || "默认最新版",
-        "聊天模型部署名": deployment,
         "Foundry 模型部署名": foundryDeployment,
-        "图片模型部署名": imageDeployment
+        "GPT Image 2 部署名": imageDeployment,
+        "图片专用 API key": imageApiKey ? "✅ 是" : "❌ 否"
     });
 });
 
-app.get('/api/test-db', async (req, res) => {
+app.get('/api/test-db', requireApiAccess, async (req, res) => {
     try {
         const testData = { msgType: 'sys_test', msg: 'Hello Azure Cosmos DB!', time: new Date().toISOString() };
         const created = await WsMessage.create(testData);
