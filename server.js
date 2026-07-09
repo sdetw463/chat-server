@@ -422,16 +422,8 @@ function buildFoundryAgentUserContent(userMessage, documents, reasoningMode, sho
     const contentDocs = docs.filter(doc => doc && doc.content);
     const parts = [];
 
-    for (const doc of fileDocs) {
-        parts.push({
-            type: "input_file",
-            filename: safeFileName(doc.name || "attachment"),
-            file_data: doc.fileData
-        });
-    }
-
     const fileSummary = fileDocs.length
-        ? "\n\n本轮用户上传了这些原始附件，已作为 input_file 提供给你和代码解释器：\n"
+        ? "\n\n本轮用户上传了这些原始附件，后端已上传到 Foundry 并挂载到代码解释器容器：\n"
             + fileDocs.map(doc => `- ${safeFileName(doc.name || "attachment")} (${doc.mimeType || "application/octet-stream"}, ${doc.size || 0} bytes)`).join("\n")
         : "";
     const text = `${buildFoundryAgentUserMessage(userMessage, contentDocs, reasoningMode, shouldSearch)}${fileSummary}`.trim() || "你好";
@@ -460,9 +452,114 @@ async function postFoundryOpenAI(pathPart, body) {
     return response.json();
 }
 
-function buildFoundryAgentReference() {
-    const reference = { name: foundryAgentName, type: "agent_reference" };
-    if (foundryAgentVersion) reference.version = String(foundryAgentVersion);
+function getFoundryProjectBaseUrl() {
+    if (!foundryProjectEndpoint) throw new Error("未配置 FOUNDRY_PROJECT_ENDPOINT，无法调用 Foundry Agent。");
+    return `${stripTrailingSlash(foundryProjectEndpoint)}/`;
+}
+
+async function postFoundryProject(pathPart, body) {
+    const cleanPath = String(pathPart || "").replace(/^\/+/, "");
+    const response = await fetch(`${getFoundryProjectBaseUrl()}${cleanPath}`, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            ...(await getResponsesAuthHeaders("entra"))
+        },
+        body: JSON.stringify(body || {})
+    });
+    if (!response.ok) {
+        throw new Error(await readAzureTextError(response));
+    }
+    return response.json();
+}
+
+async function deleteFoundryProject(pathPart) {
+    const cleanPath = String(pathPart || "").replace(/^\/+/, "");
+    const response = await fetch(`${getFoundryProjectBaseUrl()}${cleanPath}`, {
+        method: "DELETE",
+        headers: await getResponsesAuthHeaders("entra")
+    });
+    if (!response.ok && response.status !== 404) {
+        throw new Error(await readAzureTextError(response));
+    }
+    return true;
+}
+
+function parseDataUrlFile(doc) {
+    const match = String(doc && doc.fileData || "").match(/^data:([^;]+);base64,(.+)$/i);
+    if (!match) return null;
+    const filename = safeFileName(doc.name || "attachment");
+    return {
+        filename,
+        mimeType: doc.mimeType || match[1] || "application/octet-stream",
+        buffer: Buffer.from(match[2], "base64")
+    };
+}
+
+async function uploadFoundryAssistantFile(doc) {
+    const parsed = parseDataUrlFile(doc);
+    if (!parsed || !parsed.buffer.length) throw new Error(`附件 ${doc && doc.name || ""} 不是有效文件数据。`);
+    const form = new FormData();
+    form.append("purpose", "assistants");
+    form.append("file", new Blob([parsed.buffer], { type: parsed.mimeType }), parsed.filename);
+    const response = await fetch(`${getFoundryOpenAIBaseUrl()}files`, {
+        method: "POST",
+        headers: await getResponsesAuthHeaders("entra"),
+        body: form
+    });
+    if (!response.ok) {
+        throw new Error(await readAzureTextError(response));
+    }
+    const data = await response.json();
+    if (!data.id) throw new Error(`附件 ${parsed.filename} 上传到 Foundry 后没有返回 file id。`);
+    return {
+        id: data.id,
+        filename: parsed.filename,
+        mimeType: parsed.mimeType,
+        bytes: parsed.buffer.length
+    };
+}
+
+function buildTransientAgentName() {
+    const suffix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    return `tuo-upload-${suffix}`;
+}
+
+async function createFoundryFileAgent(uploadedFiles) {
+    const agentName = buildTransientAgentName();
+    const fileIds = uploadedFiles.map(file => file.id).filter(Boolean);
+    const created = await postFoundryProject("agents?api-version=v1", {
+        name: agentName,
+        definition: {
+            kind: "prompt",
+            model: foundryDeployment,
+            instructions: TUOTUO_SYSTEM_INSTRUCTIONS,
+            tools: [
+                {
+                    type: "code_interpreter",
+                    container: {
+                        type: "auto",
+                        file_ids: fileIds
+                    }
+                }
+            ]
+        },
+        description: "Temporary TuoTuo agent with uploaded user files for code interpreter."
+    });
+    return {
+        name: created.name || agentName,
+        version: created.version || created.agent_version || created.agentVersion || "",
+        temporary: true
+    };
+}
+
+function buildFoundryAgentReference(agentOverride) {
+    const reference = {
+        name: agentOverride && agentOverride.name || foundryAgentName,
+        type: "agent_reference"
+    };
+    const version = agentOverride && agentOverride.version || foundryAgentVersion;
+    if (version) reference.version = String(version);
     return reference;
 }
 
@@ -608,16 +705,26 @@ function buildAgentFallbackInput(userMessage, documents, historyMessages, reason
 
 async function runFoundryAgentChat({ userMessage, documents, historyMessages, reasoningMode, sessionId }) {
     const shouldSearch = shouldExpectWebSearch(userMessage, reasoningMode);
+    const rawFileDocs = (Array.isArray(documents) ? documents : []).filter(isInlineInputFileDocument).slice(0, 5);
+    let temporaryAgent = null;
+    let uploadedFiles = [];
     const content = buildFoundryAgentUserContent(userMessage, documents, reasoningMode, shouldSearch);
-    const agentBody = { agent_reference: buildFoundryAgentReference() };
+    if (rawFileDocs.length) {
+        uploadedFiles = [];
+        for (const doc of rawFileDocs) {
+            uploadedFiles.push(await uploadFoundryAssistantFile(doc));
+        }
+        temporaryAgent = await createFoundryFileAgent(uploadedFiles);
+    }
+    const agentBody = { agent_reference: buildFoundryAgentReference(temporaryAgent) };
     let conversationId = sessionId ? foundryAgentConversations.get(sessionId) : null;
     let response;
 
     try {
-        if (!conversationId) {
+        if (!conversationId || temporaryAgent) {
             const conversation = await postFoundryOpenAI("conversations", {});
             conversationId = conversation && conversation.id;
-            if (sessionId && conversationId) foundryAgentConversations.set(sessionId, conversationId);
+            if (sessionId && conversationId && !temporaryAgent) foundryAgentConversations.set(sessionId, conversationId);
         }
 
         response = await postFoundryOpenAI("responses", {
@@ -633,6 +740,11 @@ async function runFoundryAgentChat({ userMessage, documents, historyMessages, re
             stream: false,
             ...agentBody
         });
+    } finally {
+        if (temporaryAgent && temporaryAgent.name) {
+            deleteFoundryProject(`agents/${encodeURIComponent(temporaryAgent.name)}?api-version=v1`)
+                .catch(error => console.error("清理临时 Foundry Agent 失败:", error.message || error));
+        }
     }
 
     return {
@@ -640,7 +752,8 @@ async function runFoundryAgentChat({ userMessage, documents, historyMessages, re
         sources: extractCitationSources(response),
         files: extractGeneratedFiles(response),
         conversationId,
-        rawResponseId: response && response.id
+        rawResponseId: response && response.id,
+        uploadedFiles
     };
 }
 
