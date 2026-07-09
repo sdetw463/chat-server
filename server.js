@@ -471,8 +471,6 @@ function normalizeAgentFileRecord(file, index = 0) {
     };
     if (record.containerId) {
         record.url = `/api/ai-agent-file/${encodeURIComponent(record.containerId)}/${encodeURIComponent(record.fileId)}?filename=${encodeURIComponent(filename)}`;
-    } else {
-        record.url = `/api/ai-agent-file/${encodeURIComponent(record.fileId)}?filename=${encodeURIComponent(filename)}`;
     }
     return record;
 }
