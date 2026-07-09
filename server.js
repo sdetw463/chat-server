@@ -555,10 +555,14 @@ async function createFoundryFileAgent(uploadedFiles) {
 
 function buildFoundryAgentReference(agentOverride) {
     const reference = {
-        name: agentOverride && agentOverride.name || foundryAgentName,
+        name: (agentOverride && agentOverride.name) || foundryAgentName,
         type: "agent_reference"
     };
-    const version = agentOverride && agentOverride.version || foundryAgentVersion;
+
+    const version = agentOverride
+        ? agentOverride.version
+        : foundryAgentVersion;
+
     if (version) reference.version = String(version);
     return reference;
 }
