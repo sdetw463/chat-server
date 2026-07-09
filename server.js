@@ -86,6 +86,9 @@ const foundryDeployment = process.env.FOUNDRY_MODEL_DEPLOYMENT
 const foundryAgentName = process.env.FOUNDRY_AGENT_NAME
     || process.env.AZURE_AI_AGENT_NAME
     || "tuo-agent";
+const foundryAgentVersion = process.env.FOUNDRY_AGENT_VERSION
+    || process.env.AZURE_AI_AGENT_VERSION
+    || "";
 const foundryAgentEnabled = String(process.env.FOUNDRY_AGENT_ENABLED || "true").toLowerCase() !== "false";
 const foundryAgentConversations = new Map();
 const imageEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || process.env.AZURE_OPENAI_ENDPOINT || process.env.AZURE_OPENAI_API_BASE;
@@ -425,6 +428,12 @@ async function postFoundryOpenAI(pathPart, body) {
     return response.json();
 }
 
+function buildFoundryAgentReference() {
+    const reference = { name: foundryAgentName, type: "agent_reference" };
+    if (foundryAgentVersion) reference.version = String(foundryAgentVersion);
+    return reference;
+}
+
 async function getFoundryBinary(pathPart) {
     const cleanPath = String(pathPart || "").replace(/^\/+/, "");
     const response = await fetch(`${getFoundryOpenAIBaseUrl()}${cleanPath}`, {
@@ -518,25 +527,20 @@ function buildAgentFallbackInput(userMessage, documents, historyMessages, reason
 async function runFoundryAgentChat({ userMessage, documents, historyMessages, reasoningMode, sessionId }) {
     const shouldSearch = shouldExpectWebSearch(userMessage, reasoningMode);
     const content = buildFoundryAgentUserMessage(userMessage, documents, reasoningMode, shouldSearch);
-    const agentBody = { agent: { name: foundryAgentName, type: "agent_reference" } };
+    const agentBody = { agent_reference: buildFoundryAgentReference() };
     let conversationId = sessionId ? foundryAgentConversations.get(sessionId) : null;
     let response;
 
     try {
         if (!conversationId) {
-            const conversation = await postFoundryOpenAI("conversations", {
-                items: [{ type: "message", role: "user", content }]
-            });
+            const conversation = await postFoundryOpenAI("conversations", {});
             conversationId = conversation && conversation.id;
             if (sessionId && conversationId) foundryAgentConversations.set(sessionId, conversationId);
-        } else {
-            await postFoundryOpenAI(`conversations/${encodeURIComponent(conversationId)}/items`, {
-                items: [{ type: "message", role: "user", content }]
-            });
         }
 
         response = await postFoundryOpenAI("responses", {
             conversation: conversationId,
+            input: [{ role: "user", content }],
             stream: false,
             ...agentBody
         });
@@ -636,6 +640,7 @@ function buildResponsesInput(userMessage, images, documents, historyMessages, re
 }
 
 async function getAzureAccessToken() {
+    if (process.env.AZURE_AI_AUTH_TOKEN) return process.env.AZURE_AI_AUTH_TOKEN;
     if (process.env.AZURE_OPENAI_AUTH_TOKEN) return process.env.AZURE_OPENAI_AUTH_TOKEN;
     const token = await azureCredential.getToken("https://ai.azure.com/.default");
     if (!token || !token.token) throw new Error("无法通过 DefaultAzureCredential 获取 Azure 访问令牌。请先 az login，或在 Azure App Service 配置托管身份，或改用 AZURE_OPENAI_API_KEY。");
@@ -683,12 +688,19 @@ function selectResponsesTarget(needWebSearch) {
 
 async function readAzureTextError(response) {
     const text = await response.text();
-    if (!text) return `Azure Responses API 请求失败：HTTP ${response.status}`;
+    const requestId = response.headers.get("x-ms-request-id")
+        || response.headers.get("apim-request-id")
+        || response.headers.get("x-request-id");
+    const detailParts = [`HTTP ${response.status}`];
+    if (response.statusText) detailParts.push(response.statusText);
+    if (requestId) detailParts.push(`request_id=${requestId}`);
+    if (!text) return `Azure Responses API 请求失败：${detailParts.join(" / ")}`;
     try {
         const parsed = JSON.parse(text);
-        return parsed.error?.message || parsed.message || JSON.stringify(parsed.error || parsed);
+        const message = parsed.error?.message || parsed.message || JSON.stringify(parsed.error || parsed);
+        return `Azure Responses API 请求失败：${detailParts.join(" / ")}：${message}`;
     } catch {
-        return text;
+        return `Azure Responses API 请求失败：${detailParts.join(" / ")}：${text}`;
     }
 }
 
@@ -1224,6 +1236,7 @@ app.get('/api/status', (req, res) => {
         "Foundry Project Endpoint/Web Search": !!foundryProjectEndpoint ? "✅ 是" : "❌ 否",
         "Foundry Agent 是否启用": shouldUseFoundryAgentForChat([]) ? "✅ 是" : "❌ 否",
         "Foundry Agent 名称": foundryAgentName,
+        "Foundry Agent 版本": foundryAgentVersion || "默认最新版",
         "聊天模型部署名": deployment,
         "Foundry 模型部署名": foundryDeployment,
         "图片模型部署名": imageDeployment
