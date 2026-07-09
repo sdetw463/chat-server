@@ -12,11 +12,6 @@ const allowedOrigins = String(process.env.APP_ALLOWED_ORIGINS || '')
     .split(',')
     .map(origin => origin.trim().replace(/\/+$/, ''))
     .filter(Boolean);
-const sessionSecret = process.env.TUOTUO_SESSION_SECRET || '';
-const apiSessionTtlMs = Math.min(365, Math.max(1, Number(process.env.TUOTUO_SESSION_DAYS || 90))) * 24 * 60 * 60 * 1000;
-const apiAccessConfigured = Boolean(sessionSecret && allowedOrigins.length);
-const loginAttempts = new Map();
-const rateLimitBuckets = new Map();
 
 app.use(cors({
     origin(origin, callback) {
@@ -30,171 +25,6 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '35mb' }));
 app.use(express.urlencoded({ limit: '35mb', extended: true }));
-
-function timingSafeEqualText(left, right) {
-    const a = Buffer.from(String(left || ''), 'utf8');
-    const b = Buffer.from(String(right || ''), 'utf8');
-    return a.length === b.length && crypto.timingSafeEqual(a, b);
-}
-
-function signApiSessionPayload(payload) {
-    return crypto.createHmac('sha256', sessionSecret).update(payload).digest('base64url');
-}
-
-function createApiSession(userId) {
-    const payload = Buffer.from(JSON.stringify({ sub: userId, exp: Date.now() + apiSessionTtlMs, v: 2 })).toString('base64url');
-    return `${payload}.${signApiSessionPayload(payload)}`;
-}
-
-function getApiSession(req) {
-    const header = String(req.get('authorization') || '');
-    const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
-    if (!token || !sessionSecret) return null;
-    const [payload, signature] = token.split('.');
-    if (!payload || !signature || !timingSafeEqualText(signature, signApiSessionPayload(payload))) return null;
-    try {
-        const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
-        if (!parsed || parsed.v !== 2 || !parsed.sub || Number(parsed.exp) <= Date.now()) return null;
-        return { userId: String(parsed.sub) };
-    } catch {
-        return null;
-    }
-}
-
-function requireApiAccess(req, res, next) {
-    if (!apiAccessConfigured) {
-        return res.status(503).json({ error: '账号访问尚未配置。请在服务端设置 TUOTUO_SESSION_SECRET 和 APP_ALLOWED_ORIGINS。' });
-    }
-    const auth = getApiSession(req);
-    if (!auth) return res.status(401).json({ error: '需要个人访问验证。' });
-    req.auth = auth;
-    return next();
-}
-
-function limitRequests(name, maxRequests, windowMs) {
-    return (req, res, next) => {
-        const userId = req.auth && req.auth.userId || req.ip || 'anonymous';
-        const key = `${name}:${userId}`;
-        const now = Date.now();
-        const entries = (rateLimitBuckets.get(key) || []).filter(time => now - time < windowMs);
-        if (entries.length >= maxRequests) {
-            const retryAfter = Math.max(1, Math.ceil((windowMs - (now - entries[0])) / 1000));
-            res.setHeader('Retry-After', String(retryAfter));
-            return res.status(429).json({ error: `请求过于频繁，请在 ${retryAfter} 秒后再试。` });
-        }
-        entries.push(now);
-        rateLimitBuckets.set(key, entries);
-        return next();
-    };
-}
-
-function limitLoginAttempts(req, res, next) {
-    const key = req.ip || 'unknown';
-    const now = Date.now();
-    const attempts = (loginAttempts.get(key) || []).filter(time => now - time < 15 * 60 * 1000);
-    if (attempts.length >= 8) return res.status(429).json({ error: '尝试次数过多，请 15 分钟后再试。' });
-    req.loginAttemptKey = key;
-    return next();
-}
-
-function normalizeAccountUsername(value) {
-    return String(value || '').trim().toLowerCase();
-}
-
-function isValidAccountUsername(username) {
-    return /^[a-z0-9_\-\u4e00-\u9fff]{3,24}$/.test(username);
-}
-
-function isValidAccountPassword(password) {
-    return typeof password === 'string' && password.length >= 8 && password.length <= 128;
-}
-
-function derivePasswordKey(password, salt) {
-    return new Promise((resolve, reject) => {
-        crypto.scrypt(password, salt, 64, (error, key) => error ? reject(error) : resolve(key));
-    });
-}
-
-async function hashAccountPassword(password) {
-    const salt = crypto.randomBytes(16).toString('base64url');
-    const key = await derivePasswordKey(password, salt);
-    return `scrypt$${salt}$${key.toString('base64url')}`;
-}
-
-async function verifyAccountPassword(password, storedHash) {
-    const [algorithm, salt, expected] = String(storedHash || '').split('$');
-    if (algorithm !== 'scrypt' || !salt || !expected) return false;
-    const key = await derivePasswordKey(password, salt);
-    return timingSafeEqualText(key.toString('base64url'), expected);
-}
-
-function accountSetupError(res) {
-    if (!process.env.MONGODB_URI || mongoose.connection.readyState !== 1) {
-        res.status(503).json({ error: '账号数据库暂不可用，请稍后重试。' });
-        return true;
-    }
-    return false;
-}
-
-function recordFailedLogin(req) {
-    const attempts = loginAttempts.get(req.loginAttemptKey) || [];
-    attempts.push(Date.now());
-    loginAttempts.set(req.loginAttemptKey, attempts);
-}
-
-app.post('/api/auth/register', limitLoginAttempts, async (req, res) => {
-    if (!apiAccessConfigured) {
-        return res.status(503).json({ error: '账号访问尚未配置。' });
-    }
-    if (accountSetupError(res)) return;
-    const username = normalizeAccountUsername(req.body && req.body.username);
-    const password = String(req.body && req.body.password || '');
-    if (!isValidAccountUsername(username)) {
-        return res.status(400).json({ error: '用户名需为 3-24 位小写字母、数字、中文、下划线或连字符。' });
-    }
-    if (!isValidAccountPassword(password)) {
-        return res.status(400).json({ error: '个人密码需为 8-128 个字符。' });
-    }
-    try {
-        const passwordHash = await hashAccountPassword(password);
-        await AiUser.create({ username, passwordHash });
-    } catch (error) {
-        if (error && error.code === 11000) return res.status(409).json({ error: '这个用户名已被使用，请换一个。' });
-        const requestId = crypto.randomUUID();
-        console.error(`创建 AI 用户失败 [${requestId}]:`, error);
-        return res.status(500).json({ error: `创建账号失败，请稍后重试（${requestId}）。` });
-    }
-    loginAttempts.delete(req.loginAttemptKey);
-    return res.status(201).json({ accessToken: createApiSession(username), username, expiresInSeconds: Math.floor(apiSessionTtlMs / 1000) });
-});
-
-app.post('/api/auth/login', limitLoginAttempts, async (req, res) => {
-    if (!apiAccessConfigured) return res.status(503).json({ error: '账号访问尚未配置。' });
-    if (accountSetupError(res)) return;
-    const username = normalizeAccountUsername(req.body && req.body.username);
-    const password = String(req.body && req.body.password || '');
-    if (!isValidAccountUsername(username) || !password) return res.status(400).json({ error: '请输入用户名和个人密码。' });
-    try {
-        const user = await AiUser.findOne({ username }).lean();
-        if (!user) {
-            recordFailedLogin(req);
-            return res.status(404).json({ error: '用户不存在。' });
-        }
-        if (!await verifyAccountPassword(password, user.passwordHash)) {
-            recordFailedLogin(req);
-            return res.status(401).json({ error: '用户名或密码不正确。' });
-        }
-        loginAttempts.delete(req.loginAttemptKey);
-        return res.json({ accessToken: createApiSession(username), username, expiresInSeconds: Math.floor(apiSessionTtlMs / 1000) });
-    } catch (error) {
-        console.error('AI 用户登录失败:', error);
-        return res.status(500).json({ error: '登录失败，请稍后重试。' });
-    }
-});
-
-app.get('/api/auth/session', requireApiAccess, (req, res) => {
-    res.json({ authenticated: true, userId: req.auth.userId });
-});
 
 // ==========================================
 // 1. 初始化数据库和对象存储
@@ -214,25 +44,6 @@ const wsMsgSchema = new mongoose.Schema({
     likedBy: [String], entryId: String
 }, { strict: false, timestamps: true });
 const WsMessage = mongoose.model('WsMessage', wsMsgSchema, 'chat_history');
-
-const aiSessionSchema = new mongoose.Schema({
-    sessionId: String,
-    userName: String,
-    data: Object,
-    foundryConversationId: String,
-    foundryVectorStoreId: String,
-    foundryFileIds: [String]
-}, { strict: false, timestamps: true });
-const AiSession = mongoose.model('AiSession', aiSessionSchema, 'ai_sessions');
-
-const aiUserSchema = new mongoose.Schema({
-    username: { type: String, required: true, unique: true, index: true },
-    passwordHash: { type: String, required: true }
-}, { timestamps: true });
-const AiUser = mongoose.model('AiUser', aiUserSchema, 'ai_users');
-const ensureAiUserIndex = () => AiUser.init().catch(error => console.error('创建 AI 用户名唯一索引失败:', error));
-if (mongoose.connection.readyState === 1) ensureAiUserIndex();
-else mongoose.connection.once('connected', ensureAiUserIndex);
 
 let containerClient = null;
 if (process.env.AZURE_STORAGE_CONNECTION_STRING) {
@@ -1310,11 +1121,11 @@ function buildAgentRequestFromHttp(req, images) {
         reasoningMode: ['normal', 'think', 'research'].includes(req.body.reasoningMode) ? req.body.reasoningMode : 'normal',
         sessionId: String(req.body.sessionId || '').slice(0, 160) || null,
         sessionFiles: Array.isArray(req.body.sessionFiles) ? req.body.sessionFiles : [],
-        userId: req.auth.userId
+        userId: 'public'
     };
 }
 
-app.post('/api/ai-chat', requireApiAccess, limitRequests('agent-chat', 30, 15 * 60 * 1000), async (req, res) => {
+app.post('/api/ai-chat', async (req, res) => {
     const wantsStream = req.body.stream === true || req.body.stream === 'true';
     try {
         const images = await prepareAgentImages(req.body.images || req.body.image || []);
@@ -1347,7 +1158,7 @@ app.post('/api/ai-chat', requireApiAccess, limitRequests('agent-chat', 30, 15 * 
     }
 });
 
-app.post('/api/ai-image', requireApiAccess, limitRequests('image-generation', 12, 15 * 60 * 1000), async (req, res) => {
+app.post('/api/ai-image', async (req, res) => {
     try {
         const prompt = String(req.body.prompt || '').trim();
         const images = Array.isArray(req.body.images) ? req.body.images : (req.body.images ? [req.body.images] : []);
@@ -1483,131 +1294,16 @@ app.post('/api/ai-image', requireApiAccess, limitRequests('image-generation', 12
     }
 });
 
-function escapeHtmlAttribute(value) {
-    return String(value || '')
-        .replace(/&/g, '&amp;')
-        .replace(/"/g, '&quot;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
-}
-
-function sanitizeUserMediaHtml(value) {
-    const imageUrls = [...String(value || '').matchAll(/src="([^"]+)"/g)]
-        .map(match => String(match[1] || '').trim())
-        .filter(url => /^https:\/\//i.test(url))
-        .slice(0, 4);
-    return imageUrls.map(url => `<img src="${escapeHtmlAttribute(url)}" class="gpt-user-image">`).join('');
-}
-
-function sanitizeGeneratedFiles(files, userId) {
-    pruneGeneratedFileGrants();
-    return (Array.isArray(files) ? files : []).slice(0, 12).map(file => {
-        const filename = getFileNameFromPath(file && (file.filename || file.name || file.fileName), 'agent-output');
-        const downloadId = String(file && (file.downloadId || getDownloadIdFromUrl(file.url)) || '');
-        const grant = downloadId && foundryGeneratedFiles.get(downloadId);
-        return {
-            filename,
-            type: String(file && file.type || 'file').slice(0, 40),
-            downloadId: grant && grant.userId === userId ? downloadId : '',
-            url: grant && grant.userId === userId ? `/api/ai-agent-file/${encodeURIComponent(downloadId)}` : ''
-        };
-    });
-}
-
-function sanitizeSessionRecord(raw, userId) {
-    if (!raw || typeof raw !== 'object') return null;
-    const id = String(raw.id || '');
-    if (!/^[a-zA-Z0-9_-]{1,160}$/.test(id)) return null;
-    const messages = (Array.isArray(raw.messages) ? raw.messages : []).slice(-200).map(message => {
-        const role = message && message.role === 'assistant' ? 'assistant' : 'user';
-        const clean = {
-            role,
-            content: String(message && message.content || '').slice(0, 30000),
-            userText: String(message && message.userText || '').slice(0, 30000)
-        };
-        if (role === 'user') clean.mediaHtml = sanitizeUserMediaHtml(message && message.mediaHtml);
-        if (role === 'assistant') {
-            clean.sources = (Array.isArray(message && message.sources) ? message.sources : []).slice(0, 12)
-                .map(source => ({
-                    title: String(source && source.title || '').slice(0, 180),
-                    url: /^https:\/\//i.test(String(source && source.url || '')) ? String(source.url).slice(0, 2000) : ''
-                }))
-                .filter(source => source.url);
-            clean.generatedFiles = sanitizeGeneratedFiles(message && (message.generatedFiles || message.files), userId);
-        }
-        return clean;
-    });
-    return {
-        id,
-        title: String(raw.title || '新聊天').slice(0, 120),
-        pinned: Boolean(raw.pinned),
-        createdAt: Number(raw.createdAt) || Date.now(),
-        updatedAt: Number(raw.updatedAt) || Date.now(),
-        parentSessionId: /^[a-zA-Z0-9_-]{1,160}$/.test(String(raw.parentSessionId || '')) ? String(raw.parentSessionId) : null,
-        rootSessionId: /^[a-zA-Z0-9_-]{1,160}$/.test(String(raw.rootSessionId || '')) ? String(raw.rootSessionId) : null,
-        branchDepth: Math.min(12, Math.max(0, Number(raw.branchDepth) || 0)),
-        branchedFromMessageIndex: Number.isInteger(raw.branchedFromMessageIndex) ? raw.branchedFromMessageIndex : null,
-        branchedFromMessagePreview: String(raw.branchedFromMessagePreview || '').slice(0, 200),
-        needsHistorySeed: Boolean(raw.needsHistorySeed),
-        messages
-    };
-}
-
-// ==========================================
-// 3. 处理 AI 聊天记录保存和读取的接口 (Cosmos DB)
-// ==========================================
-app.post('/api/sessions', requireApiAccess, limitRequests('session-write', 120, 60 * 60 * 1000), async (req, res) => {
-    try {
-        const sessions = (Array.isArray(req.body.sessions) ? req.body.sessions : [])
-            .slice(0, 100)
-            .map(session => sanitizeSessionRecord(session, req.auth.userId))
-            .filter(Boolean);
-        const userName = req.auth.userId;
-
-        if(process.env.MONGODB_URI) {
-            const currentSessionIds = sessions.map(s => s.id);
-            const canReplaceSessionList = req.body.clientLoadedAllSessions === true;
-
-            // 【增加安全保护】：只有当前端确实传了有效会话时，才执行差异化删除
-            // 防止前端因网络延迟还未拉取到数据时，发生意外的"清库"惨剧
-            if (canReplaceSessionList && currentSessionIds.length > 0) {
-                await AiSession.deleteMany({ 
-                    userName: userName, 
-                    sessionId: { $nin: currentSessionIds } 
-                });
-            } else if (canReplaceSessionList && sessions.length === 0 && req.body.forceDeleteAll === true) {
-                // 如果以后需要做"清空所有记录"的功能，可以靠这个显式字段来控制
-                await AiSession.deleteMany({ userName: userName });
-            }
-
-            for (const s of sessions) {
-                await AiSession.findOneAndUpdate(
-                    { sessionId: s.id, userName: userName }, 
-                    { $set: { sessionId: s.id, userName: userName, data: s } }, 
-                    { upsert: true }
-                );
-            }
-        }
-        res.json({ success: true });
-    } catch (err) { 
-        console.error("同步 AI 会话失败:", err);
-        res.status(500).json({ error: err.message }); 
-    }
+// AI 聊天记录只保存在访问者自己的浏览器中，不再写入或读取云端数据库。
+app.all('/api/sessions', (req, res) => {
+    res.status(410).json({ error: '云端 AI 聊天记录已停用；记录仅保存在当前浏览器。' });
 });
 
-app.get('/api/sessions', requireApiAccess, async (req, res) => {
-    try {
-        if(!process.env.MONGODB_URI) return res.json([]);
-        const docs = await AiSession.find({ userName: req.auth.userId }).lean();
-        res.json(docs.map(d => d.data));
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.get('/api/ai-agent-file/:downloadId', requireApiAccess, async (req, res) => {
+app.get('/api/ai-agent-file/:downloadId', async (req, res) => {
     try {
         pruneGeneratedFileGrants();
         const grant = foundryGeneratedFiles.get(String(req.params.downloadId || ''));
-        if (!grant || grant.userId !== req.auth.userId) {
+        if (!grant) {
             return res.status(404).json({ error: '文件不存在或安全访问已过期。请重新生成或上传该文件。' });
         }
         const filename = getFileNameFromPath(grant.filename, 'agent-output');
@@ -1621,12 +1317,12 @@ app.get('/api/ai-agent-file/:downloadId', requireApiAccess, async (req, res) => 
     }
 });
 
-app.get('/api/status', requireApiAccess, (req, res) => {
+app.get('/api/status', (req, res) => {
     res.json({
         "数据库是否连接": mongoose.connection.readyState === 1 ? "✅ 正常" : "❌ 未连接",
         "MONGODB_URI 是否已读到": !!process.env.MONGODB_URI ? "✅ 是" : "❌ 否",
         "云存储是否配置": !!process.env.AZURE_STORAGE_CONNECTION_STRING ? "✅ 是" : "❌ 否",
-        "个人访问保护": apiAccessConfigured ? "✅ 已配置" : "❌ 未配置",
+        "公共 AI 访问": "✅ 已启用",
         "Foundry Project Endpoint": !!foundryProjectEndpoint ? "✅ 是" : "❌ 否",
         "Foundry Agent 是否可用": !!foundryProjectEndpoint && !!foundryAgentName ? "✅ 是" : "❌ 否",
         "Foundry Agent 名称": foundryAgentName,
@@ -1637,15 +1333,8 @@ app.get('/api/status', requireApiAccess, (req, res) => {
     });
 });
 
-app.get('/api/test-db', requireApiAccess, async (req, res) => {
-    try {
-        const testData = { msgType: 'sys_test', msg: 'Hello Azure Cosmos DB!', time: new Date().toISOString() };
-        const created = await WsMessage.create(testData);
-        const history = await WsMessage.find().sort({ _id: -1 }).limit(5).lean();
-        res.json({ success: true, message: "完美！读写测试全通！", data_written: created, recent_data: history });
-    } catch (err) {
-        res.json({ success: false, error_message: err.message, stack: err.stack });
-    }
+app.all('/api/test-db', (req, res) => {
+    res.status(404).json({ error: 'Not found' });
 });
 
 app.get('/', (req, res) => { res.send("TuoTuo Server is running!"); });
