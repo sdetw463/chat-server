@@ -3,6 +3,7 @@ const http = require('http');
 const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
+const { toFile } = require('openai');
 const { DefaultAzureCredential } = require('@azure/identity');
 const { AIProjectClient } = require('@azure/ai-projects');
 const mongoose = require('mongoose');
@@ -84,6 +85,12 @@ const foundryAgentName = process.env.FOUNDRY_AGENT_NAME
 const foundryAgentVersion = process.env.FOUNDRY_AGENT_VERSION
     || process.env.AZURE_AI_AGENT_VERSION
     || "";
+const foundryFileInputSlots = String(process.env.FOUNDRY_CODE_INTERPRETER_FILE_SLOTS
+    || "attachment_file_1,attachment_file_2,attachment_file_3")
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean)
+    .slice(0, 8);
 const foundryAgentConversations = new Map();
 const foundryGeneratedFiles = new Map();
 const imageEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || process.env.AZURE_OPENAI_ENDPOINT || process.env.AZURE_OPENAI_API_BASE;
@@ -386,32 +393,19 @@ function isInlineInputFileDocument(doc) {
     return !!(doc && typeof doc.fileData === "string" && /^data:[^;]+;base64,/i.test(doc.fileData));
 }
 
-async function buildFoundryAgentUserContent(userMessage, documents, images, reasoningMode, sessionFiles, userId) {
+async function buildFoundryAgentUserContent(userMessage, documents, images, reasoningMode, sessionFiles, userId, attachmentNames = []) {
     const docs = Array.isArray(documents) ? documents : [];
     const fileDocs = docs.filter(isInlineInputFileDocument).slice(0, 5);
     const contentDocs = docs.filter(doc => doc && doc.content && !isInlineInputFileDocument(doc));
-    const parts = [{ type: "input_text", text: buildFoundryAgentUserMessage(userMessage, contentDocs, reasoningMode) }];
-
-    for (const doc of fileDocs) {
-        parts.push({
-            type: "input_file",
-            filename: safeFileName(doc.name || "attachment"),
-            file_data: doc.fileData
-        });
-    }
-
-    for (const file of normalizeSessionFiles(sessionFiles, userId).slice(-8)) {
-        try {
-            const downloaded = await downloadSessionGeneratedFile(file, userId);
-            parts.push({
-                type: "input_file",
-                filename: downloaded.filename,
-                file_data: `data:${downloaded.mimeType.split(';')[0]};base64,${downloaded.buffer.toString('base64')}`
-            });
-        } catch (error) {
-            console.error("重新附加历史文件失败:", file.filename || file.downloadId, error.message || error);
-        }
-    }
+    const names = (attachmentNames.length ? attachmentNames : fileDocs.map(doc => safeFileName(doc.name || "attachment")))
+        .slice(0, foundryFileInputSlots.length);
+    const fileSummary = names.length
+        ? `\n\n本轮已附加文件：\n${names.map(name => `- ${name}`).join('\n')}`
+        : '';
+    const parts = [{
+        type: "input_text",
+        text: `${buildFoundryAgentUserMessage(userMessage, contentDocs, reasoningMode)}${fileSummary}`
+    }];
 
     const normalizedImages = (Array.isArray(images) ? images : [images])
         .map(normalizeChatImage)
@@ -435,6 +429,63 @@ function parseDataUrlFile(doc) {
         mimeType: doc.mimeType || match[1] || "application/octet-stream",
         buffer
     };
+}
+
+async function collectFoundryCodeInterpreterFiles(documents, sessionFiles, userId) {
+    const files = [];
+    const rawDocs = (Array.isArray(documents) ? documents : [])
+        .filter(isInlineInputFileDocument)
+        .slice(0, foundryFileInputSlots.length);
+
+    for (const doc of rawDocs) {
+        const parsed = parseDataUrlFile(doc);
+        if (parsed) files.push(parsed);
+    }
+
+    const remaining = foundryFileInputSlots.length - files.length;
+    if (remaining > 0) {
+        for (const file of normalizeSessionFiles(sessionFiles, userId).slice(-remaining)) {
+            try {
+                files.push(await downloadSessionGeneratedFile(file, userId));
+            } catch (error) {
+                console.error("重新附加历史文件失败:", file.filename || file.downloadId, error.message || error);
+            }
+        }
+    }
+    return files;
+}
+
+async function uploadFoundryCodeInterpreterFiles(openai, files) {
+    const uploaded = [];
+    try {
+        for (const file of files) {
+            const uploadable = await toFile(file.buffer, file.filename, { type: file.mimeType });
+            const result = await openai.files.create({ file: uploadable, purpose: "assistants" });
+            if (!result?.id) throw new Error(`附件 ${file.filename} 上传后没有返回 file id。`);
+            uploaded.push({ id: result.id, filename: file.filename });
+        }
+        return uploaded;
+    } catch (error) {
+        await Promise.allSettled(uploaded.map(file => openai.files.delete(file.id)));
+        throw error;
+    }
+}
+
+function buildFoundryFileStructuredInputs(uploadedFiles) {
+    const values = {};
+    foundryFileInputSlots.forEach((slot, index) => {
+        values[slot] = uploadedFiles[index]?.id || "";
+    });
+    return values;
+}
+
+async function cleanupFoundryInputFiles(invocation) {
+    const files = invocation?.uploadedInputFiles || [];
+    if (!files.length) return;
+    const results = await Promise.allSettled(files.map(file => invocation.openai.files.delete(file.id)));
+    results.forEach(result => {
+        if (result.status === 'rejected') console.error('清理 Foundry 输入文件失败:', result.reason?.message || result.reason);
+    });
 }
 
 function pruneGeneratedFileGrants() {
@@ -619,49 +670,62 @@ async function prepareFoundryAgentInvocation({ userMessage, documents, images, h
         }
     }
 
+    const attachmentFiles = await collectFoundryCodeInterpreterFiles(
+        documents,
+        shouldReattachSessionFiles ? sessionFiles : [],
+        userId
+    );
+    const uploadedInputFiles = await uploadFoundryCodeInterpreterFiles(openai, attachmentFiles);
     const content = await buildFoundryAgentUserContent(
         userMessage,
         documents,
         images,
         reasoningMode,
-        shouldReattachSessionFiles ? sessionFiles : [],
-        userId
+        [],
+        userId,
+        attachmentFiles.map(file => file.filename)
     );
     const currentMessage = { type: "message", role: "user", content };
+    const agentBody = { agent_reference: buildFoundryAgentReference() };
+    if (uploadedInputFiles.length) {
+        agentBody.structured_inputs = buildFoundryFileStructuredInputs(uploadedInputFiles);
+    }
     return {
         openai,
+        uploadedInputFiles,
         conversationId,
         conversationKey,
         requestBody: {
             ...(conversationId ? { conversation: conversationId } : {}),
-            input: conversationId ? [currentMessage] : [...history, currentMessage]
+            input: conversationId ? [currentMessage] : [...history, currentMessage],
+            ...(uploadedInputFiles.length ? { tool_choice: { type: "code_interpreter" } } : {})
         },
         requestOptions: {
-            body: { agent_reference: buildFoundryAgentReference() }
+            body: agentBody
         }
     };
 }
 
 async function runFoundryAgentChat(args) {
     const invocation = await prepareFoundryAgentInvocation(args);
-    let response;
     try {
-        response = await invocation.openai.responses.create(
+        const response = await invocation.openai.responses.create(
             { ...invocation.requestBody, stream: false },
             invocation.requestOptions
         );
+        return {
+            reply: extractResponseText(response),
+            sources: extractCitationSources(response),
+            files: extractGeneratedFiles(response, args.userId),
+            conversationId: invocation.conversationId,
+            rawResponseId: response && response.id,
+        };
     } catch (error) {
         forgetInvalidConversation(invocation, error);
         throw error;
+    } finally {
+        await cleanupFoundryInputFiles(invocation);
     }
-
-    return {
-        reply: extractResponseText(response),
-        sources: extractCitationSources(response),
-        files: extractGeneratedFiles(response, args.userId),
-        conversationId: invocation.conversationId,
-        rawResponseId: response && response.id,
-    };
 }
 
 function forgetInvalidConversation(invocation, error) {
@@ -671,63 +735,88 @@ function forgetInvalidConversation(invocation, error) {
 }
 
 async function handleFoundryAgentChatSSE(args, res, abortSignal) {
-    sendSSE(res, { status: "正在调用 Foundry Agent", tool: "agent", agent: foundryAgentName });
-    const invocation = await prepareFoundryAgentInvocation(args);
-    let stream;
-    try {
-        stream = await invocation.openai.responses.create(
-            { ...invocation.requestBody, stream: true },
-            { ...invocation.requestOptions, signal: abortSignal }
-        );
-    } catch (error) {
-        forgetInvalidConversation(invocation, error);
-        throw error;
-    }
-    let response = null;
-    let streamedText = "";
-    let lastToolStatus = "";
-    const heartbeat = setInterval(() => {
-        if (!res.writableEnded && !res.destroyed) sendSSE(res, { ping: Date.now() });
-    }, 15000);
-    heartbeat.unref?.();
-
-    try {
-        for await (const event of stream) {
-            if (event.type === "response.output_text.delta" && event.delta) {
-                streamedText += event.delta;
-                sendSSE(res, { delta: event.delta });
-            } else if (event.type === "response.web_search_call.searching" && lastToolStatus !== "web_search") {
-                lastToolStatus = "web_search";
-                sendSSE(res, { status: "正在搜索并核对资料", tool: "web_search" });
-            } else if (event.type === "response.code_interpreter_call.in_progress" && lastToolStatus !== "code_interpreter") {
-                lastToolStatus = "code_interpreter";
-                sendSSE(res, { status: "正在处理或生成文件", tool: "code_interpreter" });
-            } else if (event.type === "response.completed") {
-                response = event.response;
-            } else if (event.type === "response.failed") {
-                const message = event.response?.error?.message || "Foundry Agent 响应失败。";
-                throw new Error(message);
-            } else if (event.type === "error") {
-                throw new Error(event.message || "Foundry Agent 流式响应失败。");
-            }
-        }
-    } finally {
-        clearInterval(heartbeat);
-    }
-
-    const reply = extractResponseText(response);
-    const sources = extractCitationSources(response);
-    const files = extractGeneratedFiles(response, args.userId);
-    if (sources.length) sendSSE(res, { sources });
-    if (files.length) sendSSE(res, { files });
-    if (!streamedText && reply) sendSSE(res, { delta: reply });
-    if (!streamedText && !reply) sendSSE(res, { delta: "我没有收到有效回复，请稍后再试。" });
+    const hasAttachments = Array.isArray(args.documents) && args.documents.length > 0;
     sendSSE(res, {
-        done: true,
-        foundryConversationId: invocation.conversationId || null,
-        foundryResponseId: response && response.id || null
+        status: hasAttachments ? "正在读取并准备附件" : "正在理解你的问题",
+        tool: "agent",
+        agent: foundryAgentName
     });
-    return sendSSEDone(res);
+    const invocation = await prepareFoundryAgentInvocation(args);
+    try {
+        if (invocation.uploadedInputFiles.length) {
+            sendSSE(res, { status: "附件已挂载，正在启动代码解释器", tool: "code_interpreter" });
+        }
+        let stream;
+        try {
+            stream = await invocation.openai.responses.create(
+                { ...invocation.requestBody, stream: true },
+                { ...invocation.requestOptions, signal: abortSignal }
+            );
+        } catch (error) {
+            forgetInvalidConversation(invocation, error);
+            throw error;
+        }
+        let response = null;
+        let streamedText = "";
+        let lastStatus = "";
+        const sendProgress = (status, tool = "agent") => {
+            if (!status || status === lastStatus) return;
+            lastStatus = status;
+            sendSSE(res, { status, tool });
+        };
+        const heartbeat = setInterval(() => {
+            if (!res.writableEnded && !res.destroyed) sendSSE(res, { ping: Date.now() });
+        }, 15000);
+        heartbeat.unref?.();
+
+        try {
+            for await (const event of stream) {
+                if (event.type === "response.output_text.delta" && event.delta) {
+                    streamedText += event.delta;
+                    sendSSE(res, { delta: event.delta });
+                } else if (event.type === "response.in_progress") {
+                    sendProgress("正在分析并组织回答");
+                } else if (event.type === "response.web_search_call.in_progress") {
+                    sendProgress("正在启动网页搜索", "web_search");
+                } else if (event.type === "response.web_search_call.searching") {
+                    sendProgress("正在搜索并核对相关资料", "web_search");
+                } else if (event.type === "response.web_search_call.completed") {
+                    sendProgress("检索完成，正在整理来源", "web_search");
+                } else if (event.type === "response.code_interpreter_call.in_progress") {
+                    sendProgress("正在用代码解释器读取文件", "code_interpreter");
+                } else if (event.type === "response.code_interpreter_call.interpreting") {
+                    sendProgress("正在运行分析并生成结果", "code_interpreter");
+                } else if (event.type === "response.code_interpreter_call.completed") {
+                    sendProgress("文件处理完成，正在整理回答", "code_interpreter");
+                } else if (event.type === "response.completed") {
+                    response = event.response;
+                } else if (event.type === "response.failed") {
+                    const message = event.response?.error?.message || "Foundry Agent 响应失败。";
+                    throw new Error(message);
+                } else if (event.type === "error") {
+                    throw new Error(event.message || "Foundry Agent 流式响应失败。");
+                }
+            }
+        } finally {
+            clearInterval(heartbeat);
+        }
+
+        const reply = extractResponseText(response);
+        const sources = extractCitationSources(response);
+        const files = extractGeneratedFiles(response, args.userId);
+        if (sources.length) sendSSE(res, { sources });
+        if (files.length) sendSSE(res, { files });
+        if (!streamedText && reply) sendSSE(res, { delta: reply });
+        if (!streamedText && !reply) sendSSE(res, { delta: "我没有收到有效回复，请稍后再试。" });
+        sendSSE(res, {
+            done: true,
+            foundryConversationId: invocation.conversationId || null,
+            foundryResponseId: response && response.id || null
+        });
+        return sendSSEDone(res);
+    } finally {
+        await cleanupFoundryInputFiles(invocation);
+    }
 }
 
 async function downloadFoundryAgentFile(containerId, fileId) {
@@ -829,6 +918,13 @@ function extractCitationSources(response) {
 }
 
 function formatAIError(error) {
+    const rawMessage = String(error?.message || '');
+    if (/unsupported_file/i.test(rawMessage)) {
+        return "附件没有成功挂载到 Foundry Code Interpreter。请确认当前 Agent 版本已配置 attachment_file_1～3 结构化输入槽；不要把 Excel 作为模型原生 input_file 发送。";
+    }
+    if (/structured[_ ]inputs?|attachment_file_[123]|handlebar|placeholder/i.test(rawMessage)) {
+        return "Foundry Agent 的运行时文件槽尚未配置或名称不一致。请在 Agent 的 Code Interpreter 中配置 attachment_file_1、attachment_file_2、attachment_file_3，并发布新版本后同步 FOUNDRY_AGENT_VERSION。";
+    }
     if (error?.status === 429 || error?.code === 'rate_limit_exceeded') {
         const retryAfter = Number(error.headers?.get?.('retry-after'));
         const retryText = Number.isFinite(retryAfter) && retryAfter > 0
@@ -1070,6 +1166,7 @@ app.get('/api/status', (req, res) => {
         "Foundry Agent 是否可用": !!foundryProjectEndpoint && !!foundryAgentName ? "✅ 是" : "❌ 否",
         "Foundry Agent 名称": foundryAgentName,
         "Foundry Agent 版本": foundryAgentVersion || "默认最新版",
+        "Code Interpreter 运行时附件槽": foundryFileInputSlots.join(', '),
         "GPT Image 2 部署名": imageDeployment,
         "图片专用 API key": imageApiKey ? "✅ 是" : "❌ 否"
     });
@@ -1151,6 +1248,7 @@ module.exports = {
     server,
     _test: {
         buildConversationSeed,
+        buildFoundryFileStructuredInputs,
         buildFoundryAgentReference,
         buildFoundryAgentUserContent,
         buildFoundryAgentUserMessage,
