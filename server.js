@@ -647,6 +647,13 @@ function getActiveFoundryConversation(conversationKey) {
     return null;
 }
 
+function buildFoundryResponseRequestBody({ conversationId, history, currentMessage }) {
+    return {
+        ...(conversationId ? { conversation: conversationId } : {}),
+        input: conversationId ? [currentMessage] : [...history, currentMessage]
+    };
+}
+
 async function prepareFoundryAgentInvocation({ userMessage, documents, images, historyMessages, reasoningMode, sessionId, sessionFiles, userId }) {
     assertFoundryAgentReady();
     validateAgentRequest({ userMessage, documents, images, historyMessages, sessionFiles });
@@ -695,11 +702,10 @@ async function prepareFoundryAgentInvocation({ userMessage, documents, images, h
         uploadedInputFiles,
         conversationId,
         conversationKey,
-        requestBody: {
-            ...(conversationId ? { conversation: conversationId } : {}),
-            input: conversationId ? [currentMessage] : [...history, currentMessage],
-            ...(uploadedInputFiles.length ? { tool_choice: { type: "code_interpreter" } } : {})
-        },
+        // Agent 版本是工具选择的唯一配置源。Foundry 不允许请求级
+        // tool_choice 覆盖与 Agent 自身的 tool_choice 不同；附件只通过
+        // structured_inputs 挂载，是否调用 Code Interpreter 由 Agent 决定。
+        requestBody: buildFoundryResponseRequestBody({ conversationId, history, currentMessage }),
         requestOptions: {
             body: agentBody
         }
@@ -919,6 +925,9 @@ function extractCitationSources(response) {
 
 function formatAIError(error) {
     const rawMessage = String(error?.message || '');
+    if (/ToolChoice must match|tool[_ ]choice/i.test(rawMessage)) {
+        return "Foundry Agent 的工具选择配置与请求冲突。请确认后端没有覆盖 Agent 版本中的 tool_choice。";
+    }
     if (/unsupported_file/i.test(rawMessage)) {
         return "附件没有成功挂载到 Foundry Code Interpreter。请确认当前 Agent 版本已配置 attachment_file_1～3 结构化输入槽；不要把 Excel 作为模型原生 input_file 发送。";
     }
@@ -1249,6 +1258,7 @@ module.exports = {
     _test: {
         buildConversationSeed,
         buildFoundryFileStructuredInputs,
+        buildFoundryResponseRequestBody,
         buildFoundryAgentReference,
         buildFoundryAgentUserContent,
         buildFoundryAgentUserMessage,
