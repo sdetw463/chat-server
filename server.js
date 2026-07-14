@@ -439,14 +439,25 @@ async function collectFoundryCodeInterpreterFiles(documents, sessionFiles, userI
 
     for (const doc of rawDocs) {
         const parsed = parseDataUrlFile(doc);
-        if (parsed) files.push(parsed);
+        if (parsed) files.push({ ...parsed, persistent: true, isNewSessionFile: true });
     }
 
     const remaining = foundryFileInputSlots.length - files.length;
     if (remaining > 0) {
         for (const file of normalizeSessionFiles(sessionFiles, userId).slice(-remaining)) {
             try {
-                files.push(await downloadSessionGeneratedFile(file, userId));
+                const grant = foundryGeneratedFiles.get(file.downloadId);
+                if (grant?.source === "files_api" && grant.fileId) {
+                    files.push({
+                        filename: file.filename,
+                        mimeType: contentTypeForFileName(file.filename),
+                        existingFileId: grant.fileId,
+                        persistent: true,
+                        isNewSessionFile: false
+                    });
+                } else {
+                    files.push(await downloadSessionGeneratedFile(file, userId));
+                }
             } catch (error) {
                 console.error("重新附加历史文件失败:", file.filename || file.downloadId, error.message || error);
             }
@@ -459,16 +470,58 @@ async function uploadFoundryCodeInterpreterFiles(openai, files) {
     const uploaded = [];
     try {
         for (const file of files) {
+            if (file.existingFileId) {
+                uploaded.push({
+                    id: file.existingFileId,
+                    filename: file.filename,
+                    persistent: true,
+                    isNewSessionFile: false
+                });
+                continue;
+            }
             const uploadable = await toFile(file.buffer, file.filename, { type: file.mimeType });
+            // Microsoft Foundry's project-scoped Files API currently rejects
+            // the OpenAI SDK's optional expires_after field. Access is bounded
+            // by our 24-hour download/session grant instead.
             const result = await openai.files.create({ file: uploadable, purpose: "assistants" });
             if (!result?.id) throw new Error(`附件 ${file.filename} 上传后没有返回 file id。`);
-            uploaded.push({ id: result.id, filename: file.filename });
+            uploaded.push({
+                id: result.id,
+                filename: file.filename,
+                persistent: file.persistent === true,
+                isNewSessionFile: file.isNewSessionFile === true
+            });
         }
         return uploaded;
     } catch (error) {
-        await Promise.allSettled(uploaded.map(file => openai.files.delete(file.id)));
+        await Promise.allSettled(uploaded
+            .filter(file => !file.persistent)
+            .map(file => openai.files.delete(file.id)));
         throw error;
     }
+}
+
+function registerFoundryInputSessionFiles(uploadedFiles, userId) {
+    return (Array.isArray(uploadedFiles) ? uploadedFiles : [])
+        .filter(file => file?.persistent && file?.isNewSessionFile && file?.id)
+        .map(file => {
+            const filename = getFileNameFromPath(file.filename, "attachment");
+            const downloadId = crypto.randomBytes(24).toString('base64url');
+            foundryGeneratedFiles.set(downloadId, {
+                userId,
+                fileId: String(file.id),
+                containerId: "",
+                filename,
+                source: "files_api",
+                expiresAt: Date.now() + 24 * 60 * 60 * 1000
+            });
+            return {
+                filename,
+                type: "file",
+                downloadId,
+                url: `/api/ai-agent-file/${encodeURIComponent(downloadId)}`
+            };
+        });
 }
 
 function buildFoundryFileStructuredInputs(uploadedFiles) {
@@ -480,7 +533,7 @@ function buildFoundryFileStructuredInputs(uploadedFiles) {
 }
 
 async function cleanupFoundryInputFiles(invocation) {
-    const files = invocation?.uploadedInputFiles || [];
+    const files = (invocation?.uploadedInputFiles || []).filter(file => !file.persistent);
     if (!files.length) return;
     const results = await Promise.allSettled(files.map(file => invocation.openai.files.delete(file.id)));
     results.forEach(result => {
@@ -660,7 +713,6 @@ async function prepareFoundryAgentInvocation({ userMessage, documents, images, h
     const { openai } = getFoundryClients();
     const conversationKey = sessionId ? `${userId}:${sessionId}` : '';
     let conversationId = getActiveFoundryConversation(conversationKey);
-    const shouldReattachSessionFiles = !conversationId;
     const history = buildConversationSeed(historyMessages);
 
     if (!conversationId) {
@@ -679,10 +731,11 @@ async function prepareFoundryAgentInvocation({ userMessage, documents, images, h
 
     const attachmentFiles = await collectFoundryCodeInterpreterFiles(
         documents,
-        shouldReattachSessionFiles ? sessionFiles : [],
+        sessionFiles,
         userId
     );
     const uploadedInputFiles = await uploadFoundryCodeInterpreterFiles(openai, attachmentFiles);
+    const rememberedInputFiles = registerFoundryInputSessionFiles(uploadedInputFiles, userId);
     const content = await buildFoundryAgentUserContent(
         userMessage,
         documents,
@@ -700,6 +753,7 @@ async function prepareFoundryAgentInvocation({ userMessage, documents, images, h
     return {
         openai,
         uploadedInputFiles,
+        rememberedInputFiles,
         conversationId,
         conversationKey,
         // Agent 版本是工具选择的唯一配置源。Foundry 不允许请求级
@@ -723,6 +777,7 @@ async function runFoundryAgentChat(args) {
             reply: extractResponseText(response),
             sources: extractCitationSources(response),
             files: extractGeneratedFiles(response, args.userId),
+            sessionFiles: invocation.rememberedInputFiles,
             conversationId: invocation.conversationId,
             rawResponseId: response && response.id,
         };
@@ -812,6 +867,9 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
         const files = extractGeneratedFiles(response, args.userId);
         if (sources.length) sendSSE(res, { sources });
         if (files.length) sendSSE(res, { files });
+        if (invocation.rememberedInputFiles.length) {
+            sendSSE(res, { sessionFiles: invocation.rememberedInputFiles });
+        }
         if (!streamedText && reply) sendSSE(res, { delta: reply });
         if (!streamedText && !reply) sendSSE(res, { delta: "我没有收到有效回复，请稍后再试。" });
         sendSSE(res, {
@@ -831,9 +889,10 @@ async function downloadFoundryAgentFile(containerId, fileId) {
         containerId = "";
     }
     if (!fileId) throw new Error("缺少 fileId，无法下载 Agent 生成文件。");
-    if (!containerId) throw new Error("缺少 containerId，无法下载 Agent 生成文件。");
     const { openai } = getFoundryClients();
-    const response = await openai.containers.files.content.retrieve(fileId, { container_id: containerId });
+    const response = containerId
+        ? await openai.containers.files.content.retrieve(fileId, { container_id: containerId })
+        : await openai.files.content(fileId);
     return {
         buffer: Buffer.from(await response.arrayBuffer()),
         contentType: response.headers.get("content-type") || "application/octet-stream"
@@ -1007,6 +1066,7 @@ app.post('/api/ai-chat', async (req, res) => {
             reply: result.reply,
             sources: result.sources,
             files: result.files,
+            sessionFiles: result.sessionFiles,
             foundryConversationId: result.conversationId || null,
             foundryResponseId: result.rawResponseId || null,
             usedAgent: true,
@@ -1259,6 +1319,7 @@ module.exports = {
         buildConversationSeed,
         buildFoundryFileStructuredInputs,
         buildFoundryResponseRequestBody,
+        registerFoundryInputSessionFiles,
         buildFoundryAgentReference,
         buildFoundryAgentUserContent,
         buildFoundryAgentUserMessage,
