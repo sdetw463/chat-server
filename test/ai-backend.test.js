@@ -62,6 +62,22 @@ test('attachment requests do not override the Agent tool choice', () => {
     assert.equal(Object.hasOwn(requestBody, 'tool_choice'), false);
 });
 
+test('stateless requests preserve bounded role history without a conversation round-trip', () => {
+    const history = [
+        { type: 'message', role: 'user', content: '第一问' },
+        { type: 'message', role: 'assistant', content: '第一答' }
+    ];
+    const currentMessage = { type: 'message', role: 'user', content: '第二问' };
+
+    assert.deepEqual(_test.buildFoundryResponseRequestBody({
+        conversationId: null,
+        history,
+        currentMessage
+    }), {
+        input: [...history, currentMessage]
+    });
+});
+
 test('new uploaded files are registered as reusable session files', () => {
     const files = _test.registerFoundryInputSessionFiles([{
         id: 'file_uploaded_once',
