@@ -91,6 +91,7 @@ const foundryFileInputSlots = String(process.env.FOUNDRY_CODE_INTERPRETER_FILE_S
     .map(value => value.trim())
     .filter(Boolean)
     .slice(0, 8);
+const foundryUseConversations = String(process.env.FOUNDRY_USE_CONVERSATIONS || '').toLowerCase() === 'true';
 const foundryAgentConversations = new Map();
 const foundryGeneratedFiles = new Map();
 const imageEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || process.env.AZURE_OPENAI_ENDPOINT || process.env.AZURE_OPENAI_API_BASE;
@@ -715,7 +716,11 @@ async function prepareFoundryAgentInvocation({ userMessage, documents, images, h
     let conversationId = getActiveFoundryConversation(conversationKey);
     const history = buildConversationSeed(historyMessages);
 
-    if (!conversationId) {
+    // Creating a Foundry Conversation adds a full network round-trip before the
+    // response can start. The browser already supplies bounded, role-preserving
+    // history, so normal website chat stays stateless for a faster first token.
+    // Conversation mode remains opt-in for deployments that explicitly need it.
+    if (foundryUseConversations && !conversationId) {
         try {
             const conversation = await openai.conversations.create(history.length ? { items: history } : {});
             conversationId = conversation && conversation.id;
