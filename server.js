@@ -92,6 +92,8 @@ const foundryFileInputSlots = String(process.env.FOUNDRY_CODE_INTERPRETER_FILE_S
     .filter(Boolean)
     .slice(0, 8);
 const foundryUseConversations = String(process.env.FOUNDRY_USE_CONVERSATIONS || '').toLowerCase() === 'true';
+const foundryStreamMaxMs = Math.max(60_000, Number(process.env.FOUNDRY_STREAM_MAX_MS || 12 * 60 * 1000));
+const foundryStreamHeartbeatMs = Math.max(5_000, Number(process.env.FOUNDRY_STREAM_HEARTBEAT_MS || 15_000));
 const foundryAgentConversations = new Map();
 const foundryGeneratedFiles = new Map();
 const imageEndpoint = process.env.AZURE_OPENAI_IMAGE_ENDPOINT || process.env.AZURE_OPENAI_ENDPOINT || process.env.AZURE_OPENAI_API_BASE;
@@ -368,10 +370,22 @@ function setupSSE(res) {
         "Connection": "keep-alive",
         "X-Accel-Buffering": "no"
     });
+    res.socket?.setNoDelay?.(true);
+    res.socket?.setKeepAlive?.(true, foundryStreamHeartbeatMs);
     if (typeof res.flushHeaders === "function") res.flushHeaders();
 }
-function sendSSE(res, data) { res.write(`data: ${JSON.stringify(data)}\n\n`); }
-function sendSSEDone(res) { res.write(`data: [DONE]\n\n`); res.end(); }
+function sendSSE(res, data) {
+    if (res.writableEnded || res.destroyed) return false;
+    const accepted = res.write(`data: ${JSON.stringify(data)}\n\n`);
+    if (typeof res.flush === "function") res.flush();
+    return accepted;
+}
+function sendSSEDone(res) {
+    if (res.writableEnded || res.destroyed) return;
+    res.write(`data: [DONE]\n\n`);
+    if (typeof res.flush === "function") res.flush();
+    res.end();
+}
 
 function getTextFromMessage(message) {
     return String(message && (message.content || message.text || message.userText || message.message) || "").trim();
@@ -800,17 +814,42 @@ function forgetInvalidConversation(invocation, error) {
     }
 }
 
+function formatFoundryIncompleteResponse(response) {
+    const reason = String(response?.incomplete_details?.reason || response?.status || "unknown");
+    const labels = {
+        max_output_tokens: "达到最大输出长度",
+        content_filter: "触发内容过滤",
+        tool_timeout: "工具执行超时"
+    };
+    return `Foundry Agent 没有完成本次回答（${labels[reason] || reason}）。已生成的内容会保留，请重试或把复杂任务拆成更小步骤。`;
+}
+
 async function handleFoundryAgentChatSSE(args, res, abortSignal) {
     const hasAttachments = Array.isArray(args.documents) && args.documents.length > 0;
-    sendSSE(res, {
-        status: hasAttachments ? "正在读取并准备附件" : "正在理解你的问题",
-        tool: "agent",
-        agent: foundryAgentName
-    });
-    const invocation = await prepareFoundryAgentInvocation(args);
+    let invocation = null;
+    let lastStatus = "";
+    let lastTool = "agent";
+    const sendProgress = (status, tool = "agent") => {
+        if (!status || (status === lastStatus && tool === lastTool)) return;
+        lastStatus = status;
+        lastTool = tool;
+        sendSSE(res, { status, tool, agent: foundryAgentName });
+    };
+    const heartbeat = setInterval(() => {
+        sendSSE(res, {
+            ping: Date.now(),
+            status: lastStatus || "仍在处理中",
+            tool: lastTool,
+            agent: foundryAgentName
+        });
+    }, foundryStreamHeartbeatMs);
+    heartbeat.unref?.();
+
+    sendProgress(hasAttachments ? "正在读取并准备附件" : "正在理解你的问题");
     try {
+        invocation = await prepareFoundryAgentInvocation(args);
         if (invocation.uploadedInputFiles.length) {
-            sendSSE(res, { status: "附件已挂载，正在启动代码解释器", tool: "code_interpreter" });
+            sendProgress("附件已挂载，正在启动代码解释器", "code_interpreter");
         }
         let stream;
         try {
@@ -824,47 +863,44 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
         }
         let response = null;
         let streamedText = "";
-        let lastStatus = "";
-        const sendProgress = (status, tool = "agent") => {
-            if (!status || status === lastStatus) return;
-            lastStatus = status;
-            sendSSE(res, { status, tool });
-        };
-        const heartbeat = setInterval(() => {
-            if (!res.writableEnded && !res.destroyed) sendSSE(res, { ping: Date.now() });
-        }, 15000);
-        heartbeat.unref?.();
 
-        try {
-            for await (const event of stream) {
-                if (event.type === "response.output_text.delta" && event.delta) {
-                    streamedText += event.delta;
-                    sendSSE(res, { delta: event.delta });
-                } else if (event.type === "response.in_progress") {
-                    sendProgress("正在分析并组织回答");
-                } else if (event.type === "response.web_search_call.in_progress") {
-                    sendProgress("正在启动网页搜索", "web_search");
-                } else if (event.type === "response.web_search_call.searching") {
-                    sendProgress("正在搜索并核对相关资料", "web_search");
-                } else if (event.type === "response.web_search_call.completed") {
-                    sendProgress("检索完成，正在整理来源", "web_search");
-                } else if (event.type === "response.code_interpreter_call.in_progress") {
-                    sendProgress("正在用代码解释器读取文件", "code_interpreter");
-                } else if (event.type === "response.code_interpreter_call.interpreting") {
-                    sendProgress("正在运行分析并生成结果", "code_interpreter");
-                } else if (event.type === "response.code_interpreter_call.completed") {
-                    sendProgress("文件处理完成，正在整理回答", "code_interpreter");
-                } else if (event.type === "response.completed") {
-                    response = event.response;
-                } else if (event.type === "response.failed") {
-                    const message = event.response?.error?.message || "Foundry Agent 响应失败。";
-                    throw new Error(message);
-                } else if (event.type === "error") {
-                    throw new Error(event.message || "Foundry Agent 流式响应失败。");
-                }
+        for await (const event of stream) {
+            if (event.type === "response.output_text.delta" && event.delta) {
+                streamedText += event.delta;
+                lastStatus = "正在生成回答";
+                lastTool = "agent";
+                sendSSE(res, { delta: event.delta });
+            } else if (event.type === "response.in_progress") {
+                sendProgress("正在分析并组织回答");
+            } else if (event.type === "response.web_search_call.in_progress") {
+                sendProgress("正在启动网页搜索", "web_search");
+            } else if (event.type === "response.web_search_call.searching") {
+                sendProgress("正在搜索并核对相关资料", "web_search");
+            } else if (event.type === "response.web_search_call.completed") {
+                sendProgress("检索完成，正在整理来源", "web_search");
+            } else if (event.type === "response.code_interpreter_call.in_progress") {
+                sendProgress("正在用代码解释器读取文件", "code_interpreter");
+            } else if (event.type === "response.code_interpreter_call.interpreting") {
+                sendProgress("正在运行分析并生成结果", "code_interpreter");
+            } else if (event.type === "response.code_interpreter_call.completed") {
+                sendProgress("文件处理完成，正在整理回答", "code_interpreter");
+            } else if (event.type === "response.completed") {
+                response = event.response;
+            } else if (event.type === "response.incomplete") {
+                response = event.response;
+                throw new Error(formatFoundryIncompleteResponse(response));
+            } else if (event.type === "response.failed") {
+                const message = event.response?.error?.message || "Foundry Agent 响应失败。";
+                throw new Error(message);
+            } else if (event.type === "error") {
+                throw new Error(event.message || "Foundry Agent 流式响应失败。");
             }
-        } finally {
-            clearInterval(heartbeat);
+        }
+
+        if (!response) {
+            throw new Error(streamedText
+                ? "Foundry Agent 的流式连接在完成事件到达前中断。已保留部分内容，请重试。"
+                : "Foundry Agent 的流式连接提前中断，未收到有效回答。请重试。");
         }
 
         const reply = extractResponseText(response);
@@ -883,8 +919,15 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
             foundryResponseId: response && response.id || null
         });
         return sendSSEDone(res);
+    } catch (error) {
+        if (abortSignal?.aborted && abortSignal.reason instanceof Error) {
+            throw abortSignal.reason;
+        }
+        forgetInvalidConversation(invocation, error);
+        throw error;
     } finally {
-        await cleanupFoundryInputFiles(invocation);
+        clearInterval(heartbeat);
+        if (invocation) await cleanupFoundryInputFiles(invocation);
     }
 }
 
@@ -1063,7 +1106,18 @@ app.post('/api/ai-chat', async (req, res) => {
             res.once('close', () => {
                 if (!res.writableEnded) controller.abort();
             });
-            return await handleFoundryAgentChatSSE(agentRequest, res, controller.signal);
+            const streamTimeout = setTimeout(() => {
+                if (!controller.signal.aborted) {
+                    const minutes = Math.max(1, Math.ceil(foundryStreamMaxMs / 60000));
+                    controller.abort(new Error(`Foundry Agent 处理超过 ${minutes} 分钟，已停止本次流式连接。已生成内容会保留，请重试或把任务拆成更小步骤。`));
+                }
+            }, foundryStreamMaxMs);
+            streamTimeout.unref?.();
+            try {
+                return await handleFoundryAgentChatSSE(agentRequest, res, controller.signal);
+            } finally {
+                clearTimeout(streamTimeout);
+            }
         }
 
         const result = await runFoundryAgentChat(agentRequest);
@@ -1332,6 +1386,7 @@ module.exports = {
         extractGeneratedFiles,
         parseDataUrlFile,
         resolveImageSize,
-        validateAgentRequest
+        validateAgentRequest,
+        formatFoundryIncompleteResponse
     }
 };
