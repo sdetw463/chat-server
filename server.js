@@ -92,7 +92,7 @@ const foundryFileInputSlots = String(process.env.FOUNDRY_CODE_INTERPRETER_FILE_S
     .filter(Boolean)
     .slice(0, 8);
 const foundryUseConversations = String(process.env.FOUNDRY_USE_CONVERSATIONS || '').toLowerCase() === 'true';
-const foundryStreamMaxMs = Math.max(60_000, Number(process.env.FOUNDRY_STREAM_MAX_MS || 12 * 60 * 1000));
+const foundryStreamMaxMs = Math.max(60_000, Number(process.env.FOUNDRY_STREAM_MAX_MS || 20 * 60 * 1000));
 const foundryStreamHeartbeatMs = Math.max(5_000, Number(process.env.FOUNDRY_STREAM_HEARTBEAT_MS || 15_000));
 const foundryAgentConversations = new Map();
 const foundryGeneratedFiles = new Map();
@@ -826,6 +826,8 @@ function formatFoundryIncompleteResponse(response) {
 
 async function handleFoundryAgentChatSSE(args, res, abortSignal) {
     const hasAttachments = Array.isArray(args.documents) && args.documents.length > 0;
+    const startedAt = Date.now();
+    const elapsedSeconds = () => Math.max(0, Math.round((Date.now() - startedAt) / 1000));
     let invocation = null;
     let lastStatus = "";
     let lastTool = "agent";
@@ -833,14 +835,17 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
         if (!status || (status === lastStatus && tool === lastTool)) return;
         lastStatus = status;
         lastTool = tool;
-        sendSSE(res, { status, tool, agent: foundryAgentName });
+        const elapsed = elapsedSeconds();
+        console.log(`[Foundry SSE +${elapsed}s] ${tool}: ${status}`);
+        sendSSE(res, { status, tool, agent: foundryAgentName, elapsedSeconds: elapsed });
     };
     const heartbeat = setInterval(() => {
         sendSSE(res, {
             ping: Date.now(),
             status: lastStatus || "仍在处理中",
             tool: lastTool,
-            agent: foundryAgentName
+            agent: foundryAgentName,
+            elapsedSeconds: elapsedSeconds()
         });
     }, foundryStreamHeartbeatMs);
     heartbeat.unref?.();
@@ -855,7 +860,13 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
         try {
             stream = await invocation.openai.responses.create(
                 { ...invocation.requestBody, stream: true },
-                { ...invocation.requestOptions, signal: abortSignal }
+                {
+                    ...invocation.requestOptions,
+                    signal: abortSignal,
+                    // Keep the SDK's own request timeout slightly above our explicit
+                    // stream limit, otherwise a client default could end a long tool run first.
+                    timeout: foundryStreamMaxMs + 60_000
+                }
             );
         } catch (error) {
             forgetInvalidConversation(invocation, error);
@@ -913,16 +924,21 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
         }
         if (!streamedText && reply) sendSSE(res, { delta: reply });
         if (!streamedText && !reply) sendSSE(res, { delta: "我没有收到有效回复，请稍后再试。" });
+        const completedInSeconds = elapsedSeconds();
+        console.log(`[Foundry SSE +${completedInSeconds}s] completed response=${response && response.id || 'unknown'}`);
         sendSSE(res, {
             done: true,
             foundryConversationId: invocation.conversationId || null,
-            foundryResponseId: response && response.id || null
+            foundryResponseId: response && response.id || null,
+            elapsedSeconds: completedInSeconds
         });
         return sendSSEDone(res);
     } catch (error) {
-        if (abortSignal?.aborted && abortSignal.reason instanceof Error) {
-            throw abortSignal.reason;
-        }
+        const effectiveError = abortSignal?.aborted && abortSignal.reason instanceof Error
+            ? abortSignal.reason
+            : error;
+        console.error(`[Foundry SSE +${elapsedSeconds()}s] failed:`, effectiveError?.message || effectiveError);
+        if (effectiveError !== error) throw effectiveError;
         forgetInvalidConversation(invocation, error);
         throw error;
     } finally {
@@ -1294,6 +1310,8 @@ app.get('/api/status', (req, res) => {
         "Foundry Agent 是否可用": !!foundryProjectEndpoint && !!foundryAgentName ? "✅ 是" : "❌ 否",
         "Foundry Agent 名称": foundryAgentName,
         "Foundry Agent 版本": foundryAgentVersion || "默认最新版",
+        "Foundry 流式最大时长（分钟）": Number((foundryStreamMaxMs / 60000).toFixed(2)),
+        "Foundry SSE 心跳间隔（秒）": Number((foundryStreamHeartbeatMs / 1000).toFixed(2)),
         "Code Interpreter 运行时附件槽": foundryFileInputSlots.join(', '),
         "GPT Image 2 部署名": imageDeployment,
         "图片专用 API key": imageApiKey ? "✅ 是" : "❌ 否"
