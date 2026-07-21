@@ -191,3 +191,13 @@ test('invalid or oversized attachment payloads are rejected before Foundry is ca
         sessionFiles: []
     }), /附件.*无效/);
 });
+
+test('incomplete Foundry responses are surfaced instead of treated as a successful partial answer', () => {
+    const message = _test.formatFoundryIncompleteResponse({
+        status: 'incomplete',
+        incomplete_details: { reason: 'max_output_tokens' }
+    });
+
+    assert.match(message, /达到最大输出长度/);
+    assert.match(message, /已生成的内容会保留/);
+});
