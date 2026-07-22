@@ -22,8 +22,8 @@ app.use(cors({
         return callback(null, allowedOrigins.includes(String(origin).replace(/\/+$/, '')));
     },
     credentials: false,
-    methods: ['GET', 'POST'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    methods: ['GET', 'POST', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Client-ID']
 }));
 app.use(express.json({ limit: '35mb' }));
 app.use(express.urlencoded({ limit: '35mb', extended: true }));
@@ -47,12 +47,101 @@ const wsMsgSchema = new mongoose.Schema({
 }, { strict: false, timestamps: true });
 const WsMessage = mongoose.model('WsMessage', wsMsgSchema, 'chat_history');
 
+const aiSessionSchema = new mongoose.Schema({
+    userId: { type: String, required: true, index: true },
+    sessionId: { type: String, required: true },
+    title: { type: String, default: '新聊天' },
+    pinned: { type: Boolean, default: false },
+    foundryConversationId: { type: String, default: '' },
+    summary: { type: String, default: '' },
+    clientUpdatedAt: { type: Number, default: 0 },
+    parentSessionId: { type: String, default: '' },
+    rootSessionId: { type: String, default: '' },
+    branchDepth: { type: Number, default: 0 },
+    lastActiveAt: { type: Date, default: Date.now }
+}, { timestamps: true });
+aiSessionSchema.index({ userId: 1, sessionId: 1 }, { unique: true });
+
+const aiMessageSchema = new mongoose.Schema({
+    userId: { type: String, required: true, index: true },
+    sessionId: { type: String, required: true, index: true },
+    messageId: { type: String, required: true },
+    role: { type: String, enum: ['user', 'assistant'], required: true },
+    content: { type: String, default: '' },
+    userText: { type: String, default: '' },
+    mediaHtml: { type: String, default: '' },
+    sources: { type: [mongoose.Schema.Types.Mixed], default: [] },
+    generatedFiles: { type: [mongoose.Schema.Types.Mixed], default: [] },
+    sessionFiles: { type: [mongoose.Schema.Types.Mixed], default: [] },
+    clientCreatedAt: { type: Number, default: 0 }
+}, { timestamps: true });
+aiMessageSchema.index({ userId: 1, sessionId: 1, messageId: 1 }, { unique: true });
+aiMessageSchema.index({ userId: 1, sessionId: 1, createdAt: -1 });
+
+const aiFileSchema = new mongoose.Schema({
+    userId: { type: String, required: true, index: true },
+    sessionId: { type: String, required: true, index: true },
+    downloadTokenHash: { type: String, required: true, unique: true, index: true },
+    downloadId: { type: String, required: true, unique: true, select: false },
+    filename: { type: String, required: true },
+    mimeType: { type: String, default: 'application/octet-stream' },
+    size: { type: Number, default: 0 },
+    sha256: { type: String, default: '' },
+    blobName: { type: String, required: true },
+    source: { type: String, enum: ['upload', 'agent'], required: true },
+    lastAccessAt: { type: Date, default: Date.now }
+}, { timestamps: true });
+
+const AiSession = mongoose.model('AiSession', aiSessionSchema, 'ai_sessions');
+const AiMessage = mongoose.model('AiMessage', aiMessageSchema, 'ai_messages');
+const AiFile = mongoose.model('AiFile', aiFileSchema, 'ai_files');
+
 let containerClient = null;
 if (process.env.AZURE_STORAGE_CONNECTION_STRING) {
     try {
         const blobServiceClient = BlobServiceClient.fromConnectionString(process.env.AZURE_STORAGE_CONNECTION_STRING);
         containerClient = blobServiceClient.getContainerClient('tuotuo-files');
+        containerClient.createIfNotExists().catch(e => console.error('创建对象存储容器失败', e));
     } catch(e) { console.error('存储连接错误', e); }
+}
+
+function canUsePersistentAiStorage() {
+    return !!containerClient && mongoose.connection.readyState === 1;
+}
+
+function hashDownloadToken(token) {
+    return crypto.createHash('sha256').update(String(token || '')).digest('hex');
+}
+
+function normalizeIdentityPart(value, maxLength = 160) {
+    return String(value || '').trim().slice(0, maxLength);
+}
+
+function buildAiUserId(clientId, sessionId, req) {
+    const stableClientId = normalizeIdentityPart(clientId);
+    const legacyScope = [
+        'legacy',
+        normalizeIdentityPart(sessionId) || 'no-session',
+        req?.ip || req?.socket?.remoteAddress || '',
+        req?.get?.('user-agent') || ''
+    ].join(':');
+    return crypto.createHash('sha256').update(stableClientId || legacyScope).digest('base64url');
+}
+
+async function uploadBufferToBlob(buffer, { userId, sessionId, filename, mimeType }) {
+    if (!containerClient) throw new Error('Azure Blob Storage 尚未配置。');
+    const safeSession = crypto.createHash('sha256').update(String(sessionId || 'no-session')).digest('hex').slice(0, 20);
+    const blobName = `ai/${String(userId).slice(0, 20)}/${safeSession}/${crypto.randomUUID()}-${safeFileName(filename)}`;
+    const client = containerClient.getBlockBlobClient(blobName);
+    await client.uploadData(buffer, {
+        blobHTTPHeaders: { blobContentType: mimeType || 'application/octet-stream' }
+    });
+    return blobName;
+}
+
+async function downloadBlobBuffer(blobName) {
+    if (!containerClient || !blobName) throw new Error('持久文件存储不可用。');
+    return containerClient.getBlockBlobClient(blobName).downloadToBuffer();
 }
 
 async function uploadBase64ToBlob(base64Str) {
@@ -91,7 +180,11 @@ const foundryFileInputSlots = String(process.env.FOUNDRY_CODE_INTERPRETER_FILE_S
     .map(value => value.trim())
     .filter(Boolean)
     .slice(0, 8);
-const foundryUseConversations = String(process.env.FOUNDRY_USE_CONVERSATIONS || '').toLowerCase() === 'true';
+const foundryUseConversations = String(process.env.FOUNDRY_USE_CONVERSATIONS || 'true').toLowerCase() === 'true';
+const aiContextMessageLimit = Math.min(80, Math.max(12, Number(process.env.AI_CONTEXT_MESSAGE_LIMIT || 40)));
+const aiContextCharacterBudget = Math.min(200_000, Math.max(24_000, Number(process.env.AI_CONTEXT_CHARACTER_BUDGET || 90_000)));
+const aiSessionFileLimit = Math.min(200, Math.max(12, Number(process.env.AI_SESSION_FILE_LIMIT || 80)));
+const aiSessionStorageMaxBytes = Math.min(10 * 1024 ** 3, Math.max(100 * 1024 ** 2, Number(process.env.AI_SESSION_STORAGE_MAX_BYTES || 1024 ** 3)));
 const foundryStreamMaxMs = Math.max(60_000, Number(process.env.FOUNDRY_STREAM_MAX_MS || 20 * 60 * 1000));
 const foundryStreamHeartbeatMs = Math.max(5_000, Number(process.env.FOUNDRY_STREAM_HEARTBEAT_MS || 15_000));
 const foundryAgentConversations = new Map();
@@ -446,7 +539,29 @@ function parseDataUrlFile(doc) {
     };
 }
 
-async function collectFoundryCodeInterpreterFiles(documents, sessionFiles, userId) {
+function selectRelevantSessionFiles(sessionFiles, userMessage, limit) {
+    const message = String(userMessage || '').toLowerCase();
+    return normalizeSessionFileReferences(sessionFiles)
+        .map((file, index) => {
+            const lowerName = file.filename.toLowerCase();
+            const stem = lowerName.replace(/\.[^.]+$/, '');
+            const extension = lowerName.split('.').pop();
+            let score = index;
+            if (stem.length >= 2 && message.includes(stem)) score += 10_000;
+            if (extension && message.includes(extension)) score += 1_000;
+            return { file, score };
+        })
+        .sort((a, b) => b.score - a.score)
+        .slice(0, limit)
+        .map(item => item.file);
+}
+
+function shouldAttachHistoricalFiles(userMessage) {
+    return /(文件|附件|文档|表格|数据|刚才|之前|上次|生成的|上传的|修改|编辑|转换|导出|下载|继续处理|word|docx?|pdf|excel|xlsx?|csv|pptx?|zip)/i
+        .test(String(userMessage || ''));
+}
+
+async function collectFoundryCodeInterpreterFiles(documents, sessionFiles, userId, sessionId, userMessage) {
     const files = [];
     const rawDocs = (Array.isArray(documents) ? documents : [])
         .filter(isInlineInputFileDocument)
@@ -458,10 +573,34 @@ async function collectFoundryCodeInterpreterFiles(documents, sessionFiles, userI
     }
 
     const remaining = foundryFileInputSlots.length - files.length;
-    if (remaining > 0) {
-        for (const file of normalizeSessionFiles(sessionFiles, userId).slice(-remaining)) {
+    if (remaining > 0 && shouldAttachHistoricalFiles(userMessage)) {
+        let candidates = normalizeSessionFileReferences(sessionFiles);
+        if (mongoose.connection.readyState === 1 && sessionId) {
+            const stored = (await AiFile.find({ userId, sessionId }).sort({ updatedAt: -1 }).limit(aiSessionFileLimit).lean()).reverse();
+            const storedRefs = stored.map(record => ({
+                filename: record.filename,
+                downloadId: '',
+                storageId: String(record._id),
+                type: 'file',
+                _storedRecord: record
+            }));
+            candidates = [...candidates, ...storedRefs];
+        }
+        const selected = selectRelevantSessionFiles(candidates, userMessage, remaining);
+        for (const file of selected) {
             try {
-                const grant = foundryGeneratedFiles.get(file.downloadId);
+                const grant = file._storedRecord || await resolveStoredFile(file.downloadId, userId, sessionId);
+                if (!grant) throw new Error('文件记录不存在或不属于当前会话。');
+                if (grant.blobName) {
+                    files.push({
+                        filename: file.filename,
+                        mimeType: grant.mimeType || contentTypeForFileName(file.filename),
+                        buffer: await downloadBlobBuffer(grant.blobName),
+                        persistent: false,
+                        isNewSessionFile: false
+                    });
+                    continue;
+                }
                 if (grant?.source === "files_api" && grant.fileId) {
                     files.push({
                         filename: file.filename,
@@ -471,7 +610,7 @@ async function collectFoundryCodeInterpreterFiles(documents, sessionFiles, userI
                         isNewSessionFile: false
                     });
                 } else {
-                    files.push(await downloadSessionGeneratedFile(file, userId));
+                    files.push(await downloadSessionGeneratedFile({ ...file, sessionId }, userId));
                 }
             } catch (error) {
                 console.error("重新附加历史文件失败:", file.filename || file.downloadId, error.message || error);
@@ -539,6 +678,78 @@ function registerFoundryInputSessionFiles(uploadedFiles, userId) {
         });
 }
 
+function buildDurableFileResponse(record, downloadId) {
+    return {
+        filename: record.filename,
+        type: 'file',
+        downloadId,
+        storageId: String(record._id || ''),
+        url: `/api/ai-agent-file/${encodeURIComponent(downloadId)}`,
+        persistent: true
+    };
+}
+
+async function persistFileBuffer({ buffer, filename, mimeType, source, userId, sessionId }) {
+    if (!canUsePersistentAiStorage() || !buffer?.length || !sessionId) return null;
+    const [fileCount, sizeRows] = await Promise.all([
+        AiFile.countDocuments({ userId, sessionId }),
+        AiFile.aggregate([
+            { $match: { userId, sessionId } },
+            { $group: { _id: null, total: { $sum: '$size' } } }
+        ])
+    ]);
+    const usedBytes = Number(sizeRows[0]?.total || 0);
+    if (fileCount >= aiSessionFileLimit) throw new Error(`当前会话最多长期保存 ${aiSessionFileLimit} 个文件。`);
+    if (usedBytes + buffer.length > aiSessionStorageMaxBytes) throw new Error('当前会话的长期文件存储空间已达到上限。');
+    const downloadId = crypto.randomBytes(24).toString('base64url');
+    const blobName = await uploadBufferToBlob(buffer, { userId, sessionId, filename, mimeType });
+    try {
+        const record = await AiFile.create({
+            userId,
+            sessionId,
+            downloadTokenHash: hashDownloadToken(downloadId),
+            downloadId,
+            filename: getFileNameFromPath(filename, 'agent-output'),
+            mimeType: mimeType || contentTypeForFileName(filename),
+            size: buffer.length,
+            sha256: crypto.createHash('sha256').update(buffer).digest('hex'),
+            blobName,
+            source
+        });
+        return buildDurableFileResponse(record, downloadId);
+    } catch (error) {
+        await containerClient.getBlockBlobClient(blobName).deleteIfExists().catch(() => {});
+        throw error;
+    }
+}
+
+async function persistNewInputSessionFiles(attachmentFiles, uploadedFiles, userId, sessionId) {
+    const remembered = [];
+    for (let index = 0; index < attachmentFiles.length; index += 1) {
+        const file = attachmentFiles[index];
+        if (!file?.isNewSessionFile || !file.buffer) continue;
+        try {
+            const saved = await persistFileBuffer({
+                buffer: file.buffer,
+                filename: file.filename,
+                mimeType: file.mimeType,
+                source: 'upload',
+                userId,
+                sessionId
+            });
+            if (saved) {
+                remembered.push(saved);
+                if (uploadedFiles[index]) uploadedFiles[index].persistent = false;
+                continue;
+            }
+        } catch (error) {
+            console.error('持久化用户附件失败，将使用临时授权:', error.message || error);
+        }
+        remembered.push(...registerFoundryInputSessionFiles(uploadedFiles[index] ? [uploadedFiles[index]] : [], userId));
+    }
+    return remembered;
+}
+
 function buildFoundryFileStructuredInputs(uploadedFiles) {
     const values = {};
     foundryFileInputSlots.forEach((slot, index) => {
@@ -568,8 +779,7 @@ function getDownloadIdFromUrl(value) {
     return match ? decodeURIComponent(match[1]) : '';
 }
 
-function normalizeSessionFiles(sessionFiles, userId) {
-    pruneGeneratedFileGrants();
+function normalizeSessionFileReferences(sessionFiles) {
     const seen = new Set();
     return (Array.isArray(sessionFiles) ? sessionFiles : [])
         .map(file => {
@@ -577,24 +787,47 @@ function normalizeSessionFiles(sessionFiles, userId) {
             const filename = getFileNameFromPath(file.filename || file.name || file.fileName || "agent-output", "agent-output");
             const url = String(file.url || file.downloadUrl || "").trim();
             const downloadId = String(file.downloadId || getDownloadIdFromUrl(url) || '').trim();
-            const grant = downloadId && foundryGeneratedFiles.get(downloadId);
-            const key = `${downloadId}:${filename}`;
-            if (!grant || grant.userId !== userId || seen.has(key)) return null;
+            const storageId = String(file.storageId || file.fileId || '').trim();
+            const key = `${downloadId || storageId}:${filename}`;
+            if ((!downloadId && !storageId && !file._storedRecord) || seen.has(key)) return null;
             seen.add(key);
             return {
                 filename,
                 downloadId,
+                storageId,
                 url,
-                type: file.type || "file"
+                type: file.type || "file",
+                ...(file._storedRecord ? { _storedRecord: file._storedRecord } : {})
             };
         })
         .filter(Boolean);
 }
 
+async function resolveStoredFile(downloadId, userId, sessionId = '') {
+    pruneGeneratedFileGrants();
+    if (mongoose.connection.readyState === 1 && downloadId) {
+        const query = { downloadTokenHash: hashDownloadToken(downloadId), userId };
+        if (sessionId) query.sessionId = sessionId;
+        const record = await AiFile.findOne(query).lean();
+        if (record) return { ...record, durable: true };
+    }
+    const grant = downloadId && foundryGeneratedFiles.get(downloadId);
+    if (grant && grant.userId === userId && grant.expiresAt > Date.now()) return grant;
+    return null;
+}
+
 async function downloadSessionGeneratedFile(file, userId) {
-    const grant = file && foundryGeneratedFiles.get(file.downloadId);
-    if (!grant || grant.userId !== userId || grant.expiresAt <= Date.now()) {
+    const grant = file && await resolveStoredFile(file.downloadId, userId, file.sessionId || '');
+    if (!grant) {
         throw new Error('历史文件的安全访问已过期，请重新上传该文件。');
+    }
+    if (grant.blobName) {
+        const buffer = await downloadBlobBuffer(grant.blobName);
+        return {
+            filename: getFileNameFromPath(file.filename || grant.filename, 'agent-output'),
+            mimeType: grant.mimeType || contentTypeForFileName(grant.filename),
+            buffer
+        };
     }
     const downloaded = await downloadFoundryAgentFile(grant.containerId, grant.fileId);
     const filename = getFileNameFromPath(file.filename || grant.filename, "agent-output");
@@ -664,6 +897,60 @@ function extractGeneratedFiles(response, userId) {
     return found.filter(Boolean).slice(0, 12);
 }
 
+function extractGeneratedFileCitations(response) {
+    const found = [];
+    const seen = new Set();
+    for (const item of response?.output || []) {
+        if (item?.type !== 'message') continue;
+        for (const content of item.content || []) {
+            for (const annotation of content.annotations || []) {
+                if (annotation?.type !== 'container_file_citation') continue;
+                const fileId = annotation.file_id || annotation.fileId;
+                const containerId = annotation.container_id || annotation.containerId;
+                if (!fileId || !containerId) continue;
+                const key = `${containerId}:${fileId}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                found.push({
+                    fileId: String(fileId),
+                    containerId: String(containerId),
+                    filename: getFileNameFromPath(annotation.filename || annotation.file_name || guessAgentFileName({ fileId }, found.length))
+                });
+            }
+        }
+    }
+    return found.slice(0, 12);
+}
+
+async function materializeGeneratedFiles(response, userId, sessionId) {
+    const citations = extractGeneratedFileCitations(response);
+    if (!citations.length) return [];
+    const files = [];
+    for (const citation of citations) {
+        if (canUsePersistentAiStorage() && sessionId) {
+            try {
+                const downloaded = await downloadFoundryAgentFile(citation.containerId, citation.fileId);
+                const durable = await persistFileBuffer({
+                    buffer: downloaded.buffer,
+                    filename: citation.filename,
+                    mimeType: contentTypeForFileName(citation.filename, downloaded.contentType),
+                    source: 'agent',
+                    userId,
+                    sessionId
+                });
+                if (durable) {
+                    files.push(durable);
+                    continue;
+                }
+            } catch (error) {
+                console.error('持久化 Agent 生成文件失败，将返回临时链接:', error.message || error);
+            }
+        }
+        files.push(normalizeAgentFileRecord(citation, files.length, userId));
+    }
+    return files.filter(Boolean);
+}
+
 function guessAgentFileName(file, index = 0) {
     const hint = `${file && (file.filename || file.path || file.fileName || file.text || file.type || "") || ""}`.toLowerCase();
     const id = String(file && file.fileId || "");
@@ -677,14 +964,102 @@ function guessAgentFileName(file, index = 0) {
 }
 
 function buildConversationSeed(historyMessages) {
-    const input = [];
-    const history = Array.isArray(historyMessages) ? historyMessages.slice(-12) : [];
-    for (const msg of history) {
+    const reversed = [];
+    let remainingCharacters = aiContextCharacterBudget;
+    const history = Array.isArray(historyMessages) ? historyMessages.slice(-aiContextMessageLimit) : [];
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+        const msg = history[index];
         const role = msg && msg.role === "assistant" ? "assistant" : (msg && msg.role === "user" ? "user" : null);
-        const content = getTextFromMessage(msg).slice(0, 24000);
-        if (role && content) input.push({ type: "message", role, content });
+        const raw = getTextFromMessage(msg);
+        const content = raw.slice(Math.max(0, raw.length - Math.min(32000, remainingCharacters)));
+        if (role && content) {
+            reversed.push({ type: "message", role, content });
+            remainingCharacters -= content.length;
+        }
+        if (remainingCharacters <= 0) break;
     }
-    return input;
+    return reversed.reverse();
+}
+
+function sanitizeStoredMediaHtml(value) {
+    // mediaHtml comes from the browser and is rendered as HTML. Never persist
+    // arbitrary markup; attachment names already remain in the message text.
+    return '';
+}
+
+function sanitizeStoredMessage(message, fallbackId = '') {
+    if (!message || !['user', 'assistant'].includes(message.role)) return null;
+    const content = String(message.content || message.userText || '').slice(0, 32000);
+    if (!content) return null;
+    const messageId = normalizeIdentityPart(message.id || message.messageId || fallbackId, 180)
+        || crypto.createHash('sha256').update(`${message.role}:${content}`).digest('base64url');
+    return {
+        messageId,
+        role: message.role,
+        content,
+        userText: String(message.userText || '').slice(0, 16000),
+        mediaHtml: sanitizeStoredMediaHtml(message.mediaHtml),
+        sources: Array.isArray(message.sources) ? message.sources.slice(0, 20) : [],
+        generatedFiles: Array.isArray(message.generatedFiles || message.files) ? (message.generatedFiles || message.files).slice(0, 30) : [],
+        sessionFiles: Array.isArray(message.sessionFiles) ? message.sessionFiles.slice(0, 30) : [],
+        clientCreatedAt: Number(message.createdAt) || 0
+    };
+}
+
+async function ensureAiSession(userId, sessionId, metadata = {}) {
+    if (mongoose.connection.readyState !== 1 || !sessionId) return null;
+    return AiSession.findOneAndUpdate(
+        { userId, sessionId },
+        {
+            $set: {
+                lastActiveAt: new Date(),
+                ...(metadata.title ? { title: String(metadata.title).slice(0, 120) } : {}),
+                ...(typeof metadata.pinned === 'boolean' ? { pinned: metadata.pinned } : {}),
+                ...(Number(metadata.clientUpdatedAt) ? { clientUpdatedAt: Number(metadata.clientUpdatedAt) } : {}),
+                ...(metadata.parentSessionId ? { parentSessionId: normalizeIdentityPart(metadata.parentSessionId) } : {}),
+                ...(metadata.rootSessionId ? { rootSessionId: normalizeIdentityPart(metadata.rootSessionId) } : {}),
+                ...(Number.isFinite(metadata.branchDepth) ? { branchDepth: Math.max(0, Math.min(12, Number(metadata.branchDepth))) } : {})
+            },
+            $setOnInsert: { userId, sessionId }
+        },
+        { upsert: true, new: true }
+    );
+}
+
+async function upsertStoredMessages(userId, sessionId, messages) {
+    if (mongoose.connection.readyState !== 1 || !sessionId) return;
+    const sanitized = (Array.isArray(messages) ? messages : [])
+        .slice(-300)
+        .map(message => sanitizeStoredMessage(message))
+        .filter(Boolean);
+    if (!sanitized.length) return;
+    await AiMessage.bulkWrite(sanitized.map(message => ({
+        updateOne: {
+            filter: { userId, sessionId, messageId: message.messageId },
+            update: { $set: { ...message, userId, sessionId } },
+            upsert: true
+        }
+    })), { ordered: false });
+}
+
+async function loadStoredConversationHistory(userId, sessionId, fallbackHistory) {
+    if (mongoose.connection.readyState !== 1 || !sessionId) return fallbackHistory;
+    const stored = await AiMessage.find({ userId, sessionId })
+        .sort({ clientCreatedAt: -1, createdAt: -1, _id: -1 })
+        .limit(aiContextMessageLimit)
+        .lean();
+    if (!stored.length) return fallbackHistory;
+    return stored.reverse().map(message => ({ role: message.role, content: message.content }));
+}
+
+async function persistCompletedChatTurn({ userId, sessionId, userMessage, reply, sources, files, requestId }) {
+    if (mongoose.connection.readyState !== 1 || !sessionId) return;
+    await ensureAiSession(userId, sessionId);
+    const baseId = normalizeIdentityPart(requestId, 140) || crypto.randomUUID();
+    await upsertStoredMessages(userId, sessionId, [
+        { id: `${baseId}:user`, role: 'user', content: userMessage, createdAt: Date.now() - 1 },
+        { id: `${baseId}:assistant`, role: 'assistant', content: reply, sources, generatedFiles: files, createdAt: Date.now() }
+    ]);
 }
 
 function validateAgentRequest({ userMessage, documents, images, historyMessages, sessionFiles }) {
@@ -693,8 +1068,8 @@ function validateAgentRequest({ userMessage, documents, images, historyMessages,
     }
     if (Array.isArray(documents) && documents.length > 3) throw new Error('一次最多处理 3 个文件。');
     if (Array.isArray(images) && images.length > 4) throw new Error('一次最多处理 4 张聊天图片。');
-    if (Array.isArray(historyMessages) && historyMessages.length > 18) throw new Error('历史消息数量超出限制。');
-    if (Array.isArray(sessionFiles) && sessionFiles.length > 12) throw new Error('历史文件数量超出限制。');
+    if (Array.isArray(historyMessages) && historyMessages.length > 300) throw new Error('历史消息数量超出限制。');
+    if (Array.isArray(sessionFiles) && sessionFiles.length > aiSessionFileLimit) throw new Error('历史文件数量超出限制。');
     const rawFiles = (Array.isArray(documents) ? documents : [])
         .filter(doc => doc && Object.prototype.hasOwnProperty.call(doc, 'fileData'));
     const totalBytes = rawFiles.reduce((sum, doc) => {
@@ -705,13 +1080,18 @@ function validateAgentRequest({ userMessage, documents, images, historyMessages,
     if (totalBytes > MAX_AGENT_TOTAL_FILE_BYTES) throw new Error('单次原始附件合计不能超过 20MB。');
 }
 
-function getActiveFoundryConversation(conversationKey) {
+async function getActiveFoundryConversation(conversationKey, userId, sessionId) {
     if (!conversationKey) return null;
     const record = foundryAgentConversations.get(conversationKey);
-    if (!record) return null;
     if (typeof record === 'string') return record;
-    if (record.expiresAt > Date.now()) return record.id;
-    foundryAgentConversations.delete(conversationKey);
+    if (record?.id) return record.id;
+    if (mongoose.connection.readyState === 1 && userId && sessionId) {
+        const session = await AiSession.findOne({ userId, sessionId }).select('foundryConversationId').lean();
+        if (session?.foundryConversationId) {
+            foundryAgentConversations.set(conversationKey, session.foundryConversationId);
+            return session.foundryConversationId;
+        }
+    }
     return null;
 }
 
@@ -727,19 +1107,22 @@ async function prepareFoundryAgentInvocation({ userMessage, documents, images, h
     validateAgentRequest({ userMessage, documents, images, historyMessages, sessionFiles });
     const { openai } = getFoundryClients();
     const conversationKey = sessionId ? `${userId}:${sessionId}` : '';
-    let conversationId = getActiveFoundryConversation(conversationKey);
-    const history = buildConversationSeed(historyMessages);
+    await ensureAiSession(userId, sessionId);
+    let conversationId = await getActiveFoundryConversation(conversationKey, userId, sessionId);
+    const resolvedHistory = await loadStoredConversationHistory(userId, sessionId, historyMessages);
+    const history = buildConversationSeed(resolvedHistory);
 
-    // Creating a Foundry Conversation adds a full network round-trip before the
-    // response can start. The browser already supplies bounded, role-preserving
-    // history, so normal website chat stays stateless for a faster first token.
-    // Conversation mode remains opt-in for deployments that explicitly need it.
+    // Conversation mode is enabled by default for durable multi-turn context.
+    // MongoDB remains the recovery source if the Foundry conversation expires.
     if (foundryUseConversations && !conversationId) {
         try {
             const conversation = await openai.conversations.create(history.length ? { items: history } : {});
             conversationId = conversation && conversation.id;
             if (conversationKey && conversationId) {
-                foundryAgentConversations.set(conversationKey, { id: conversationId, expiresAt: Date.now() + 24 * 60 * 60 * 1000 });
+                foundryAgentConversations.set(conversationKey, conversationId);
+                if (mongoose.connection.readyState === 1) {
+                    await AiSession.updateOne({ userId, sessionId }, { $set: { foundryConversationId: conversationId } });
+                }
             }
         } catch (error) {
             // Conversation state is an optimization. The request can still be completed
@@ -751,10 +1134,12 @@ async function prepareFoundryAgentInvocation({ userMessage, documents, images, h
     const attachmentFiles = await collectFoundryCodeInterpreterFiles(
         documents,
         sessionFiles,
-        userId
+        userId,
+        sessionId,
+        userMessage
     );
     const uploadedInputFiles = await uploadFoundryCodeInterpreterFiles(openai, attachmentFiles);
-    const rememberedInputFiles = registerFoundryInputSessionFiles(uploadedInputFiles, userId);
+    const rememberedInputFiles = await persistNewInputSessionFiles(attachmentFiles, uploadedInputFiles, userId, sessionId);
     const content = await buildFoundryAgentUserContent(
         userMessage,
         documents,
@@ -775,6 +1160,8 @@ async function prepareFoundryAgentInvocation({ userMessage, documents, images, h
         rememberedInputFiles,
         conversationId,
         conversationKey,
+        userId,
+        sessionId,
         // Agent 版本是工具选择的唯一配置源。Foundry 不允许请求级
         // tool_choice 覆盖与 Agent 自身的 tool_choice 不同；附件只通过
         // structured_inputs 挂载，是否调用 Code Interpreter 由 Agent 决定。
@@ -792,10 +1179,22 @@ async function runFoundryAgentChat(args) {
             { ...invocation.requestBody, stream: false },
             invocation.requestOptions
         );
+        const reply = extractResponseText(response);
+        const sources = extractCitationSources(response);
+        const files = await materializeGeneratedFiles(response, args.userId, args.sessionId);
+        await persistCompletedChatTurn({
+            userId: args.userId,
+            sessionId: args.sessionId,
+            userMessage: args.userMessage,
+            reply,
+            sources,
+            files,
+            requestId: args.requestId
+        });
         return {
-            reply: extractResponseText(response),
-            sources: extractCitationSources(response),
-            files: extractGeneratedFiles(response, args.userId),
+            reply,
+            sources,
+            files,
             sessionFiles: invocation.rememberedInputFiles,
             conversationId: invocation.conversationId,
             rawResponseId: response && response.id,
@@ -809,8 +1208,14 @@ async function runFoundryAgentChat(args) {
 }
 
 function forgetInvalidConversation(invocation, error) {
-    if (invocation?.conversationKey && error?.status === 404 && /conversation/i.test(String(error.message || ''))) {
+    if (invocation?.conversationKey && [400, 404, 410].includes(Number(error?.status)) && /conversation/i.test(String(error.message || ''))) {
         foundryAgentConversations.delete(invocation.conversationKey);
+        if (mongoose.connection.readyState === 1 && invocation.userId && invocation.sessionId) {
+            AiSession.updateOne(
+                { userId: invocation.userId, sessionId: invocation.sessionId },
+                { $set: { foundryConversationId: '' } }
+            ).catch(dbError => console.error('清除失效 Conversation 记录失败:', dbError.message || dbError));
+        }
     }
 }
 
@@ -916,7 +1321,16 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
 
         const reply = extractResponseText(response);
         const sources = extractCitationSources(response);
-        const files = extractGeneratedFiles(response, args.userId);
+        const files = await materializeGeneratedFiles(response, args.userId, args.sessionId);
+        await persistCompletedChatTurn({
+            userId: args.userId,
+            sessionId: args.sessionId,
+            userMessage: args.userMessage,
+            reply,
+            sources,
+            files,
+            requestId: args.requestId
+        });
         if (sources.length) sendSSE(res, { sources });
         if (files.length) sendSSE(res, { files });
         if (invocation.rememberedInputFiles.length) {
@@ -1093,12 +1507,6 @@ async function prepareAgentImages(images) {
 function buildAgentRequestFromHttp(req, images) {
     const sessionId = String(req.body.sessionId || '').slice(0, 160) || null;
     const clientId = String(req.body.clientId || '').slice(0, 160);
-    const anonymousScope = clientId || [
-        'legacy',
-        sessionId || 'no-session',
-        req.ip || req.socket?.remoteAddress || '',
-        req.get('user-agent') || ''
-    ].join(':');
     return {
         userMessage: String(req.body.message || '').trim(),
         documents: Array.isArray(req.body.documents) ? req.body.documents : [],
@@ -1106,8 +1514,9 @@ function buildAgentRequestFromHttp(req, images) {
         historyMessages: Array.isArray(req.body.historyMessages) ? req.body.historyMessages : [],
         reasoningMode: ['normal', 'think', 'research'].includes(req.body.reasoningMode) ? req.body.reasoningMode : 'normal',
         sessionId,
+        requestId: normalizeIdentityPart(req.body.requestId, 140) || crypto.randomUUID(),
         sessionFiles: Array.isArray(req.body.sessionFiles) ? req.body.sessionFiles : [],
-        userId: crypto.createHash('sha256').update(anonymousScope).digest('base64url')
+        userId: buildAiUserId(clientId, sessionId, req)
     };
 }
 
@@ -1277,15 +1686,109 @@ app.post('/api/ai-image', async (req, res) => {
     }
 });
 
-// AI 聊天记录只保存在访问者自己的浏览器中，不再写入或读取云端数据库。
-app.all('/api/sessions', (req, res) => {
-    res.status(410).json({ error: '云端 AI 聊天记录已停用；记录仅保存在当前浏览器。' });
+function requireSessionIdentity(req) {
+    const clientId = normalizeIdentityPart(req.body?.clientId || req.get?.('X-Client-ID') || req.query?.clientId);
+    if (!clientId || clientId.length < 16) throw new Error('缺少有效的客户端标识。');
+    return buildAiUserId(clientId, req.body?.session?.id || req.body?.sessionId || req.params?.sessionId, req);
+}
+
+app.get('/api/sessions', async (req, res) => {
+    try {
+        if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: '聊天历史数据库暂时不可用。' });
+        const userId = requireSessionIdentity(req);
+        const sessions = await AiSession.find({ userId }).sort({ pinned: -1, clientUpdatedAt: -1, updatedAt: -1 }).limit(80).lean();
+        const result = await Promise.all(sessions.map(async session => {
+            const [recentMessages, files] = await Promise.all([
+                AiMessage.find({ userId, sessionId: session.sessionId }).sort({ clientCreatedAt: -1, createdAt: -1, _id: -1 }).limit(300).lean(),
+                AiFile.find({ userId, sessionId: session.sessionId }).select('+downloadId').sort({ createdAt: 1 }).limit(aiSessionFileLimit).lean()
+            ]);
+            const messages = recentMessages.reverse();
+            return {
+                id: session.sessionId,
+                title: session.title,
+                pinned: session.pinned,
+                parentSessionId: session.parentSessionId || null,
+                rootSessionId: session.rootSessionId || session.sessionId,
+                branchDepth: session.branchDepth || 0,
+                createdAt: session.createdAt?.getTime?.() || Date.now(),
+                updatedAt: Math.max(session.clientUpdatedAt || 0, session.updatedAt?.getTime?.() || 0),
+                messages: messages.map(message => ({
+                    id: message.messageId,
+                    role: message.role,
+                    content: message.content,
+                    userText: message.userText,
+                    mediaHtml: message.mediaHtml,
+                    sources: message.sources,
+                    generatedFiles: message.generatedFiles,
+                    sessionFiles: message.sessionFiles,
+                    createdAt: message.clientCreatedAt || message.createdAt?.getTime?.() || 0
+                })),
+                fileRefs: files.map(file => buildDurableFileResponse(file, file.downloadId))
+            };
+        }));
+        res.json({ sessions: result });
+    } catch (error) {
+        res.status(400).json({ error: error.message || '读取聊天历史失败。' });
+    }
+});
+
+app.post('/api/sessions/sync', async (req, res) => {
+    try {
+        if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: '聊天历史数据库暂时不可用。' });
+        const userId = requireSessionIdentity(req);
+        const session = req.body?.session;
+        const sessionId = normalizeIdentityPart(session?.id);
+        if (!sessionId) return res.status(400).json({ error: '缺少会话 ID。' });
+        await ensureAiSession(userId, sessionId, {
+            title: session.title,
+            pinned: !!session.pinned,
+            clientUpdatedAt: session.updatedAt,
+            parentSessionId: session.parentSessionId,
+            rootSessionId: session.rootSessionId,
+            branchDepth: session.branchDepth
+        });
+        await upsertStoredMessages(userId, sessionId, session.messages);
+        res.json({ ok: true });
+    } catch (error) {
+        console.error('同步 AI 历史失败:', error);
+        res.status(400).json({ error: error.message || '同步聊天历史失败。' });
+    }
+});
+
+app.delete('/api/sessions/:sessionId', async (req, res) => {
+    try {
+        if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: '聊天历史数据库暂时不可用。' });
+        const userId = requireSessionIdentity(req);
+        const sessionId = normalizeIdentityPart(req.params.sessionId);
+        const files = await AiFile.find({ userId, sessionId }).lean();
+        await Promise.allSettled(files.map(file => containerClient?.getBlockBlobClient(file.blobName).deleteIfExists()));
+        await Promise.all([
+            AiFile.deleteMany({ userId, sessionId }),
+            AiMessage.deleteMany({ userId, sessionId }),
+            AiSession.deleteOne({ userId, sessionId })
+        ]);
+        res.json({ ok: true });
+    } catch (error) {
+        res.status(400).json({ error: error.message || '删除聊天失败。' });
+    }
 });
 
 app.get('/api/ai-agent-file/:downloadId', async (req, res) => {
     try {
         pruneGeneratedFileGrants();
-        const grant = foundryGeneratedFiles.get(String(req.params.downloadId || ''));
+        const downloadId = String(req.params.downloadId || '');
+        const stored = mongoose.connection.readyState === 1
+            ? await AiFile.findOne({ downloadTokenHash: hashDownloadToken(downloadId) }).lean()
+            : null;
+        if (stored?.blobName) {
+            const filename = getFileNameFromPath(stored.filename, 'agent-output');
+            const buffer = await downloadBlobBuffer(stored.blobName);
+            AiFile.updateOne({ _id: stored._id }, { $set: { lastAccessAt: new Date() } }).catch(() => {});
+            res.setHeader('Content-Type', stored.mimeType || contentTypeForFileName(filename));
+            res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
+            return res.send(buffer);
+        }
+        const grant = foundryGeneratedFiles.get(downloadId);
         if (!grant) {
             return res.status(404).json({ error: '文件不存在或安全访问已过期。请重新生成或上传该文件。' });
         }
@@ -1305,6 +1808,8 @@ app.get('/api/status', (req, res) => {
         "数据库是否连接": mongoose.connection.readyState === 1 ? "✅ 正常" : "❌ 未连接",
         "MONGODB_URI 是否已读到": !!process.env.MONGODB_URI ? "✅ 是" : "❌ 否",
         "云存储是否配置": !!process.env.AZURE_STORAGE_CONNECTION_STRING ? "✅ 是" : "❌ 否",
+        "AI 历史持久化": mongoose.connection.readyState === 1 ? "✅ MongoDB" : "❌ 不可用",
+        "AI 文件持久化": canUsePersistentAiStorage() ? "✅ MongoDB + Blob" : "⚠️ 临时模式",
         "公共 AI 访问": "✅ 已启用",
         "Foundry Project Endpoint": !!foundryProjectEndpoint ? "✅ 是" : "❌ 否",
         "Foundry Agent 是否可用": !!foundryProjectEndpoint && !!foundryAgentName ? "✅ 是" : "❌ 否",
@@ -1313,6 +1818,8 @@ app.get('/api/status', (req, res) => {
         "Foundry 流式最大时长（分钟）": Number((foundryStreamMaxMs / 60000).toFixed(2)),
         "Foundry SSE 心跳间隔（秒）": Number((foundryStreamHeartbeatMs / 1000).toFixed(2)),
         "Code Interpreter 运行时附件槽": foundryFileInputSlots.join(', '),
+        "AI 近期上下文消息上限": aiContextMessageLimit,
+        "AI 会话文件索引上限": aiSessionFileLimit,
         "GPT Image 2 部署名": imageDeployment,
         "图片专用 API key": imageApiKey ? "✅ 是" : "❌ 否"
     });
@@ -1400,6 +1907,11 @@ module.exports = {
         buildFoundryAgentReference,
         buildFoundryAgentUserContent,
         buildFoundryAgentUserMessage,
+        selectRelevantSessionFiles,
+        shouldAttachHistoricalFiles,
+        sanitizeStoredMediaHtml,
+        sanitizeStoredMessage,
+        hashDownloadToken,
         extractCitationSources,
         extractGeneratedFiles,
         parseDataUrlFile,
