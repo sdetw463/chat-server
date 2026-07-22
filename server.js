@@ -68,7 +68,6 @@ const aiSessionSchema = new mongoose.Schema({
     branchDepth: { type: Number, default: 0 },
     lastActiveAt: { type: Date, default: Date.now }
 }, { timestamps: true });
-aiSessionSchema.index({ userId: 1, sessionId: 1 });
 
 const aiMessageSchema = new mongoose.Schema({
     userId: { type: String, required: true, index: true },
@@ -83,8 +82,6 @@ const aiMessageSchema = new mongoose.Schema({
     sessionFiles: { type: [mongoose.Schema.Types.Mixed], default: [] },
     clientCreatedAt: { type: Number, default: 0 }
 }, { timestamps: true });
-aiMessageSchema.index({ docType: 1, userId: 1, sessionId: 1, messageId: 1 }, { unique: true, sparse: true });
-aiMessageSchema.index({ userId: 1, sessionId: 1, createdAt: -1 });
 
 const aiFileSchema = new mongoose.Schema({
     userId: { type: String, required: true, index: true },
@@ -119,7 +116,6 @@ function scopeAiRecordSchema(schema, docType) {
 scopeAiRecordSchema(aiSessionSchema, 'session');
 scopeAiRecordSchema(aiMessageSchema, 'message');
 scopeAiRecordSchema(aiFileSchema, 'file');
-aiFileSchema.index({ docType: 1, downloadTokenHash: 1 }, { unique: true, sparse: true });
 
 // Cosmos DB for MongoDB allocates throughput per physical collection. Keep all
 // AI records in one collection and separate them with docType so a small
@@ -609,7 +605,8 @@ async function collectFoundryCodeInterpreterFiles(documents, sessionFiles, userI
     if (remaining > 0 && shouldAttachHistoricalFiles(userMessage)) {
         let candidates = normalizeSessionFileReferences(sessionFiles);
         if (mongoose.connection.readyState === 1 && sessionId) {
-            const stored = (await AiFile.find({ userId, sessionId }).sort({ updatedAt: -1 }).limit(aiSessionFileLimit).lean()).reverse();
+            const stored = (await AiFile.find({ userId, sessionId }).limit(aiSessionFileLimit).lean())
+                .sort((a, b) => new Date(a.updatedAt || a.createdAt || 0) - new Date(b.updatedAt || b.createdAt || 0));
             const storedRefs = stored.map(record => ({
                 filename: record.filename,
                 downloadId: '',
@@ -1077,12 +1074,15 @@ async function upsertStoredMessages(userId, sessionId, messages) {
 
 async function loadStoredConversationHistory(userId, sessionId, fallbackHistory) {
     if (mongoose.connection.readyState !== 1 || !sessionId) return fallbackHistory;
-    const stored = await AiMessage.find({ userId, sessionId })
-        .sort({ clientCreatedAt: -1, createdAt: -1, _id: -1 })
-        .limit(aiContextMessageLimit)
-        .lean();
+    const stored = (await AiMessage.find({ userId, sessionId }).limit(1000).lean())
+        .sort((a, b) => {
+            const aTime = Number(a.clientCreatedAt) || new Date(a.createdAt || 0).getTime();
+            const bTime = Number(b.clientCreatedAt) || new Date(b.createdAt || 0).getTime();
+            return aTime - bTime || String(a._id).localeCompare(String(b._id));
+        })
+        .slice(-aiContextMessageLimit);
     if (!stored.length) return fallbackHistory;
-    return stored.reverse().map(message => ({ role: message.role, content: message.content }));
+    return stored.map(message => ({ role: message.role, content: message.content }));
 }
 
 async function persistCompletedChatTurn({ userId, sessionId, userMessage, reply, sources, files, requestId }) {
@@ -1729,13 +1729,25 @@ app.get('/api/sessions', async (req, res) => {
     try {
         if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: '聊天历史数据库暂时不可用。' });
         const userId = requireSessionIdentity(req);
-        const sessions = await AiSession.find({ userId }).sort({ pinned: -1, clientUpdatedAt: -1, updatedAt: -1 }).limit(80).lean();
+        const sessions = (await AiSession.find({ userId }).limit(200).lean())
+            .sort((a, b) => {
+                if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+                const aTime = Number(a.clientUpdatedAt) || new Date(a.updatedAt || 0).getTime();
+                const bTime = Number(b.clientUpdatedAt) || new Date(b.updatedAt || 0).getTime();
+                return bTime - aTime;
+            })
+            .slice(0, 80);
         const result = await Promise.all(sessions.map(async session => {
-            const [recentMessages, files] = await Promise.all([
-                AiMessage.find({ userId, sessionId: session.sessionId }).sort({ clientCreatedAt: -1, createdAt: -1, _id: -1 }).limit(300).lean(),
-                AiFile.find({ userId, sessionId: session.sessionId }).select('+downloadId').sort({ createdAt: 1 }).limit(aiSessionFileLimit).lean()
+            const [messageRows, fileRows] = await Promise.all([
+                AiMessage.find({ userId, sessionId: session.sessionId }).limit(1000).lean(),
+                AiFile.find({ userId, sessionId: session.sessionId }).select('+downloadId').limit(aiSessionFileLimit).lean()
             ]);
-            const messages = recentMessages.reverse();
+            const messages = messageRows.sort((a, b) => {
+                const aTime = Number(a.clientCreatedAt) || new Date(a.createdAt || 0).getTime();
+                const bTime = Number(b.clientCreatedAt) || new Date(b.createdAt || 0).getTime();
+                return aTime - bTime || String(a._id).localeCompare(String(b._id));
+            }).slice(-300);
+            const files = fileRows.sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0));
             return {
                 id: session.sessionId,
                 title: session.title,
