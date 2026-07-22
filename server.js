@@ -33,7 +33,15 @@ app.use(express.urlencoded({ limit: '35mb', extended: true }));
 // ==========================================
 if (process.env.MONGODB_URI) {
     mongoose.connect(process.env.MONGODB_URI, { useNewUrlParser: true, useUnifiedTopology: true })
-        .then(() => console.log('✅ MongoDB 数据库连接成功！'))
+        .then(async () => {
+            console.log('✅ MongoDB 数据库连接成功！');
+            // The first persistence build may have created ai_sessions before
+            // docType was introduced. Those records are session records.
+            await mongoose.connection.collection('ai_sessions').updateMany(
+                { docType: { $exists: false } },
+                { $set: { docType: 'session' } }
+            ).catch(error => console.error('迁移 AI 会话记录失败:', error.message || error));
+        })
         .catch(err => console.error('🔥 MongoDB 连接失败:', err));
 } else {
     console.error('❌ 警告：服务器没有读到 MONGODB_URI 环境变量！');
@@ -60,7 +68,7 @@ const aiSessionSchema = new mongoose.Schema({
     branchDepth: { type: Number, default: 0 },
     lastActiveAt: { type: Date, default: Date.now }
 }, { timestamps: true });
-aiSessionSchema.index({ userId: 1, sessionId: 1 }, { unique: true });
+aiSessionSchema.index({ userId: 1, sessionId: 1 });
 
 const aiMessageSchema = new mongoose.Schema({
     userId: { type: String, required: true, index: true },
@@ -75,14 +83,14 @@ const aiMessageSchema = new mongoose.Schema({
     sessionFiles: { type: [mongoose.Schema.Types.Mixed], default: [] },
     clientCreatedAt: { type: Number, default: 0 }
 }, { timestamps: true });
-aiMessageSchema.index({ userId: 1, sessionId: 1, messageId: 1 }, { unique: true });
+aiMessageSchema.index({ docType: 1, userId: 1, sessionId: 1, messageId: 1 }, { unique: true, sparse: true });
 aiMessageSchema.index({ userId: 1, sessionId: 1, createdAt: -1 });
 
 const aiFileSchema = new mongoose.Schema({
     userId: { type: String, required: true, index: true },
     sessionId: { type: String, required: true, index: true },
-    downloadTokenHash: { type: String, required: true, unique: true, index: true },
-    downloadId: { type: String, required: true, unique: true, select: false },
+    downloadTokenHash: { type: String, required: true, index: true },
+    downloadId: { type: String, required: true, select: false },
     filename: { type: String, required: true },
     mimeType: { type: String, default: 'application/octet-stream' },
     size: { type: Number, default: 0 },
@@ -92,9 +100,34 @@ const aiFileSchema = new mongoose.Schema({
     lastAccessAt: { type: Date, default: Date.now }
 }, { timestamps: true });
 
-const AiSession = mongoose.model('AiSession', aiSessionSchema, 'ai_sessions');
-const AiMessage = mongoose.model('AiMessage', aiMessageSchema, 'ai_messages');
-const AiFile = mongoose.model('AiFile', aiFileSchema, 'ai_files');
+function scopeAiRecordSchema(schema, docType) {
+    schema.add({ docType: { type: String, required: true, default: docType } });
+    const queryOperations = [
+        'countDocuments', 'deleteMany', 'deleteOne', 'find', 'findOne',
+        'findOneAndDelete', 'findOneAndUpdate', 'updateMany', 'updateOne'
+    ];
+    queryOperations.forEach(operation => {
+        schema.pre(operation, function scopeAiRecordQuery() {
+            this.where({ docType });
+        });
+    });
+    schema.pre('aggregate', function scopeAiRecordAggregate() {
+        this.pipeline().unshift({ $match: { docType } });
+    });
+}
+
+scopeAiRecordSchema(aiSessionSchema, 'session');
+scopeAiRecordSchema(aiMessageSchema, 'message');
+scopeAiRecordSchema(aiFileSchema, 'file');
+aiFileSchema.index({ docType: 1, downloadTokenHash: 1 }, { unique: true, sparse: true });
+
+// Cosmos DB for MongoDB allocates throughput per physical collection. Keep all
+// AI records in one collection and separate them with docType so a small
+// 1000-RU/s account does not need three additional 400-RU/s collections.
+const AI_RECORD_COLLECTION = 'ai_sessions';
+const AiSession = mongoose.model('AiSession', aiSessionSchema, AI_RECORD_COLLECTION);
+const AiMessage = mongoose.model('AiMessage', aiMessageSchema, AI_RECORD_COLLECTION);
+const AiFile = mongoose.model('AiFile', aiFileSchema, AI_RECORD_COLLECTION);
 
 let containerClient = null;
 if (process.env.AZURE_STORAGE_CONNECTION_STRING) {
@@ -1020,7 +1053,7 @@ async function ensureAiSession(userId, sessionId, metadata = {}) {
                 ...(metadata.rootSessionId ? { rootSessionId: normalizeIdentityPart(metadata.rootSessionId) } : {}),
                 ...(Number.isFinite(metadata.branchDepth) ? { branchDepth: Math.max(0, Math.min(12, Number(metadata.branchDepth))) } : {})
             },
-            $setOnInsert: { userId, sessionId }
+            $setOnInsert: { docType: 'session', userId, sessionId }
         },
         { upsert: true, new: true }
     );
@@ -1035,8 +1068,8 @@ async function upsertStoredMessages(userId, sessionId, messages) {
     if (!sanitized.length) return;
     await AiMessage.bulkWrite(sanitized.map(message => ({
         updateOne: {
-            filter: { userId, sessionId, messageId: message.messageId },
-            update: { $set: { ...message, userId, sessionId } },
+            filter: { docType: 'message', userId, sessionId, messageId: message.messageId },
+            update: { $set: { ...message, docType: 'message', userId, sessionId } },
             upsert: true
         }
     })), { ordered: false });
