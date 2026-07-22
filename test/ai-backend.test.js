@@ -131,6 +131,35 @@ test('conversation seed preserves roles instead of flattening history into promp
     ]);
 });
 
+test('conversation seed keeps substantially more than the old twelve-message window', () => {
+    const history = Array.from({ length: 30 }, (_, index) => ({
+        role: index % 2 ? 'assistant' : 'user',
+        content: `消息 ${index + 1}`
+    }));
+    const seed = _test.buildConversationSeed(history);
+    assert.equal(seed.length, 30);
+    assert.equal(seed[0].content, '消息 1');
+    assert.equal(seed.at(-1).content, '消息 30');
+});
+
+test('an explicitly named historical file is selected ahead of newer unrelated files', () => {
+    const selected = _test.selectRelevantSessionFiles([
+        { filename: '导师批注.docx', downloadId: 'old-file' },
+        { filename: '临时数据.csv', downloadId: 'new-file' }
+    ], '请继续修改导师批注.docx', 1);
+    assert.equal(selected[0].downloadId, 'old-file');
+});
+
+test('base64 images are stripped before chat messages are persisted', () => {
+    const html = _test.sanitizeStoredMediaHtml('<img src="data:image/png;base64,AAAA" class="gpt-user-image">');
+    assert.equal(html, '');
+});
+
+test('historical files are not mounted for unrelated small talk', () => {
+    assert.equal(_test.shouldAttachHistoricalFiles('你好，今天过得怎么样？'), false);
+    assert.equal(_test.shouldAttachHistoricalFiles('把刚才的 PDF 转成 Word'), true);
+});
+
 test('only official container file citations become download cards', () => {
     const files = _test.extractGeneratedFiles({
         output: [
