@@ -125,6 +125,41 @@ const AiSession = mongoose.model('AiSession', aiSessionSchema, AI_RECORD_COLLECT
 const AiMessage = mongoose.model('AiMessage', aiMessageSchema, AI_RECORD_COLLECTION);
 const AiFile = mongoose.model('AiFile', aiFileSchema, AI_RECORD_COLLECTION);
 
+const DELETED_SESSION_DOC_TYPE = 'deleted_session';
+
+function deletedSessionError() {
+    const error = new Error('当前会话状态异常，暂时无法继续。请新建一个聊天后重试。');
+    error.status = 410;
+    error.code = 'SESSION_UNAVAILABLE';
+    return error;
+}
+
+async function isAiSessionDeleted(userId, sessionId) {
+    if (mongoose.connection.readyState !== 1 || !userId || !sessionId) return false;
+    const record = await mongoose.connection.collection(AI_RECORD_COLLECTION).findOne({
+        docType: DELETED_SESSION_DOC_TYPE,
+        userId,
+        sessionId
+    }, { projection: { _id: 1 } });
+    return !!record;
+}
+
+async function assertAiSessionActive(userId, sessionId) {
+    if (await isAiSessionDeleted(userId, sessionId)) throw deletedSessionError();
+}
+
+async function markAiSessionDeleted(userId, sessionId, reason = 'user_deleted') {
+    if (mongoose.connection.readyState !== 1 || !userId || !sessionId) return;
+    await mongoose.connection.collection(AI_RECORD_COLLECTION).updateOne(
+        { docType: DELETED_SESSION_DOC_TYPE, userId, sessionId },
+        {
+            $set: { deletedAt: new Date(), reason: String(reason).slice(0, 80) },
+            $setOnInsert: { docType: DELETED_SESSION_DOC_TYPE, userId, sessionId, createdAt: new Date() }
+        },
+        { upsert: true }
+    );
+}
+
 let containerClient = null;
 if (process.env.AZURE_STORAGE_CONNECTION_STRING) {
     try {
@@ -1140,6 +1175,7 @@ async function prepareFoundryAgentInvocation({ userMessage, documents, images, h
     validateAgentRequest({ userMessage, documents, images, historyMessages, sessionFiles });
     const { openai } = getFoundryClients();
     const conversationKey = sessionId ? `${userId}:${sessionId}` : '';
+    await assertAiSessionActive(userId, sessionId);
     await ensureAiSession(userId, sessionId);
     let conversationId = await getActiveFoundryConversation(conversationKey, userId, sessionId);
     const resolvedHistory = await loadStoredConversationHistory(userId, sessionId, historyMessages);
@@ -1558,6 +1594,9 @@ app.post('/api/ai-chat', async (req, res) => {
     try {
         const images = await prepareAgentImages(req.body.images || req.body.image || []);
         const agentRequest = buildAgentRequestFromHttp(req, images);
+        // Check before opening the SSE response so a deleted local browser
+        // session receives HTTP 410 and cannot invoke the model.
+        await assertAiSessionActive(agentRequest.userId, agentRequest.sessionId);
         if (wantsStream) {
             setupSSE(res);
             const controller = new AbortController();
@@ -1598,7 +1637,7 @@ app.post('/api/ai-chat', async (req, res) => {
                 return sendSSEDone(res);
             } catch { return; }
         }
-        return res.status(500).json({ error: errorMessage });
+        return res.status(Number(error.status) || 500).json({ error: errorMessage, code: error.code || undefined });
     }
 });
 
@@ -1784,6 +1823,7 @@ app.post('/api/sessions/sync', async (req, res) => {
         const session = req.body?.session;
         const sessionId = normalizeIdentityPart(session?.id);
         if (!sessionId) return res.status(400).json({ error: '缺少会话 ID。' });
+        await assertAiSessionActive(userId, sessionId);
         await ensureAiSession(userId, sessionId, {
             title: session.title,
             pinned: !!session.pinned,
@@ -1796,7 +1836,7 @@ app.post('/api/sessions/sync', async (req, res) => {
         res.json({ ok: true });
     } catch (error) {
         console.error('同步 AI 历史失败:', error);
-        res.status(400).json({ error: error.message || '同步聊天历史失败。' });
+        res.status(Number(error.status) || 400).json({ error: error.message || '同步聊天历史失败。', code: error.code || undefined });
     }
 });
 
@@ -1805,13 +1845,26 @@ app.delete('/api/sessions/:sessionId', async (req, res) => {
         if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: '聊天历史数据库暂时不可用。' });
         const userId = requireSessionIdentity(req);
         const sessionId = normalizeIdentityPart(req.params.sessionId);
+        const session = await AiSession.findOne({ userId, sessionId }).select('foundryConversationId').lean();
         const files = await AiFile.find({ userId, sessionId }).lean();
         await Promise.allSettled(files.map(file => containerClient?.getBlockBlobClient(file.blobName).deleteIfExists()));
+        if (session?.foundryConversationId) {
+            try {
+                const { openai } = getFoundryClients();
+                await openai.conversations.delete(session.foundryConversationId);
+            } catch (error) {
+                // The tombstone still prevents further usage if Foundry has
+                // already expired the conversation or deletion is unavailable.
+                console.error('删除 Foundry conversation 失败:', error.message || error);
+            }
+        }
         await Promise.all([
             AiFile.deleteMany({ userId, sessionId }),
             AiMessage.deleteMany({ userId, sessionId }),
             AiSession.deleteOne({ userId, sessionId })
         ]);
+        foundryAgentConversations.delete(`${userId}:${sessionId}`);
+        await markAiSessionDeleted(userId, sessionId);
         res.json({ ok: true });
     } catch (error) {
         res.status(400).json({ error: error.message || '删除聊天失败。' });
