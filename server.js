@@ -23,8 +23,16 @@ app.use(cors({
     },
     credentials: false,
     methods: ['GET', 'POST', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Client-ID']
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Client-ID', 'X-AI-Access']
 }));
+const aiAccessTokens = new Map();
+app.use(['/api/ai-chat', '/api/ai-image', '/api/sessions'], (req, res, next) => {
+    const socket = aiAccessTokens.get(req.get('X-AI-Access'));
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+        return res.status(503).json({ error: '当前服务暂时不可用，请稍后再试。', code: 'SERVICE_UNAVAILABLE' });
+    }
+    next();
+});
 app.use(express.json({ limit: '35mb' }));
 app.use(express.urlencoded({ limit: '35mb', extended: true }));
 
@@ -1939,6 +1947,22 @@ let clients = new Map();
 wss.on('connection', async (ws, req) => {
     const nickname = decodeURIComponent(req.url.split('/socket/')[1] || "匿名粉丝");
     clients.set(ws, nickname);
+    // Register access handling before the asynchronous history query.
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message);
+            if (data.type !== 'ai_access' || nickname !== '拖') return;
+            if (!ws.aiAccessToken) {
+                ws.aiAccessToken = crypto.randomBytes(32).toString('base64url');
+                aiAccessTokens.set(ws.aiAccessToken, ws);
+            }
+            ws.send(JSON.stringify({ type: 'ai_access', token: ws.aiAccessToken }));
+        } catch (_) { /* Invalid messages are handled by the chat listener. */ }
+    });
+    ws.on('close', () => {
+        if (ws.aiAccessToken) aiAccessTokens.delete(ws.aiAccessToken);
+        clients.delete(ws); broadcastUserList();
+    });
     
     try {
         if(process.env.MONGODB_URI) {
@@ -1963,6 +1987,9 @@ wss.on('connection', async (ws, req) => {
     ws.on('message', async (message) => {
         try {
             const data = JSON.parse(message);
+            if (data.type === 'ai_access') {
+                return;
+            }
             
             // 👇 保护前端传来的 id，存入 schema 中定义的 entryId 字段
             if (data.id) {
@@ -1984,7 +2011,6 @@ wss.on('connection', async (ws, req) => {
         } catch (e) { console.error(e); }
     });
     
-    ws.on('close', () => { clients.delete(ws); broadcastUserList(); });
 });
 
 function broadcast(data) { wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(data); }); }
