@@ -44,4 +44,14 @@
 
 方案 A 的人设现在由 `config/chat-instructions.md` 管理，内容迁移自 Foundry Agent v15。继续在 Foundry 门户编辑旧 Agent 不会改变方案 A 的行为。
 
+## SVG / VDX 上传兼容修复
+
+- 新增 `lib/file-transport.js`，把不在 Files 上传白名单的扩展名无损包装为 UTF-8 单文件 ZIP；不转换文件内容。现有 ZIP 等支持格式不重复包装。
+- 新上传与历史重挂载共用同一处理路径；模型收到实际 ZIP 文件名和内部原文件名。Blob 保存原文件，临时下载恢复原始字节和 MIME 类型。
+- 本地 32 项测试通过，包含标准 Python ZIP 解析器的 CRC/中文文件名验证，以及网站 HTTP 上传、原文件下载、临时文件跨轮复用。
+- Azure 资源级真实测试：SVG、VDX 均成功解包和解析 XML，模型计算的 SHA256 与本地原始字节一致。
+- 部署后网站 SSE 验收通过：直接上传 SVG/VDX（约 18 秒）、从持久化历史重新读取（约 16 秒）、生成 SVG（约 19 秒）、下一轮重新读取该生成文件（约 13 秒）。原始文件下载字节一致，三次读取均核对 SHA256；独立测试会话和文件已清理。首次非流式验收发生网络连接中断，不作为成功结果计入；上述验收使用网站实际 SSE 路径。
+- 部署前原 server.js 备份：`/home/data/tuotuo-server-before-svg-fix-20260907.js`。
+- 本修复针对上传接口的 `Invalid extension svg`。它不等于修好了具体 SVG 在 PowerPoint 取消组合时的排版问题；后者仍需检查原图件。
+
 官方 API 依据：https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/responses

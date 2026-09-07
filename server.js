@@ -9,6 +9,7 @@ const { AIProjectClient } = require('@azure/ai-projects');
 const mongoose = require('mongoose');
 const { BlobServiceClient } = require('@azure/storage-blob');
 const { createDirectClient, buildDirectRequest } = require('./lib/direct-responses');
+const { prepareFileTransport, transportNote, unwrapFile } = require('./lib/file-transport');
 
 const app = express();
 const allowedOrigins = String(process.env.APP_ALLOWED_ORIGINS || '')
@@ -644,7 +645,7 @@ function selectRelevantSessionFiles(sessionFiles, userMessage, limit) {
 }
 
 function shouldAttachHistoricalFiles(userMessage) {
-    return /(文件|附件|文档|表格|数据|刚才|之前|上次|生成的|上传的|修改|编辑|转换|导出|下载|继续处理|word|docx?|pdf|excel|xlsx?|csv|pptx?|zip)/i
+    return /(文件|附件|文档|表格|数据|刚才|之前|上次|生成的|上传的|修改|编辑|转换|导出|下载|继续处理|word|docx?|pdf|excel|xlsx?|csv|pptx?|zip|svg|vdx|vsdx)/i
         .test(String(userMessage || ''));
 }
 
@@ -694,6 +695,7 @@ async function collectFoundryCodeInterpreterFiles(documents, sessionFiles, userI
                         filename: file.filename,
                         mimeType: contentTypeForFileName(file.filename),
                         existingFileId: grant.fileId,
+                        transport: grant.transport,
                         persistent: true,
                         isNewSessionFile: false
                     });
@@ -717,12 +719,14 @@ async function uploadFoundryCodeInterpreterFiles(openai, files) {
                 uploaded.push({
                     id: file.existingFileId,
                     filename: file.filename,
+                    transport: file.transport,
                     persistent: true,
                     isNewSessionFile: false
                 });
                 continue;
             }
-            const uploadable = await toFile(file.buffer, file.filename, { type: file.mimeType });
+            const prepared = prepareFileTransport(file);
+            const uploadable = await toFile(prepared.buffer, prepared.filename, { type: prepared.mimeType });
             // Microsoft Foundry's project-scoped Files API currently rejects
             // the OpenAI SDK's optional expires_after field. Access is bounded
             // by our 24-hour download/session grant instead.
@@ -731,6 +735,8 @@ async function uploadFoundryCodeInterpreterFiles(openai, files) {
             uploaded.push({
                 id: result.id,
                 filename: file.filename,
+                transport: prepared.transport,
+                createdThisInvocation: true,
                 persistent: file.persistent === true,
                 isNewSessionFile: file.isNewSessionFile === true
             });
@@ -738,7 +744,7 @@ async function uploadFoundryCodeInterpreterFiles(openai, files) {
         return uploaded;
     } catch (error) {
         await Promise.allSettled(uploaded
-            .filter(file => !file.persistent)
+            .filter(file => file.createdThisInvocation)
             .map(file => openai.files.delete(file.id)));
         throw error;
     }
@@ -757,6 +763,7 @@ function registerFoundryInputSessionFiles(uploadedFiles, userId) {
                 filename,
                 source: "files_api",
                 backend: chatBackend,
+                transport: file.transport,
                 expiresAt: Date.now() + 24 * 60 * 60 * 1000
             });
             return {
@@ -920,6 +927,10 @@ async function downloadSessionGeneratedFile(file, userId) {
         };
     }
     const downloaded = await downloadFoundryAgentFile(grant.containerId, grant.fileId, grant.backend || 'foundry-agent');
+    if (grant.transport?.wrapper === 'zip-store-v1') {
+        downloaded.buffer = unwrapFile(downloaded.buffer, grant.transport.originalFilename);
+        downloaded.contentType = grant.transport.originalMimeType || 'application/octet-stream';
+    }
     const filename = getFileNameFromPath(file.filename || grant.filename, "agent-output");
     return {
         filename,
@@ -1244,6 +1255,8 @@ async function prepareFoundryAgentInvocation({ userMessage, documents, images, h
         userId,
         attachmentFiles.map(file => file.filename)
     );
+    const note = transportNote(uploadedInputFiles);
+    if (note) content.push({ type: 'input_text', text: note });
     const currentMessage = { type: "message", role: "user", content };
     const agentBody = { agent_reference: buildFoundryAgentReference() };
     if (uploadedInputFiles.length) {
@@ -1507,7 +1520,10 @@ function contentTypeForFileName(filename, fallback = "application/octet-stream")
         csv: "text/csv; charset=utf-8",
         txt: "text/plain; charset=utf-8",
         json: "application/json; charset=utf-8",
-        zip: "application/zip"
+        zip: "application/zip",
+        svg: "image/svg+xml",
+        vdx: "application/vnd.visio",
+        vsdx: "application/vnd.ms-visio.drawing"
     };
     return types[ext] || fallback;
 }
@@ -1934,6 +1950,10 @@ app.get('/api/ai-agent-file/:downloadId', async (req, res) => {
         }
         const filename = getFileNameFromPath(grant.filename, 'agent-output');
         const file = await downloadFoundryAgentFile(grant.containerId, grant.fileId, grant.backend || 'foundry-agent');
+        if (grant.transport?.wrapper === 'zip-store-v1') {
+            file.buffer = unwrapFile(file.buffer, grant.transport.originalFilename);
+            file.contentType = grant.transport.originalMimeType || 'application/octet-stream';
+        }
         res.setHeader('Content-Type', contentTypeForFileName(filename, file.contentType || 'application/octet-stream'));
         res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
         res.send(file.buffer);
@@ -1952,6 +1972,7 @@ app.get('/api/status', (req, res) => {
         "AI 文件持久化": canUsePersistentAiStorage() ? "✅ MongoDB + Blob" : "⚠️ 临时模式",
         "公共 AI 访问": "✅ 已启用",
         "AI 聊天后端": chatBackend,
+        "AI 文件上传兼容": "zip-store-v1",
         "AI 聊天模型": directResponsesEnabled ? (process.env.AZURE_RESPONSES_DEPLOYMENT || 'gpt-6-astra') : '由 Foundry Agent 版本指定',
         "AI 推理强度": directResponsesEnabled ? (process.env.AZURE_RESPONSES_REASONING_EFFORT || 'medium') : '由 Foundry Agent 版本指定',
         "Foundry Project Endpoint": !!foundryProjectEndpoint ? "✅ 是" : "❌ 否",

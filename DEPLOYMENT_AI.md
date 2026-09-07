@@ -18,6 +18,7 @@ AZURE_RESPONSES_REASONING_EFFORT=medium
 - 人设说明现在来自 `config/chat-instructions.md`（迁移自 `tuo-agent` v15），由后端仓库管理。以后修改 Foundry Agent 说明不会自动改变方案 A。
 - MongoDB 继续保存和恢复历史，按现有近期窗口发送文本；不使用旧项目级 Conversation ID。Blob 原文件保留，每轮需要时重新上传并挂载真实 file ID，完成后清理本轮临时上传。文件下载卡片和前端 SSE 协议保持兼容。
 - 没有任何模型失败后自动降级到其他模型的逻辑；也不自动重复可能已执行的工具任务。历史文件读取失败时明确报错，不根据文字记录伪装成读取原文件。
+- SVG、VDX、VSDX 等不在 Azure Files 上传白名单中的扩展名，由 `lib/file-transport.js` 无损包装为单文件 ZIP 后挂载，并向模型说明如何读取。此规则同时覆盖新附件和历史文件重挂载。数据库/Blob 保存的仍是原文件；临时下载也会解开后端自身的包装，保留原文件名和字节。普通 PDF、Excel、PNG、ZIP 等不受影响，不会重复包装用户上传的 ZIP。
 - 此实现不保证任意复杂 Office 排版转换完全保真；Code Interpreter 运行环境和转换库仍有各自限制。
 - 需同时上传 `server.js`、`lib/`、`config/`、`package.json`、`test/`、`scripts/` 与部署文档，不能只上传 server.js。不要上传 node_modules、本地缓存或凭据。前端无需修改。
 - 回退只需将 `AI_CHAT_BACKEND=foundry-agent`，并保留原 `FOUNDRY_AGENT_NAME=tuo-agent` / `FOUNDRY_AGENT_VERSION=15`。不要删除原 Foundry 配置。

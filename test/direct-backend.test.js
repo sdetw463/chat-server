@@ -8,9 +8,20 @@ test('direct HTTP chat mounts uploads, serves generated files from the resource,
     process.env.AZURE_RESPONSES_ENDPOINT = 'https://example.openai.azure.com';
     const direct = require('../lib/direct-responses');
     const calls = [];
+    const uploads = [];
+    const uploadedBytes = new Map();
     let downloads = 0;
     direct.createDirectClient = () => ({
-        files: { create: async () => ({ id: 'file-upload' }), delete: async () => ({ deleted: true }) },
+        files: {
+            create: async ({ file }) => {
+                uploads.push(file);
+                const id = uploads.length === 1 ? 'file-upload' : `file-upload-${uploads.length}`;
+                uploadedBytes.set(id, Buffer.from(await file.arrayBuffer()));
+                return { id };
+            },
+            content: async id => new Response(uploadedBytes.get(id)),
+            delete: async () => ({ deleted: true })
+        },
         containers: { files: { content: { retrieve: async (id, args) => {
             assert.equal(id, 'cfile-test');
             assert.equal(args.container_id, 'cntr-test');
@@ -54,6 +65,28 @@ test('direct HTTP chat mounts uploads, serves generated files from the resource,
         const file = await fetch(base + result.files[0].url);
         assert.equal(await file.text(), 'generated-file');
         assert.equal(downloads, 1);
+        const svg = '<svg xmlns="http://www.w3.org/2000/svg"><text>中文图</text></svg>';
+        const svgRes = await fetch(base + '/api/ai-chat', {
+            method: 'POST', headers: { 'Content-Type': 'application/json', 'X-AI-Access': token },
+            body: JSON.stringify({ clientId: 'direct-test', message: '检查 SVG', documents: [{ name: '框架.svg', fileData: 'data:image/svg+xml;base64,' + Buffer.from(svg).toString('base64') }] })
+        });
+        assert.equal(svgRes.status, 200);
+        const svgResult = await svgRes.json();
+        assert.equal(uploads.at(-1).name, '框架.svg.zip');
+        assert.match(JSON.stringify(calls.at(-1).body.input), /附件传输说明/);
+        assert.equal(svgResult.sessionFiles[0].filename, '框架.svg');
+        const original = await fetch(base + svgResult.sessionFiles[0].url);
+        assert.equal(original.headers.get('content-type'), 'image/svg+xml');
+        assert.equal(await original.text(), svg);
+        const uploadCount = uploads.length;
+        const reuse = await fetch(base + '/api/ai-chat', {
+            method: 'POST', headers: { 'Content-Type': 'application/json', 'X-AI-Access': token },
+            body: JSON.stringify({ clientId: 'direct-test', message: '继续编辑 SVG', sessionFiles: svgResult.sessionFiles })
+        });
+        assert.equal(reuse.status, 200);
+        await reuse.json();
+        assert.equal(uploads.length, uploadCount);
+        assert.match(JSON.stringify(calls.at(-1).body.input), /框架.svg.zip/);
     } finally {
         ws.terminate();
         await new Promise(resolve => server.close(resolve));
