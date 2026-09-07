@@ -8,6 +8,7 @@ const { DefaultAzureCredential } = require('@azure/identity');
 const { AIProjectClient } = require('@azure/ai-projects');
 const mongoose = require('mongoose');
 const { BlobServiceClient } = require('@azure/storage-blob');
+const { createDirectClient, buildDirectRequest } = require('./lib/direct-responses');
 
 const app = express();
 const allowedOrigins = String(process.env.APP_ALLOWED_ORIGINS || '')
@@ -246,6 +247,9 @@ const foundryAgentName = process.env.FOUNDRY_AGENT_NAME
 const foundryAgentVersion = process.env.FOUNDRY_AGENT_VERSION
     || process.env.AZURE_AI_AGENT_VERSION
     || "";
+const chatBackend = process.env.AI_CHAT_BACKEND || 'foundry-agent';
+if (!['foundry-agent', 'direct-responses'].includes(chatBackend)) throw new Error('未知的 AI_CHAT_BACKEND。');
+const directResponsesEnabled = chatBackend === 'direct-responses';
 const foundryFileInputSlots = String(process.env.FOUNDRY_CODE_INTERPRETER_FILE_SLOTS
     || "attachment_file_1,attachment_file_2,attachment_file_3")
     .split(',')
@@ -270,6 +274,13 @@ const imageMaxRetries = Math.max(0, Number(process.env.AZURE_OPENAI_IMAGE_MAX_RE
 const azureCredential = new DefaultAzureCredential();
 let foundryProjectClient = null;
 let foundryOpenAIClient = null;
+let directOpenAIClient = null;
+
+function getChatClients() {
+    if (!directResponsesEnabled) return getFoundryClients();
+    if (!directOpenAIClient) directOpenAIClient = createDirectClient(azureCredential);
+    return { openai: directOpenAIClient };
+}
 
 function getFoundryClients() {
     assertFoundryAgentReady();
@@ -557,6 +568,10 @@ function getTextFromMessage(message) {
 }
 
 function assertFoundryAgentReady() {
+    if (directResponsesEnabled) {
+        if (!process.env.AZURE_RESPONSES_ENDPOINT) throw new Error('请配置资源级 AZURE_RESPONSES_ENDPOINT。');
+        return;
+    }
     if (!foundryProjectEndpoint || !foundryAgentName) {
         throw new Error('Foundry Agent 尚未配置完成。聊天不会降级到普通模型，请检查 FOUNDRY_PROJECT_ENDPOINT 和 FOUNDRY_AGENT_NAME。');
     }
@@ -674,7 +689,7 @@ async function collectFoundryCodeInterpreterFiles(documents, sessionFiles, userI
                     });
                     continue;
                 }
-                if (grant?.source === "files_api" && grant.fileId) {
+                if (grant?.source === "files_api" && grant.fileId && (grant.backend || 'foundry-agent') === chatBackend) {
                     files.push({
                         filename: file.filename,
                         mimeType: contentTypeForFileName(file.filename),
@@ -687,6 +702,7 @@ async function collectFoundryCodeInterpreterFiles(documents, sessionFiles, userI
                 }
             } catch (error) {
                 console.error("重新附加历史文件失败:", file.filename || file.downloadId, error.message || error);
+                throw new Error(`无法读取历史文件「${file.filename || '未命名文件'}」，请重新上传后再处理；本次不会根据聊天文字代替原文件。`);
             }
         }
     }
@@ -740,6 +756,7 @@ function registerFoundryInputSessionFiles(uploadedFiles, userId) {
                 containerId: "",
                 filename,
                 source: "files_api",
+                backend: chatBackend,
                 expiresAt: Date.now() + 24 * 60 * 60 * 1000
             });
             return {
@@ -902,7 +919,7 @@ async function downloadSessionGeneratedFile(file, userId) {
             buffer
         };
     }
-    const downloaded = await downloadFoundryAgentFile(grant.containerId, grant.fileId);
+    const downloaded = await downloadFoundryAgentFile(grant.containerId, grant.fileId, grant.backend || 'foundry-agent');
     const filename = getFileNameFromPath(file.filename || grant.filename, "agent-output");
     return {
         filename,
@@ -943,6 +960,7 @@ function normalizeAgentFileRecord(file, index = 0, userId) {
         fileId,
         containerId,
         filename,
+        backend: chatBackend,
         expiresAt: Date.now() + 24 * 60 * 60 * 1000
     });
     return record;
@@ -1181,17 +1199,17 @@ function buildFoundryResponseRequestBody({ conversationId, history, currentMessa
 async function prepareFoundryAgentInvocation({ userMessage, documents, images, historyMessages, reasoningMode, sessionId, sessionFiles, userId }) {
     assertFoundryAgentReady();
     validateAgentRequest({ userMessage, documents, images, historyMessages, sessionFiles });
-    const { openai } = getFoundryClients();
+    const { openai } = getChatClients();
     const conversationKey = sessionId ? `${userId}:${sessionId}` : '';
     await assertAiSessionActive(userId, sessionId);
     await ensureAiSession(userId, sessionId);
-    let conversationId = await getActiveFoundryConversation(conversationKey, userId, sessionId);
+    let conversationId = directResponsesEnabled ? null : await getActiveFoundryConversation(conversationKey, userId, sessionId);
     const resolvedHistory = await loadStoredConversationHistory(userId, sessionId, historyMessages);
     const history = buildConversationSeed(resolvedHistory);
 
     // Conversation mode is enabled by default for durable multi-turn context.
     // MongoDB remains the recovery source if the Foundry conversation expires.
-    if (foundryUseConversations && !conversationId) {
+    if (!directResponsesEnabled && foundryUseConversations && !conversationId) {
         try {
             const conversation = await openai.conversations.create(history.length ? { items: history } : {});
             conversationId = conversation && conversation.id;
@@ -1242,8 +1260,10 @@ async function prepareFoundryAgentInvocation({ userMessage, documents, images, h
         // Agent 版本是工具选择的唯一配置源。Foundry 不允许请求级
         // tool_choice 覆盖与 Agent 自身的 tool_choice 不同；附件只通过
         // structured_inputs 挂载，是否调用 Code Interpreter 由 Agent 决定。
-        requestBody: buildFoundryResponseRequestBody({ conversationId, history, currentMessage }),
-        requestOptions: {
+        requestBody: directResponsesEnabled
+            ? buildDirectRequest({ history, currentMessage, uploadedFiles: uploadedInputFiles })
+            : buildFoundryResponseRequestBody({ conversationId, history, currentMessage }),
+        requestOptions: directResponsesEnabled ? {} : {
             body: agentBody
         }
     };
@@ -1365,6 +1385,16 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
                 sendSSE(res, { delta: event.delta });
             } else if (event.type === "response.in_progress") {
                 sendProgress("正在分析并组织回答");
+            } else if (event.type === "response.mcp_list_tools.in_progress") {
+                sendProgress("正在连接可用工具", "mcp");
+            } else if (event.type === "response.mcp_call.in_progress") {
+                sendProgress("正在调用工具获取资料", "mcp");
+            } else if (event.type === "response.mcp_call.completed") {
+                sendProgress("工具调用完成，正在整理结果", "mcp");
+            } else if (event.type === "response.mcp_call.failed" || event.type === "response.mcp_list_tools.failed") {
+                sendProgress("工具暂时不可用，正在等待处理结果", "mcp");
+            } else if (event.type === "response.output_item.done" && event.item?.type === "mcp_approval_request") {
+                throw new Error("当前工具需要授权才能继续；网站尚未提供该授权交互，请管理员检查 Agent 的工具审批配置。");
             } else if (event.type === "response.web_search_call.in_progress") {
                 sendProgress("正在启动网页搜索", "web_search");
             } else if (event.type === "response.web_search_call.searching") {
@@ -1438,13 +1468,15 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
     }
 }
 
-async function downloadFoundryAgentFile(containerId, fileId) {
+async function downloadFoundryAgentFile(containerId, fileId, backend = chatBackend) {
     if (!fileId && containerId) {
         fileId = containerId;
         containerId = "";
     }
     if (!fileId) throw new Error("缺少 fileId，无法下载 Agent 生成文件。");
-    const { openai } = getFoundryClients();
+    const { openai } = backend === 'direct-responses'
+        ? { openai: directOpenAIClient || (directOpenAIClient = createDirectClient(azureCredential)) }
+        : getFoundryClients();
     const response = containerId
         ? await openai.containers.files.content.retrieve(fileId, { container_id: containerId })
         : await openai.files.content(fileId);
@@ -1633,8 +1665,10 @@ app.post('/api/ai-chat', async (req, res) => {
             sessionFiles: result.sessionFiles,
             foundryConversationId: result.conversationId || null,
             foundryResponseId: result.rawResponseId || null,
-            usedAgent: true,
-            agentName: foundryAgentName
+            usedAgent: !directResponsesEnabled,
+            agentName: directResponsesEnabled ? null : foundryAgentName,
+            backend: chatBackend,
+            model: directResponsesEnabled ? (process.env.AZURE_RESPONSES_DEPLOYMENT || 'gpt-6-astra') : null
         });
     } catch (error) {
         console.error('🔥 Foundry Agent 聊天失败:', error);
@@ -1899,7 +1933,7 @@ app.get('/api/ai-agent-file/:downloadId', async (req, res) => {
             return res.status(404).json({ error: '文件不存在或安全访问已过期。请重新生成或上传该文件。' });
         }
         const filename = getFileNameFromPath(grant.filename, 'agent-output');
-        const file = await downloadFoundryAgentFile(grant.containerId, grant.fileId);
+        const file = await downloadFoundryAgentFile(grant.containerId, grant.fileId, grant.backend || 'foundry-agent');
         res.setHeader('Content-Type', contentTypeForFileName(filename, file.contentType || 'application/octet-stream'));
         res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
         res.send(file.buffer);
@@ -1917,6 +1951,9 @@ app.get('/api/status', (req, res) => {
         "AI 历史持久化": mongoose.connection.readyState === 1 ? "✅ MongoDB" : "❌ 不可用",
         "AI 文件持久化": canUsePersistentAiStorage() ? "✅ MongoDB + Blob" : "⚠️ 临时模式",
         "公共 AI 访问": "✅ 已启用",
+        "AI 聊天后端": chatBackend,
+        "AI 聊天模型": directResponsesEnabled ? (process.env.AZURE_RESPONSES_DEPLOYMENT || 'gpt-6-astra') : '由 Foundry Agent 版本指定',
+        "AI 推理强度": directResponsesEnabled ? (process.env.AZURE_RESPONSES_REASONING_EFFORT || 'medium') : '由 Foundry Agent 版本指定',
         "Foundry Project Endpoint": !!foundryProjectEndpoint ? "✅ 是" : "❌ 否",
         "Foundry Agent 是否可用": !!foundryProjectEndpoint && !!foundryAgentName ? "✅ 是" : "❌ 否",
         "Foundry Agent 名称": foundryAgentName,
