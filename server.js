@@ -10,6 +10,7 @@ const mongoose = require('mongoose');
 const { BlobServiceClient } = require('@azure/storage-blob');
 const { createDirectClient, buildDirectRequest } = require('./lib/direct-responses');
 const { prepareFileTransport, transportNote, unwrapFile } = require('./lib/file-transport');
+const { MAX_FILE_BYTES, MAX_TOTAL_BYTES, MAX_ATTACHMENTS, CHAT_JSON_LIMIT } = require('./lib/file-limits');
 
 const app = express();
 const allowedOrigins = String(process.env.APP_ALLOWED_ORIGINS || '')
@@ -35,8 +36,13 @@ app.use(['/api/ai-chat', '/api/ai-image', '/api/sessions'], (req, res, next) => 
     }
     next();
 });
+app.use('/api/ai-chat', express.json({ limit: CHAT_JSON_LIMIT }));
 app.use(express.json({ limit: '35mb' }));
 app.use(express.urlencoded({ limit: '35mb', extended: true }));
+app.use((error, req, res, next) => {
+    if (error?.type === 'entity.too.large') return res.status(413).json({ code: 'PAYLOAD_TOO_LARGE', error: '请求体过大，请使用新版网页的分块文件上传，勿将大文件放入聊天JSON。' });
+    next(error);
+});
 
 // ==========================================
 // 1. 初始化数据库和对象存储
@@ -594,7 +600,7 @@ async function buildFoundryAgentUserContent(userMessage, documents, images, reas
     const fileDocs = docs.filter(isInlineInputFileDocument).slice(0, 5);
     const contentDocs = docs.filter(doc => doc && doc.content && !isInlineInputFileDocument(doc));
     const names = (attachmentNames.length ? attachmentNames : fileDocs.map(doc => safeFileName(doc.name || "attachment")))
-        .slice(0, foundryFileInputSlots.length);
+        .slice(0, directResponsesEnabled ? MAX_ATTACHMENTS : foundryFileInputSlots.length);
     const fileSummary = names.length
         ? `\n\n本轮已附加文件：\n${names.map(name => `- ${name}`).join('\n')}`
         : '';
@@ -606,15 +612,26 @@ async function buildFoundryAgentUserContent(userMessage, documents, images, reas
     const normalizedImages = (Array.isArray(images) ? images : [images])
         .map(normalizeChatImage)
         .filter(image => typeof image === 'string' && image.length > 0)
-        .slice(0, 4);
+        .slice(0, directResponsesEnabled ? MAX_ATTACHMENTS : 4);
     normalizedImages.forEach(imageUrl => parts.push({ type: 'input_image', image_url: imageUrl, detail: 'auto' }));
     return parts;
 }
 
-const MAX_AGENT_FILE_BYTES = 10 * 1024 * 1024;
-const MAX_AGENT_TOTAL_FILE_BYTES = 20 * 1024 * 1024;
+const MAX_AGENT_FILE_BYTES = MAX_FILE_BYTES;
+const MAX_AGENT_TOTAL_FILE_BYTES = MAX_TOTAL_BYTES;
+
+function dataUrlFileSize(value) {
+    if (typeof value !== 'string') return -1;
+    const prefix = value.match(/^data:([^;,]+);base64,/i);
+    if (!prefix) return -1;
+    const data = value.slice(prefix[0].length);
+    if (!data.length || data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(data)) return -1;
+    return data.length / 4 * 3 - (data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0);
+}
 
 function parseDataUrlFile(doc) {
+    const size = dataUrlFileSize(doc?.fileData);
+    if (size <= 0 || size > MAX_AGENT_FILE_BYTES) return null;
     const match = String(doc && doc.fileData || "").match(/^data:([^;]+);base64,(.+)$/i);
     if (!match) return null;
     const filename = safeFileName(doc.name || "attachment");
@@ -651,16 +668,35 @@ function shouldAttachHistoricalFiles(userMessage) {
 
 async function collectFoundryCodeInterpreterFiles(documents, sessionFiles, userId, sessionId, userMessage) {
     const files = [];
+    files.omittedFilenames = [];
+    const usedBytes = () => files.reduce((sum, file) => sum + (file.buffer?.length || file.size || 0), 0);
+    const addHistoricalFile = file => {
+        if ((file.buffer?.length || file.size || 0) + usedBytes() > MAX_AGENT_TOTAL_FILE_BYTES) {
+            files.omittedFilenames.push(file.filename);
+        } else files.push(file);
+    };
     const rawDocs = (Array.isArray(documents) ? documents : [])
         .filter(isInlineInputFileDocument)
-        .slice(0, foundryFileInputSlots.length);
+        .slice(0, directResponsesEnabled ? MAX_ATTACHMENTS : foundryFileInputSlots.length);
 
     for (const doc of rawDocs) {
         const parsed = parseDataUrlFile(doc);
         if (parsed) files.push({ ...parsed, persistent: true, isNewSessionFile: true });
     }
 
-    const remaining = foundryFileInputSlots.length - files.length;
+    // New upload references and old inline payloads share the same execution
+    // path. Resolve only durable files owned by this exact user AND session.
+    const referencedIds = new Set();
+    for (const doc of (documents || []).filter(doc => doc?.uploadToken)) {
+        if (referencedIds.has(doc.uploadToken)) throw new Error('本轮包含重复附件。');
+        referencedIds.add(doc.uploadToken);
+        const record = await resolveStoredFile(doc.uploadToken, userId, sessionId);
+        if (!record?.blobName || record.sessionId !== sessionId || !Number.isSafeInteger(record.size) || record.size <= 0 || record.size > MAX_AGENT_FILE_BYTES) throw new Error('附件不存在、已失效、超限或不属于当前会话，请重新上传。');
+        if (usedBytes() + record.size > MAX_AGENT_TOTAL_FILE_BYTES) throw new Error('本轮附件合计不能超过500MB。');
+        files.push({ filename: record.filename, mimeType: record.mimeType, blobName: record.blobName, size: record.size, persistent: false, isNewSessionFile: false });
+    }
+
+    const remaining = (directResponsesEnabled ? MAX_ATTACHMENTS : foundryFileInputSlots.length) - files.length;
     if (remaining > 0 && shouldAttachHistoricalFiles(userMessage)) {
         let candidates = normalizeSessionFileReferences(sessionFiles);
         if (mongoose.connection.readyState === 1 && sessionId) {
@@ -675,32 +711,39 @@ async function collectFoundryCodeInterpreterFiles(documents, sessionFiles, userI
             }));
             candidates = [...candidates, ...storedRefs];
         }
+        candidates = candidates.filter(file => !referencedIds.has(file.downloadId) && !files.some(current => current.filename === file.filename));
         const selected = selectRelevantSessionFiles(candidates, userMessage, remaining);
         for (const file of selected) {
             try {
                 const grant = file._storedRecord || await resolveStoredFile(file.downloadId, userId, sessionId);
                 if (!grant) throw new Error('文件记录不存在或不属于当前会话。');
+                if (Number(grant.size || 0) + usedBytes() > MAX_AGENT_TOTAL_FILE_BYTES) {
+                    files.omittedFilenames.push(file.filename);
+                    continue;
+                }
                 if (grant.blobName) {
-                    files.push({
+                    addHistoricalFile({
                         filename: file.filename,
                         mimeType: grant.mimeType || contentTypeForFileName(file.filename),
-                        buffer: await downloadBlobBuffer(grant.blobName),
+                        blobName: grant.blobName,
+                        size: grant.size,
                         persistent: false,
                         isNewSessionFile: false
                     });
                     continue;
                 }
                 if (grant?.source === "files_api" && grant.fileId && (grant.backend || 'foundry-agent') === chatBackend) {
-                    files.push({
+                    addHistoricalFile({
                         filename: file.filename,
                         mimeType: contentTypeForFileName(file.filename),
                         existingFileId: grant.fileId,
+                        size: grant.size,
                         transport: grant.transport,
                         persistent: true,
                         isNewSessionFile: false
                     });
                 } else {
-                    files.push(await downloadSessionGeneratedFile({ ...file, sessionId }, userId));
+                    addHistoricalFile(await downloadSessionGeneratedFile({ ...file, sessionId }, userId));
                 }
             } catch (error) {
                 console.error("重新附加历史文件失败:", file.filename || file.downloadId, error.message || error);
@@ -708,10 +751,16 @@ async function collectFoundryCodeInterpreterFiles(documents, sessionFiles, userI
             }
         }
     }
+    const bytes = files.reduce((total, file) => total + (file.buffer?.length || file.size || 0), 0);
+    if (bytes > MAX_AGENT_TOTAL_FILE_BYTES) throw new Error('本轮挂载文件（含历史文件）合计超过 500MB，请减少本轮文件范围。');
     return files;
 }
 
 async function uploadFoundryCodeInterpreterFiles(openai, files) {
+    return require('./lib/file-memory').withFileMemory(() => uploadFoundryCodeInterpreterFilesSequential(openai, files));
+}
+
+async function uploadFoundryCodeInterpreterFilesSequential(openai, files) {
     const uploaded = [];
     try {
         for (const file of files) {
@@ -720,12 +769,16 @@ async function uploadFoundryCodeInterpreterFiles(openai, files) {
                     id: file.existingFileId,
                     filename: file.filename,
                     transport: file.transport,
+                    size: file.size,
                     persistent: true,
                     isNewSessionFile: false
                 });
                 continue;
             }
-            const prepared = prepareFileTransport(file);
+            // Mount persisted files sequentially instead of materializing a
+            // whole 500MB batch in memory at once.
+            const buffer = file.buffer || await downloadBlobBuffer(file.blobName);
+            const prepared = prepareFileTransport({ ...file, buffer });
             const uploadable = await toFile(prepared.buffer, prepared.filename, { type: prepared.mimeType });
             // Microsoft Foundry's project-scoped Files API currently rejects
             // the OpenAI SDK's optional expires_after field. Access is bounded
@@ -736,6 +789,7 @@ async function uploadFoundryCodeInterpreterFiles(openai, files) {
                 id: result.id,
                 filename: file.filename,
                 transport: prepared.transport,
+                size: buffer.length,
                 createdThisInvocation: true,
                 persistent: file.persistent === true,
                 isNewSessionFile: file.isNewSessionFile === true
@@ -764,6 +818,7 @@ function registerFoundryInputSessionFiles(uploadedFiles, userId) {
                 source: "files_api",
                 backend: chatBackend,
                 transport: file.transport,
+                size: file.size,
                 expiresAt: Date.now() + 24 * 60 * 60 * 1000
             });
             return {
@@ -1171,18 +1226,21 @@ function validateAgentRequest({ userMessage, documents, images, historyMessages,
     if (!String(userMessage || '').trim() && !(Array.isArray(documents) && documents.length) && !(Array.isArray(images) && images.length)) {
         throw new Error('请输入消息或添加附件。');
     }
-    if (Array.isArray(documents) && documents.length > 3) throw new Error('一次最多处理 3 个文件。');
-    if (Array.isArray(images) && images.length > 4) throw new Error('一次最多处理 4 张聊天图片。');
+    const maxAttachments = directResponsesEnabled ? MAX_ATTACHMENTS : foundryFileInputSlots.length;
+    if ((Array.isArray(documents) ? documents.length : 0) + (Array.isArray(images) ? images.length : 0) > maxAttachments) throw new Error(`一次最多处理 ${maxAttachments} 个附件。`);
+    for (const doc of (Array.isArray(documents) ? documents : [])) {
+        if (doc?.uploadToken !== undefined && (typeof doc.uploadToken !== 'string' || !doc.uploadToken || doc.uploadToken.length > 256 || doc.fileData !== undefined)) throw new Error('附件引用格式不正确，请重新上传。');
+    }
     if (Array.isArray(historyMessages) && historyMessages.length > 300) throw new Error('历史消息数量超出限制。');
     if (Array.isArray(sessionFiles) && sessionFiles.length > aiSessionFileLimit) throw new Error('历史文件数量超出限制。');
     const rawFiles = (Array.isArray(documents) ? documents : [])
         .filter(doc => doc && Object.prototype.hasOwnProperty.call(doc, 'fileData'));
     const totalBytes = rawFiles.reduce((sum, doc) => {
-        const parsed = parseDataUrlFile(doc);
-        if (!parsed) throw new Error(`附件 ${safeFileName(doc && doc.name || '未命名文件')} 无效或超过 10MB。`);
-        return sum + parsed.buffer.length;
+        const size = dataUrlFileSize(doc?.fileData);
+        if (size <= 0 || size > MAX_AGENT_FILE_BYTES) throw new Error(`附件 ${safeFileName(doc && doc.name || '未命名文件')} 无效或超过 200MB。`);
+        return sum + size;
     }, 0);
-    if (totalBytes > MAX_AGENT_TOTAL_FILE_BYTES) throw new Error('单次原始附件合计不能超过 20MB。');
+    if (totalBytes > MAX_AGENT_TOTAL_FILE_BYTES) throw new Error('单次原始附件合计不能超过 500MB。');
 }
 
 async function getActiveFoundryConversation(conversationKey, userId, sessionId) {
@@ -1257,6 +1315,7 @@ async function prepareFoundryAgentInvocation({ userMessage, documents, images, h
     );
     const note = transportNote(uploadedInputFiles);
     if (note) content.push({ type: 'input_text', text: note });
+    if (attachmentFiles.omittedFilenames?.length) content.push({ type: 'input_text', text: `以下历史文件因本轮500MB挂载总量限制未附加：${JSON.stringify(attachmentFiles.omittedFilenames)}。这些文件没有丢失；不要声称已读取它们，也不要根据对话文字重建原文件。如果任务需要这些文件，请明确说明限制并让用户减少本轮附件或分批处理。` });
     const currentMessage = { type: "message", role: "user", content };
     const agentBody = { agent_reference: buildFoundryAgentReference() };
     if (uploadedInputFiles.length) {
@@ -1645,6 +1704,13 @@ function buildAgentRequestFromHttp(req, images) {
     };
 }
 
+require('./lib/chunk-uploads').installChunkUploads(app, express, {
+    identity: requireSessionIdentity,
+    ready: canUsePersistentAiStorage,
+    active: assertAiSessionActive,
+    persist: persistFileBuffer
+});
+
 app.post('/api/ai-chat', async (req, res) => {
     const wantsStream = req.body.stream === true || req.body.stream === 'true';
     try {
@@ -1973,6 +2039,10 @@ app.get('/api/status', (req, res) => {
         "公共 AI 访问": "✅ 已启用",
         "AI 聊天后端": chatBackend,
         "AI 文件上传兼容": "zip-store-v1",
+        "AI 文件上传上限（MB）": MAX_AGENT_FILE_BYTES / 1024 ** 2,
+        "AI 单轮附件上限（MB）": MAX_AGENT_TOTAL_FILE_BYTES / 1024 ** 2,
+        "AI 单轮附件数量": directResponsesEnabled ? MAX_ATTACHMENTS : foundryFileInputSlots.length,
+        "AI 分块上传": "4MB / 持久化引用",
         "AI 聊天模型": directResponsesEnabled ? (process.env.AZURE_RESPONSES_DEPLOYMENT || 'gpt-6-astra') : '由 Foundry Agent 版本指定',
         "AI 推理强度": directResponsesEnabled ? (process.env.AZURE_RESPONSES_REASONING_EFFORT || 'medium') : '由 Foundry Agent 版本指定',
         "Foundry Project Endpoint": !!foundryProjectEndpoint ? "✅ 是" : "❌ 否",
@@ -2097,8 +2167,10 @@ module.exports = {
         extractCitationSources,
         extractGeneratedFiles,
         parseDataUrlFile,
+        dataUrlFileSize,
         resolveImageSize,
         validateAgentRequest,
+        collectFoundryCodeInterpreterFiles,
         formatFoundryIncompleteResponse
     }
 };
