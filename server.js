@@ -268,7 +268,31 @@ const aiContextMessageLimit = Math.min(80, Math.max(12, Number(process.env.AI_CO
 const aiContextCharacterBudget = Math.min(200_000, Math.max(24_000, Number(process.env.AI_CONTEXT_CHARACTER_BUDGET || 90_000)));
 const aiSessionFileLimit = Math.min(200, Math.max(12, Number(process.env.AI_SESSION_FILE_LIMIT || 80)));
 const aiSessionStorageMaxBytes = Math.min(10 * 1024 ** 3, Math.max(100 * 1024 ** 2, Number(process.env.AI_SESSION_STORAGE_MAX_BYTES || 1024 ** 3)));
-const foundryStreamMaxMs = Math.max(60_000, Number(process.env.FOUNDRY_STREAM_MAX_MS || 20 * 60 * 1000));
+// A stream is allowed to run until the client disconnects or the upstream
+// Responses API finishes. Set FOUNDRY_STREAM_MAX_MS to a positive value only
+// when an operator explicitly wants an application-level safety cap; 0 or an
+// unset value means no application-level duration limit.
+const MAX_NODE_TIMER_MS = 2_147_000_000;
+// openai-node requires a non-negative integer timeout and uses a timer while
+// waiting for the initial HTTP response. Keep that timer below Node's
+// 32-bit setTimeout ceiling when the stream cap is disabled; once headers have
+// arrived, the SDK clears it and the SSE stream can continue indefinitely.
+const MAX_SDK_REQUEST_TIMEOUT_MS = MAX_NODE_TIMER_MS;
+function resolveFoundryStreamTimeouts(rawValue) {
+    const configured = Number(rawValue);
+    const streamMaxMs = Number.isFinite(configured) && configured > 0
+        ? Math.min(MAX_NODE_TIMER_MS, Math.max(60_000, configured))
+        : 0;
+    const sdkRequestTimeoutMs = Math.min(
+        streamMaxMs > 0 ? streamMaxMs + 60_000 : MAX_SDK_REQUEST_TIMEOUT_MS,
+        MAX_SDK_REQUEST_TIMEOUT_MS
+    );
+    return { streamMaxMs, sdkRequestTimeoutMs };
+}
+const {
+    streamMaxMs: foundryStreamMaxMs,
+    sdkRequestTimeoutMs: foundrySdkRequestTimeoutMs
+} = resolveFoundryStreamTimeouts(process.env.FOUNDRY_STREAM_MAX_MS);
 const foundryStreamHeartbeatMs = Math.max(5_000, Number(process.env.FOUNDRY_STREAM_HEARTBEAT_MS || 15_000));
 const foundryAgentConversations = new Map();
 const foundryGeneratedFiles = new Map();
@@ -661,12 +685,21 @@ function selectRelevantSessionFiles(sessionFiles, userMessage, limit) {
         .map(item => item.file);
 }
 
-function shouldAttachHistoricalFiles(userMessage) {
-    return /(文件|附件|文档|表格|数据|刚才|之前|上次|生成的|上传的|修改|编辑|转换|导出|下载|继续处理|word|docx?|pdf|excel|xlsx?|csv|pptx?|zip|svg|vdx|vsdx)/i
-        .test(String(userMessage || ''));
+function isContinuationRequest(userMessage) {
+    const normalized = String(userMessage || '')
+        .trim()
+        .replace(/[\s，。！？!?；;：:、,]+/g, '');
+    return /^(?:(?:好|好的|那|那么|请|就|麻烦)?(?:继续|接着|恢复|续上)(?:做|处理|工作|上次|刚才)?(?:吧|一下)?)$/i.test(normalized)
+        || /^(?:上次没完成|未完成的任务)(?:继续)?$/i.test(normalized);
 }
 
-async function collectFoundryCodeInterpreterFiles(documents, sessionFiles, userId, sessionId, userMessage) {
+function shouldAttachHistoricalFiles(userMessage) {
+    return isContinuationRequest(userMessage)
+        || /(文件|附件|文档|表格|数据|刚才|之前|上次|生成的|上传的|修改|编辑|转换|导出|下载|word|docx?|pdf|excel|xlsx?|csv|pptx?|zip|svg|vdx|vsdx)/i
+            .test(String(userMessage || ''));
+}
+
+async function collectFoundryCodeInterpreterFiles(documents, sessionFiles, userId, sessionId, userMessage, historyMessages = []) {
     const files = [];
     files.omittedFilenames = [];
     const usedBytes = () => files.reduce((sum, file) => sum + (file.buffer?.length || file.size || 0), 0);
@@ -704,15 +737,29 @@ async function collectFoundryCodeInterpreterFiles(documents, sessionFiles, userI
                 .sort((a, b) => new Date(a.updatedAt || a.createdAt || 0) - new Date(b.updatedAt || b.createdAt || 0));
             const storedRefs = stored.map(record => ({
                 filename: record.filename,
-                downloadId: '',
+                downloadId: String(record.downloadId || ''),
                 storageId: String(record._id),
                 type: 'file',
                 _storedRecord: record
             }));
             candidates = [...candidates, ...storedRefs];
         }
+        const seenCandidateKeys = new Set();
+        candidates = candidates.filter(file => {
+            const key = file.downloadId || file.storageId || `${file.filename}:${file.type || 'file'}`;
+            if (seenCandidateKeys.has(key)) return false;
+            seenCandidateKeys.add(key);
+            return true;
+        });
         candidates = candidates.filter(file => !referencedIds.has(file.downloadId) && !files.some(current => current.filename === file.filename));
-        const selected = selectRelevantSessionFiles(candidates, userMessage, remaining);
+        // A continuation such as “继续” often omits the filename. Include the
+        // recent conversation when scoring candidates so the files mentioned
+        // in the unfinished request are preferred over unrelated old files.
+        const selectionText = [
+            userMessage,
+            ...(Array.isArray(historyMessages) ? historyMessages.slice(-12).map(getTextFromMessage) : [])
+        ].filter(Boolean).join('\n');
+        const selected = selectRelevantSessionFiles(candidates, selectionText, remaining);
         for (const file of selected) {
             try {
                 const grant = file._storedRecord || await resolveStoredFile(file.downloadId, userId, sessionId);
@@ -1300,7 +1347,8 @@ async function prepareFoundryAgentInvocation({ userMessage, documents, images, h
         sessionFiles,
         userId,
         sessionId,
-        userMessage
+        userMessage,
+        resolvedHistory
     );
     const uploadedInputFiles = await uploadFoundryCodeInterpreterFiles(openai, attachmentFiles);
     const rememberedInputFiles = await persistNewInputSessionFiles(attachmentFiles, uploadedInputFiles, userId, sessionId);
@@ -1403,6 +1451,8 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
     const startedAt = Date.now();
     const elapsedSeconds = () => Math.max(0, Math.round((Date.now() - startedAt) / 1000));
     let invocation = null;
+    let response = null;
+    let streamedText = "";
     let lastStatus = "";
     let lastTool = "agent";
     const sendProgress = (status, tool = "agent") => {
@@ -1437,18 +1487,16 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
                 {
                     ...invocation.requestOptions,
                     signal: abortSignal,
-                    // Keep the SDK's own request timeout slightly above our explicit
-                    // stream limit, otherwise a client default could end a long tool run first.
-                    timeout: foundryStreamMaxMs + 60_000
+                    // Keep the SDK's initial-response timeout independent from the
+                    // optional application stream cap. With the default cap of 0,
+                    // this does not stop an established SSE stream.
+                    timeout: foundrySdkRequestTimeoutMs
                 }
             );
         } catch (error) {
             forgetInvalidConversation(invocation, error);
             throw error;
         }
-        let response = null;
-        let streamedText = "";
-
         for await (const event of stream) {
             if (event.type === "response.output_text.delta" && event.delta) {
                 streamedText += event.delta;
@@ -1531,6 +1579,26 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
             ? abortSignal.reason
             : error;
         console.error(`[Foundry SSE +${elapsedSeconds()}s] failed:`, effectiveError?.message || effectiveError);
+        const partialText = String(streamedText || extractResponseText(response) || '').trim();
+        if (partialText && args.userId && args.sessionId) {
+            const partialReply = `${partialText}\n\n> ⚠️ 流式生成未正常结束：${effectiveError?.message || '连接提前中断，请重试。'}`;
+            try {
+                // Persist the partial turn on the server as well as in the
+                // browser. The request id makes this idempotent when the
+                // browser later synchronizes its fuller copy.
+                await persistCompletedChatTurn({
+                    userId: args.userId,
+                    sessionId: args.sessionId,
+                    userMessage: args.userMessage,
+                    reply: partialReply,
+                    sources: [],
+                    files: [],
+                    requestId: args.requestId
+                });
+            } catch (persistError) {
+                console.error('保存流式部分回答失败:', persistError.message || persistError);
+            }
+        }
         if (effectiveError !== error) throw effectiveError;
         forgetInvalidConversation(invocation, error);
         throw error;
@@ -1725,17 +1793,20 @@ app.post('/api/ai-chat', async (req, res) => {
             res.once('close', () => {
                 if (!res.writableEnded) controller.abort();
             });
-            const streamTimeout = setTimeout(() => {
-                if (!controller.signal.aborted) {
-                    const minutes = Math.max(1, Math.ceil(foundryStreamMaxMs / 60000));
-                    controller.abort(new Error(`Foundry Agent 处理超过 ${minutes} 分钟，已停止本次流式连接。已生成内容会保留，请重试或把任务拆成更小步骤。`));
-                }
-            }, foundryStreamMaxMs);
-            streamTimeout.unref?.();
+            let streamTimeout = null;
+            if (foundryStreamMaxMs > 0) {
+                streamTimeout = setTimeout(() => {
+                    if (!controller.signal.aborted) {
+                        const minutes = Math.max(1, Math.ceil(foundryStreamMaxMs / 60000));
+                        controller.abort(new Error(`Foundry Agent 处理超过 ${minutes} 分钟，已停止本次流式连接。已生成内容会保留，请重试或把任务拆成更小步骤。`));
+                    }
+                }, foundryStreamMaxMs);
+                streamTimeout.unref?.();
+            }
             try {
                 return await handleFoundryAgentChatSSE(agentRequest, res, controller.signal);
             } finally {
-                clearTimeout(streamTimeout);
+                if (streamTimeout) clearTimeout(streamTimeout);
             }
         }
 
@@ -1919,7 +1990,10 @@ app.get('/api/sessions', async (req, res) => {
                 rootSessionId: session.rootSessionId || session.sessionId,
                 branchDepth: session.branchDepth || 0,
                 createdAt: session.createdAt?.getTime?.() || Date.now(),
-                updatedAt: Math.max(session.clientUpdatedAt || 0, session.updatedAt?.getTime?.() || 0),
+                // Syncing an old chat touches the Mongo timestamp, but must
+                // not make that conversation appear recently used.
+                updatedAt: Math.max(0, ...messages.map(message => Number(message.clientCreatedAt) || message.createdAt?.getTime?.() || 0))
+                    || session.clientUpdatedAt || session.createdAt?.getTime?.() || 0,
                 messages: messages.map(message => ({
                     id: message.messageId,
                     role: message.role,
@@ -2049,7 +2123,9 @@ app.get('/api/status', (req, res) => {
         "Foundry Agent 是否可用": !!foundryProjectEndpoint && !!foundryAgentName ? "✅ 是" : "❌ 否",
         "Foundry Agent 名称": foundryAgentName,
         "Foundry Agent 版本": foundryAgentVersion || "默认最新版",
-        "Foundry 流式最大时长（分钟）": Number((foundryStreamMaxMs / 60000).toFixed(2)),
+        "Foundry 流式最大时长（分钟）": foundryStreamMaxMs > 0
+            ? Number((foundryStreamMaxMs / 60000).toFixed(2))
+            : "无限制（客户端断开、上游结束或服务重启时停止）",
         "Foundry SSE 心跳间隔（秒）": Number((foundryStreamHeartbeatMs / 1000).toFixed(2)),
         "Code Interpreter 运行时附件槽": foundryFileInputSlots.join(', '),
         "AI 近期上下文消息上限": aiContextMessageLimit,
@@ -2160,6 +2236,7 @@ module.exports = {
         buildFoundryAgentUserContent,
         buildFoundryAgentUserMessage,
         selectRelevantSessionFiles,
+        isContinuationRequest,
         shouldAttachHistoricalFiles,
         sanitizeStoredMediaHtml,
         sanitizeStoredMessage,
@@ -2171,6 +2248,7 @@ module.exports = {
         resolveImageSize,
         validateAgentRequest,
         collectFoundryCodeInterpreterFiles,
-        formatFoundryIncompleteResponse
+        formatFoundryIncompleteResponse,
+        resolveFoundryStreamTimeouts
     }
 };
