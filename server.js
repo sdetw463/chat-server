@@ -96,6 +96,7 @@ const aiMessageSchema = new mongoose.Schema({
     sources: { type: [mongoose.Schema.Types.Mixed], default: [] },
     generatedFiles: { type: [mongoose.Schema.Types.Mixed], default: [] },
     sessionFiles: { type: [mongoose.Schema.Types.Mixed], default: [] },
+    progress: { type: mongoose.Schema.Types.Mixed, default: null },
     clientCreatedAt: { type: Number, default: 0 }
 }, { timestamps: true });
 
@@ -1191,6 +1192,26 @@ function sanitizeStoredMediaHtml(value) {
     return '';
 }
 
+// Persist only bounded, public progress metadata; never raw reasoning or tool payloads.
+function sanitizeStoredProgress(raw) {
+    if (!raw || typeof raw !== 'object' || raw.version !== 1) return null;
+    const boundMs = value => Math.max(0, Math.min(86400000, Number(value) || 0));
+    const entries = (Array.isArray(raw.entries) ? raw.entries : []).slice(-32)
+        .filter(entry => entry && typeof entry.text === 'string' && entry.text.trim())
+        .map(entry => ({
+            kind: entry.kind === 'summary' ? 'summary' : 'status',
+            text: entry.text.replace(/\u0000/g, '').slice(0, 1600),
+            atMs: boundMs(entry.atMs),
+            key: typeof entry.key === 'string' ? entry.key.slice(0, 180) : ''
+        }));
+    return {
+        version: 1,
+        status: ['error', 'stopped'].includes(raw.status) ? raw.status : 'completed',
+        elapsedMs: boundMs(raw.elapsedMs),
+        entries
+    };
+}
+
 function sanitizeStoredMessage(message, fallbackId = '') {
     if (!message || !['user', 'assistant'].includes(message.role)) return null;
     const content = String(message.content || message.userText || '').slice(0, 32000);
@@ -1206,6 +1227,7 @@ function sanitizeStoredMessage(message, fallbackId = '') {
         sources: Array.isArray(message.sources) ? message.sources.slice(0, 20) : [],
         generatedFiles: Array.isArray(message.generatedFiles || message.files) ? (message.generatedFiles || message.files).slice(0, 30) : [],
         sessionFiles: Array.isArray(message.sessionFiles) ? message.sessionFiles.slice(0, 30) : [],
+        ...(sanitizeStoredProgress(message.progress) ? { progress: sanitizeStoredProgress(message.progress) } : {}),
         clientCreatedAt: Number(message.createdAt) || 0
     };
 }
@@ -1259,13 +1281,13 @@ async function loadStoredConversationHistory(userId, sessionId, fallbackHistory)
     return stored.map(message => ({ role: message.role, content: message.content }));
 }
 
-async function persistCompletedChatTurn({ userId, sessionId, userMessage, reply, sources, files, requestId }) {
+async function persistCompletedChatTurn({ userId, sessionId, userMessage, reply, sources, files, requestId, progress }) {
     if (mongoose.connection.readyState !== 1 || !sessionId) return;
     await ensureAiSession(userId, sessionId);
     const baseId = normalizeIdentityPart(requestId, 140) || crypto.randomUUID();
     await upsertStoredMessages(userId, sessionId, [
         { id: `${baseId}:user`, role: 'user', content: userMessage, createdAt: Date.now() - 1 },
-        { id: `${baseId}:assistant`, role: 'assistant', content: reply, sources, generatedFiles: files, createdAt: Date.now() }
+        { id: `${baseId}:assistant`, role: 'assistant', content: reply, sources, generatedFiles: files, progress, createdAt: Date.now() }
     ]);
 }
 
@@ -1455,11 +1477,37 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
     let streamedText = "";
     let lastStatus = "";
     let lastTool = "agent";
+    const progressEntries = [];
+    const pushProgressEntry = entry => {
+        progressEntries.push(entry);
+        if (progressEntries.length > 32) progressEntries.shift();
+    };
+    const sendPublicSummary = (key, value, replace = false) => {
+        if (typeof value !== 'string' || !value) return;
+        key = String(key).slice(0, 180);
+        let entry = progressEntries.find(item => item.kind === 'summary' && item.key === key);
+        if (!entry) {
+            entry = { kind: 'summary', key, text: '', atMs: Date.now() - startedAt };
+            pushProgressEntry(entry);
+        }
+        entry.text = (replace ? value : entry.text + value).replace(/\u0000/g, '').slice(0, 1600);
+        // Full bounded text makes delta and final-item events idempotent for the browser.
+        sendSSE(res, { summaryKey: key, summaryText: entry.text });
+    };
+    const sendItemSummaries = (item, index = 0) => {
+        if (item?.type !== 'reasoning' || !Array.isArray(item.summary)) return;
+        item.summary.forEach((part, summaryIndex) => {
+            if (part?.type === 'summary_text' && typeof part.text === 'string') {
+                sendPublicSummary(`${item.id || index}:${summaryIndex}`, part.text, true);
+            }
+        });
+    };
     const sendProgress = (status, tool = "agent") => {
         if (!status || (status === lastStatus && tool === lastTool)) return;
         lastStatus = status;
         lastTool = tool;
         const elapsed = elapsedSeconds();
+        pushProgressEntry({ kind: 'status', key: '', text: String(status).slice(0, 1600), atMs: Date.now() - startedAt });
         console.log(`[Foundry SSE +${elapsed}s] ${tool}: ${status}`);
         sendSSE(res, { status, tool, agent: foundryAgentName, elapsedSeconds: elapsed });
     };
@@ -1498,7 +1546,16 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
             throw error;
         }
         for await (const event of stream) {
-            if (event.type === "response.output_text.delta" && event.delta) {
+            // Only public reasoning summaries are forwarded. Raw reasoning,
+            // encrypted content and tool payloads never enter the browser log.
+            if (event.type === "response.reasoning_summary_text.delta") {
+                sendPublicSummary(`${event.item_id || event.output_index || 0}:${event.summary_index || 0}`, event.delta);
+            } else if (event.type === "response.reasoning_summary_text.done") {
+                sendPublicSummary(`${event.item_id || event.output_index || 0}:${event.summary_index || 0}`, event.text, true);
+            } else if (event.type === "response.output_item.done" && event.item?.type === "reasoning") {
+                sendItemSummaries(event.item, event.output_index);
+            } else if (event.type === "response.output_text.delta" && event.delta) {
+                if (!streamedText) sendProgress("正在生成回答");
                 streamedText += event.delta;
                 lastStatus = "正在生成回答";
                 lastTool = "agent";
@@ -1527,6 +1584,10 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
                 sendProgress("正在运行分析并生成结果", "code_interpreter");
             } else if (event.type === "response.code_interpreter_call.completed") {
                 sendProgress("文件处理完成，正在整理回答", "code_interpreter");
+            } else if (event.type === "response.file_search_call.in_progress" || event.type === "response.file_search_call.searching") {
+                sendProgress("正在检索已上传文件", "files");
+            } else if (event.type === "response.file_search_call.completed") {
+                sendProgress("文件检索完成", "files");
             } else if (event.type === "response.completed") {
                 response = event.response;
             } else if (event.type === "response.incomplete") {
@@ -1546,6 +1607,8 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
                 : "Foundry Agent 的流式连接提前中断，未收到有效回答。请重试。");
         }
 
+        (Array.isArray(response.output) ? response.output : []).forEach(sendItemSummaries);
+        sendProgress("正在整理本轮结果");
         const reply = extractResponseText(response);
         const sources = extractCitationSources(response);
         const files = await materializeGeneratedFiles(response, args.userId, args.sessionId);
@@ -1556,7 +1619,13 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
             reply,
             sources,
             files,
-            requestId: args.requestId
+            requestId: args.requestId,
+            progress: sanitizeStoredProgress({
+                version: 1,
+                status: 'completed',
+                elapsedMs: Date.now() - startedAt,
+                entries: progressEntries
+            })
         });
         if (sources.length) sendSSE(res, { sources });
         if (files.length) sendSSE(res, { files });
@@ -1593,7 +1662,13 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
                     reply: partialReply,
                     sources: [],
                     files: [],
-                    requestId: args.requestId
+                    requestId: args.requestId,
+                    progress: sanitizeStoredProgress({
+                        version: 1,
+                        status: abortSignal?.aborted ? 'stopped' : 'error',
+                        elapsedMs: Date.now() - startedAt,
+                        entries: progressEntries
+                    })
                 });
             } catch (persistError) {
                 console.error('保存流式部分回答失败:', persistError.message || persistError);
@@ -2003,6 +2078,7 @@ app.get('/api/sessions', async (req, res) => {
                     sources: message.sources,
                     generatedFiles: message.generatedFiles,
                     sessionFiles: message.sessionFiles,
+                    progress: sanitizeStoredProgress(message.progress),
                     createdAt: message.clientCreatedAt || message.createdAt?.getTime?.() || 0
                 })),
                 fileRefs: files.map(file => buildDurableFileResponse(file, file.downloadId))
@@ -2239,6 +2315,7 @@ module.exports = {
         isContinuationRequest,
         shouldAttachHistoricalFiles,
         sanitizeStoredMediaHtml,
+        sanitizeStoredProgress,
         sanitizeStoredMessage,
         hashDownloadToken,
         extractCitationSources,
