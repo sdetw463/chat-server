@@ -158,6 +158,21 @@ test('base64 images are stripped before chat messages are persisted', () => {
 test('historical files are not mounted for unrelated small talk', () => {
     assert.equal(_test.shouldAttachHistoricalFiles('你好，今天过得怎么样？'), false);
     assert.equal(_test.shouldAttachHistoricalFiles('把刚才的 PDF 转成 Word'), true);
+    assert.equal(_test.isContinuationRequest('继续'), true);
+    assert.equal(_test.isContinuationRequest('好的，继续'), true);
+    assert.equal(_test.isContinuationRequest('继续教育政策有哪些变化？'), false);
+    assert.equal(_test.shouldAttachHistoricalFiles('继续'), true);
+    assert.equal(_test.shouldAttachHistoricalFiles('继续教育政策有哪些变化？'), false);
+});
+
+test('stream duration cap is disabled by default while an explicit cap remains opt-in', () => {
+    const unlimited = _test.resolveFoundryStreamTimeouts('0');
+    assert.equal(unlimited.streamMaxMs, 0);
+    assert.ok(unlimited.sdkRequestTimeoutMs > 20 * 60 * 1000);
+
+    const capped = _test.resolveFoundryStreamTimeouts('1200000');
+    assert.equal(capped.streamMaxMs, 1200000);
+    assert.equal(capped.sdkRequestTimeoutMs, 1260000);
 });
 
 test('only official container file citations become download cards', () => {
