@@ -3,13 +3,17 @@ const http = require('http');
 const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
-const { toFile } = require('openai');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const { DefaultAzureCredential } = require('@azure/identity');
 const { AIProjectClient } = require('@azure/ai-projects');
 const mongoose = require('mongoose');
 const { BlobServiceClient } = require('@azure/storage-blob');
 const { createDirectClient, buildDirectRequest } = require('./lib/direct-responses');
-const { prepareFileTransport, transportNote, unwrapFile } = require('./lib/file-transport');
+const { prepareFileTransportFromPath, transportNote, unwrapFile } = require('./lib/file-transport');
+const { uploadAIFile, getCachedAIFile, upstreamRequestId, CACHE_SECONDS } = require('./lib/ai-file-upload');
+const { changedMessageOperations, retryDatabase } = require('./lib/history-persistence');
 const { MAX_FILE_BYTES, MAX_TOTAL_BYTES, MAX_ATTACHMENTS, CHAT_JSON_LIMIT } = require('./lib/file-limits');
 
 const app = express();
@@ -111,6 +115,7 @@ const aiFileSchema = new mongoose.Schema({
     sha256: { type: String, default: '' },
     blobName: { type: String, required: true },
     source: { type: String, enum: ['upload', 'agent'], required: true },
+    upstreamFile: { type: mongoose.Schema.Types.Mixed, default: null },
     lastAccessAt: { type: Date, default: Date.now }
 }, { timestamps: true });
 
@@ -153,11 +158,11 @@ function deletedSessionError() {
 
 async function isAiSessionDeleted(userId, sessionId) {
     if (mongoose.connection.readyState !== 1 || !userId || !sessionId) return false;
-    const record = await mongoose.connection.collection(AI_RECORD_COLLECTION).findOne({
+    const record = await retryDatabase(() => mongoose.connection.collection(AI_RECORD_COLLECTION).findOne({
         docType: DELETED_SESSION_DOC_TYPE,
         userId,
         sessionId
-    }, { projection: { _id: 1 } });
+    }, { projection: { _id: 1 } }));
     return !!record;
 }
 
@@ -727,14 +732,14 @@ async function collectFoundryCodeInterpreterFiles(documents, sessionFiles, userI
         const record = await resolveStoredFile(doc.uploadToken, userId, sessionId);
         if (!record?.blobName || record.sessionId !== sessionId || !Number.isSafeInteger(record.size) || record.size <= 0 || record.size > MAX_AGENT_FILE_BYTES) throw new Error('附件不存在、已失效、超限或不属于当前会话，请重新上传。');
         if (usedBytes() + record.size > MAX_AGENT_TOTAL_FILE_BYTES) throw new Error('本轮附件合计不能超过500MB。');
-        files.push({ filename: record.filename, mimeType: record.mimeType, blobName: record.blobName, size: record.size, persistent: false, isNewSessionFile: false });
+        files.push({ filename: record.filename, mimeType: record.mimeType, blobName: record.blobName, size: record.size, storageId: record._id, upstreamFile: record.upstreamFile, persistent: false, isNewSessionFile: false });
     }
 
     const remaining = (directResponsesEnabled ? MAX_ATTACHMENTS : foundryFileInputSlots.length) - files.length;
     if (remaining > 0 && shouldAttachHistoricalFiles(userMessage)) {
         let candidates = normalizeSessionFileReferences(sessionFiles);
         if (mongoose.connection.readyState === 1 && sessionId) {
-            const stored = (await AiFile.find({ userId, sessionId }).limit(aiSessionFileLimit).lean())
+            const stored = (await retryDatabase(() => AiFile.find({ userId, sessionId }).limit(aiSessionFileLimit).lean()))
                 .sort((a, b) => new Date(a.updatedAt || a.createdAt || 0) - new Date(b.updatedAt || b.createdAt || 0));
             const storedRefs = stored.map(record => ({
                 filename: record.filename,
@@ -775,6 +780,8 @@ async function collectFoundryCodeInterpreterFiles(documents, sessionFiles, userI
                         mimeType: grant.mimeType || contentTypeForFileName(file.filename),
                         blobName: grant.blobName,
                         size: grant.size,
+                        storageId: grant._id,
+                        upstreamFile: grant.upstreamFile,
                         persistent: false,
                         isNewSessionFile: false
                     });
@@ -804,14 +811,22 @@ async function collectFoundryCodeInterpreterFiles(documents, sessionFiles, userI
     return files;
 }
 
-async function uploadFoundryCodeInterpreterFiles(openai, files) {
-    return require('./lib/file-memory').withFileMemory(() => uploadFoundryCodeInterpreterFilesSequential(openai, files));
+async function uploadFoundryCodeInterpreterFiles(openai, files, options = {}) {
+    if (!files.length) return [];
+    return require('./lib/file-memory').withFileMemory(() => uploadFoundryCodeInterpreterFilesSequential(openai, files, options), {
+        signal: options.signal,
+        onWaiting: () => options.onProgress?.('正在等待附件传输资源', 'upload')
+    });
 }
 
-async function uploadFoundryCodeInterpreterFilesSequential(openai, files) {
+async function uploadFoundryCodeInterpreterFilesSequential(openai, files, { signal, onProgress, userId, sessionId, requestId } = {}) {
     const uploaded = [];
+    let currentFile;
+    const scope = crypto.createHash('sha256').update(`${chatBackend}:${openai.baseURL}`).digest('hex');
     try {
         for (const file of files) {
+            currentFile = file;
+            signal?.throwIfAborted();
             if (file.existingFileId) {
                 uploaded.push({
                     id: file.existingFileId,
@@ -823,34 +838,94 @@ async function uploadFoundryCodeInterpreterFilesSequential(openai, files) {
                 });
                 continue;
             }
-            // Mount persisted files sequentially instead of materializing a
-            // whole 500MB batch in memory at once.
-            const buffer = file.buffer || await downloadBlobBuffer(file.blobName);
-            const prepared = prepareFileTransport({ ...file, buffer });
-            const uploadable = await toFile(prepared.buffer, prepared.filename, { type: prepared.mimeType });
-            // Microsoft Foundry's project-scoped Files API currently rejects
-            // the OpenAI SDK's optional expires_after field. Access is bounded
-            // by our 24-hour download/session grant instead.
-            const result = await openai.files.create({ file: uploadable, purpose: "assistants" });
-            if (!result?.id) throw new Error(`附件 ${file.filename} 上传后没有返回 file id。`);
-            uploaded.push({
-                id: result.id,
-                filename: file.filename,
-                transport: prepared.transport,
-                size: buffer.length,
-                createdThisInvocation: true,
-                persistent: file.persistent === true,
-                isNewSessionFile: file.isNewSessionFile === true
-            });
+            onProgress?.(`正在检查 AI 附件：${file.filename}`, 'upload');
+            if (file.storageId && directResponsesEnabled) {
+                const latest = await retryDatabase(() => AiFile.findOne({ _id: file.storageId, userId, sessionId }).select('upstreamFile').lean());
+                if (!latest) throw new Error('附件已从当前会话移除。');
+                file.upstreamFile = latest.upstreamFile;
+            }
+            const cached = directResponsesEnabled && await getCachedAIFile(openai, file.upstreamFile, scope, signal);
+            if (cached) {
+                uploaded.push({ id: cached.id, filename: file.filename, transport: cached.transport, size: file.size, persistent: true });
+                onProgress?.(`已复用 AI 附件：${file.filename}`, 'upload');
+                continue;
+            }
+            if (file.upstreamFile?.id && file.upstreamFile.scope === scope) {
+                await deleteCachedAIFile(openai, file.upstreamFile.id);
+            }
+            const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'tuotuo-ai-file-'));
+            try {
+                const localPath = path.join(dir, 'input');
+                onProgress?.(`${file.buffer ? '正在准备附件' : '正在从云存储读取附件'}：${file.filename}`, 'upload');
+                if (file.buffer) await fs.promises.writeFile(localPath, file.buffer, { signal });
+                else await containerClient.getBlockBlobClient(file.blobName).downloadToFile(localPath, 0, undefined, { abortSignal: signal });
+                const { size } = await fs.promises.stat(localPath);
+                if (!size || size > MAX_AGENT_FILE_BYTES || (file.size && file.size !== size)) throw new Error('持久附件大小校验失败。');
+                const prepared = await prepareFileTransportFromPath({ ...file, path: localPath, size }, path.join(dir, 'wrapped.zip'), signal);
+                onProgress?.(`正在传送附件至 Azure AI：${file.filename}（${(size / 1024 ** 2).toFixed(1)} MB）`, 'upload');
+                const result = await uploadAIFile(openai, prepared, { signal, multipart: directResponsesEnabled,
+                    onPhase: () => onProgress?.(`分块已接收，正在等待 Azure AI 合并附件：${file.filename}`, 'upload'),
+                    onProgress: (done, total) => onProgress?.(`Azure AI 已接收附件：${file.filename} · ${Math.round(done / total * 100)}%`, 'upload') });
+                const entry = { id: result.id, filename: file.filename, transport: prepared.transport, size,
+                    createdThisInvocation: true, persistent: file.persistent === true, isNewSessionFile: file.isNewSessionFile === true };
+                uploaded.push(entry);
+                // Azure Uploads rejects expires_after. Bound reuse locally and
+                // clean expired AI copies separately; Blob originals stay intact.
+                if (file.storageId && directResponsesEnabled) {
+                    try {
+                        const expiresAt = Math.min(Number(result.expires_at) * 1000 || Infinity, Date.now() + CACHE_SECONDS * 1000);
+                        const saved = await retryDatabase(() => AiFile.updateOne({ _id: file.storageId, userId, sessionId }, { $set: {
+                            upstreamFile: { id: result.id, scope, expiresAt, transport: prepared.transport }
+                        } }));
+                        if (saved.matchedCount) entry.persistent = entry.cached = true;
+                    } catch (error) { console.warn('AI 附件缓存未保存，将在本轮结束后清理:', error.code || error.name); }
+                }
+            } catch (error) {
+                if (signal?.aborted) throw signal.reason;
+                error.fileStage ||= 'attachment_prepare';
+                error.attachmentName = file.filename;
+                error.durableAttachment = !!file.blobName;
+                throw error;
+            } finally { await fs.promises.rm(dir, { recursive: true, force: true }); }
         }
         return uploaded;
     } catch (error) {
+        if (!signal?.aborted && currentFile) {
+            error.fileStage ||= 'attachment_prepare';
+            error.attachmentName = currentFile.filename;
+            error.durableAttachment = !!currentFile.blobName;
+            console.error('[AI attachment failed]', JSON.stringify({ stage: error.fileStage, size: currentFile.size || currentFile.buffer?.length,
+                status: error.status, code: error.code, requestId: upstreamRequestId(error), localRequestId: requestId }));
+        }
         await Promise.allSettled(uploaded
-            .filter(file => file.createdThisInvocation)
-            .map(file => openai.files.delete(file.id)));
+            .filter(file => file.createdThisInvocation && !file.cached)
+            .map(file => openai.files.delete(file.id, { timeout: 15000, maxRetries: 1 })));
         throw error;
     }
 }
+
+async function deleteCachedAIFile(openai, id) {
+    try { await openai.files.delete(id, { timeout: 30000, maxRetries: 2 }); }
+    catch (error) { if (![404, 410].includes(error.status)) throw error; }
+}
+
+let cleaningAiFileCache = false;
+const aiFileCacheTimer = setInterval(async () => {
+    if (cleaningAiFileCache || !directResponsesEnabled || mongoose.connection.readyState !== 1) return;
+    cleaningAiFileCache = true;
+    try {
+        const { openai } = getChatClients();
+        const scope = crypto.createHash('sha256').update(`${chatBackend}:${openai.baseURL}`).digest('hex');
+        const expired = await retryDatabase(() => AiFile.find({ 'upstreamFile.scope': scope, 'upstreamFile.expiresAt': { $lt: Date.now() } })
+            .select('upstreamFile').limit(20).lean());
+        for (const file of expired) {
+            await deleteCachedAIFile(openai, file.upstreamFile.id);
+            await retryDatabase(() => AiFile.updateOne({ _id: file._id, 'upstreamFile.id': file.upstreamFile.id }, { $unset: { upstreamFile: 1 } }));
+        }
+    } catch (error) { console.warn('AI 附件缓存清理稍后重试:', error.code || error.name); }
+    finally { cleaningAiFileCache = false; }
+}, 5 * 60000);
+aiFileCacheTimer.unref();
 
 function registerFoundryInputSessionFiles(uploadedFiles, userId) {
     return (Array.isArray(uploadedFiles) ? uploadedFiles : [])
@@ -889,8 +964,9 @@ function buildDurableFileResponse(record, downloadId) {
     };
 }
 
-async function persistFileBuffer({ buffer, filename, mimeType, source, userId, sessionId }) {
-    if (!canUsePersistentAiStorage() || !buffer?.length || !sessionId) return null;
+async function persistFileBuffer({ buffer, path: localPath, filename, mimeType, source, userId, sessionId }) {
+    if (!canUsePersistentAiStorage() || (!buffer?.length && !localPath) || !sessionId) return null;
+    const size = localPath ? (await fs.promises.stat(localPath)).size : buffer.length;
     const [fileCount, sizeRows] = await Promise.all([
         AiFile.countDocuments({ userId, sessionId }),
         AiFile.aggregate([
@@ -900,9 +976,20 @@ async function persistFileBuffer({ buffer, filename, mimeType, source, userId, s
     ]);
     const usedBytes = Number(sizeRows[0]?.total || 0);
     if (fileCount >= aiSessionFileLimit) throw new Error(`当前会话最多长期保存 ${aiSessionFileLimit} 个文件。`);
-    if (usedBytes + buffer.length > aiSessionStorageMaxBytes) throw new Error('当前会话的长期文件存储空间已达到上限。');
+    if (usedBytes + size > aiSessionStorageMaxBytes) throw new Error('当前会话的长期文件存储空间已达到上限。');
     const downloadId = crypto.randomBytes(24).toString('base64url');
-    const blobName = await uploadBufferToBlob(buffer, { userId, sessionId, filename, mimeType });
+    const hash = crypto.createHash('sha256');
+    if (localPath) { for await (const chunk of fs.createReadStream(localPath)) hash.update(chunk); }
+    else hash.update(buffer);
+    let blobName;
+    if (localPath) {
+        const safeSession = crypto.createHash('sha256').update(String(sessionId)).digest('hex').slice(0, 20);
+        blobName = `ai/${String(userId).slice(0, 20)}/${safeSession}/${crypto.randomUUID()}-${safeFileName(filename)}`;
+        await containerClient.getBlockBlobClient(blobName).uploadFile(localPath, {
+            blockSize: 4 * 1024 ** 2, concurrency: 1, maxSingleShotSize: 4 * 1024 ** 2,
+            blobHTTPHeaders: { blobContentType: mimeType || 'application/octet-stream' }
+        });
+    } else blobName = await uploadBufferToBlob(buffer, { userId, sessionId, filename, mimeType });
     try {
         const record = await AiFile.create({
             userId,
@@ -911,8 +998,8 @@ async function persistFileBuffer({ buffer, filename, mimeType, source, userId, s
             downloadId,
             filename: getFileNameFromPath(filename, 'agent-output'),
             mimeType: mimeType || contentTypeForFileName(filename),
-            size: buffer.length,
-            sha256: crypto.createHash('sha256').update(buffer).digest('hex'),
+            size,
+            sha256: hash.digest('hex'),
             blobName,
             source
         });
@@ -961,7 +1048,7 @@ function buildFoundryFileStructuredInputs(uploadedFiles) {
 async function cleanupFoundryInputFiles(invocation) {
     const files = (invocation?.uploadedInputFiles || []).filter(file => !file.persistent);
     if (!files.length) return;
-    const results = await Promise.allSettled(files.map(file => invocation.openai.files.delete(file.id)));
+    const results = await Promise.allSettled(files.map(file => invocation.openai.files.delete(file.id, { timeout: 15000, maxRetries: 1 })));
     results.forEach(result => {
         if (result.status === 'rejected') console.error('清理 Foundry 输入文件失败:', result.reason?.message || result.reason);
     });
@@ -1008,7 +1095,7 @@ async function resolveStoredFile(downloadId, userId, sessionId = '') {
     if (mongoose.connection.readyState === 1 && downloadId) {
         const query = { downloadTokenHash: hashDownloadToken(downloadId), userId };
         if (sessionId) query.sessionId = sessionId;
-        const record = await AiFile.findOne(query).lean();
+        const record = await retryDatabase(() => AiFile.findOne(query).lean());
         if (record) return { ...record, durable: true };
     }
     const grant = downloadId && foundryGeneratedFiles.get(downloadId);
@@ -1234,7 +1321,7 @@ function sanitizeStoredMessage(message, fallbackId = '') {
 
 async function ensureAiSession(userId, sessionId, metadata = {}) {
     if (mongoose.connection.readyState !== 1 || !sessionId) return null;
-    return AiSession.findOneAndUpdate(
+    return retryDatabase(() => AiSession.findOneAndUpdate(
         { userId, sessionId },
         {
             $set: {
@@ -1249,7 +1336,7 @@ async function ensureAiSession(userId, sessionId, metadata = {}) {
             $setOnInsert: { docType: 'session', userId, sessionId }
         },
         { upsert: true, new: true }
-    );
+    ));
 }
 
 async function upsertStoredMessages(userId, sessionId, messages) {
@@ -1259,18 +1346,17 @@ async function upsertStoredMessages(userId, sessionId, messages) {
         .map(message => sanitizeStoredMessage(message))
         .filter(Boolean);
     if (!sanitized.length) return;
-    await AiMessage.bulkWrite(sanitized.map(message => ({
-        updateOne: {
-            filter: { docType: 'message', userId, sessionId, messageId: message.messageId },
-            update: { $set: { ...message, docType: 'message', userId, sessionId } },
-            upsert: true
-        }
-    })), { ordered: false });
+    const existing = await retryDatabase(() => AiMessage.find({ userId, sessionId, messageId: { $in: sanitized.map(m => m.messageId) } })
+        .select('messageId role content userText mediaHtml sources generatedFiles sessionFiles progress clientCreatedAt').lean());
+    const operations = changedMessageOperations(userId, sessionId, sanitized, existing);
+    for (let index = 0; index < operations.length; index += 5) {
+        await retryDatabase(() => AiMessage.bulkWrite(operations.slice(index, index + 5), { ordered: false }));
+    }
 }
 
 async function loadStoredConversationHistory(userId, sessionId, fallbackHistory) {
     if (mongoose.connection.readyState !== 1 || !sessionId) return fallbackHistory;
-    const stored = (await AiMessage.find({ userId, sessionId }).limit(1000).lean())
+    const stored = (await retryDatabase(() => AiMessage.find({ userId, sessionId }).limit(1000).lean()))
         .sort((a, b) => {
             const aTime = Number(a.clientCreatedAt) || new Date(a.createdAt || 0).getTime();
             const bTime = Number(b.clientCreatedAt) || new Date(b.createdAt || 0).getTime();
@@ -1334,7 +1420,8 @@ function buildFoundryResponseRequestBody({ conversationId, history, currentMessa
     };
 }
 
-async function prepareFoundryAgentInvocation({ userMessage, documents, images, historyMessages, reasoningMode, sessionId, sessionFiles, userId }) {
+async function prepareFoundryAgentInvocation({ userMessage, documents, images, historyMessages, reasoningMode, sessionId, sessionFiles, userId, requestId, signal, onProgress }) {
+    signal?.throwIfAborted();
     assertFoundryAgentReady();
     validateAgentRequest({ userMessage, documents, images, historyMessages, sessionFiles });
     const { openai } = getChatClients();
@@ -1372,7 +1459,9 @@ async function prepareFoundryAgentInvocation({ userMessage, documents, images, h
         userMessage,
         resolvedHistory
     );
-    const uploadedInputFiles = await uploadFoundryCodeInterpreterFiles(openai, attachmentFiles);
+    const uploadedInputFiles = await uploadFoundryCodeInterpreterFiles(openai, attachmentFiles, { signal, onProgress, userId, sessionId, requestId });
+    try {
+    signal?.throwIfAborted();
     const rememberedInputFiles = await persistNewInputSessionFiles(attachmentFiles, uploadedInputFiles, userId, sessionId);
     const content = await buildFoundryAgentUserContent(
         userMessage,
@@ -1409,6 +1498,10 @@ async function prepareFoundryAgentInvocation({ userMessage, documents, images, h
             body: agentBody
         }
     };
+    } catch (error) {
+        await cleanupFoundryInputFiles({ openai, uploadedInputFiles });
+        throw error;
+    }
 }
 
 async function runFoundryAgentChat(args) {
@@ -1524,7 +1617,7 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
 
     sendProgress(hasAttachments ? "正在读取并准备附件" : "正在理解你的问题");
     try {
-        invocation = await prepareFoundryAgentInvocation(args);
+        invocation = await prepareFoundryAgentInvocation({ ...args, signal: abortSignal, onProgress: sendProgress });
         if (invocation.uploadedInputFiles.length) {
             sendProgress("附件已挂载，正在启动代码解释器", "code_interpreter");
         }
@@ -1788,6 +1881,14 @@ function extractCitationSources(response) {
 }
 
 function formatAIError(error) {
+    if (Number(error?.code) === 16500) return '聊天历史数据库暂时繁忙，多次等待后仍被限流。原有聊天和已保存的附件不会因此删除，请稍后在当前会话重试。';
+    if (error?.fileStage) {
+        const stage = error.fileStage === 'azure_upload' ? '传送附件至 Azure AI' : '准备附件';
+        const detail = error.status ? `HTTP ${error.status}` : '传输未完成';
+        const id = upstreamRequestId(error);
+        return `${stage}失败（${detail}）${id ? `，错误编号：${id}` : ''}。本轮尚未调用模型。`
+            + (error.durableAttachment ? '原附件已保存在当前会话，请稍后在本会话重试，无需重新上传。' : '请稍后重试。');
+    }
     const rawMessage = String(error?.message || '');
     if (/ToolChoice must match|tool[_ ]choice/i.test(rawMessage)) {
         return "Foundry Agent 的工具选择配置与请求冲突。请确认后端没有覆盖 Agent 版本中的 tool_choice。";
@@ -1816,6 +1917,7 @@ function formatAIError(error) {
     if (error.message) parts.push(error.message);
     if (error.requestId) parts.push(`request_id=${error.requestId}`);
     if (error.request_id) parts.push(`request_id=${error.request_id}`);
+    if (!error.request_id && !error.requestId && upstreamRequestId(error)) parts.push(`request_id=${upstreamRequestId(error)}`);
     if (error.error) {
         try { parts.push(typeof error.error === "string" ? error.error : JSON.stringify(error.error)); } catch {}
     }
@@ -2121,6 +2223,14 @@ app.delete('/api/sessions/:sessionId', async (req, res) => {
         const sessionId = normalizeIdentityPart(req.params.sessionId);
         const session = await AiSession.findOne({ userId, sessionId }).select('foundryConversationId').lean();
         const files = await AiFile.find({ userId, sessionId }).lean();
+        if (directResponsesEnabled) {
+            const { openai } = getChatClients();
+            const scope = crypto.createHash('sha256').update(`${chatBackend}:${openai.baseURL}`).digest('hex');
+            // Delete tracked AI copies before removing the records used by GC.
+            for (const file of files) {
+                if (file.upstreamFile?.scope === scope && file.upstreamFile.id) await deleteCachedAIFile(openai, file.upstreamFile.id);
+            }
+        }
         await Promise.allSettled(files.map(file => containerClient?.getBlockBlobClient(file.blobName).deleteIfExists()));
         if (session?.foundryConversationId) {
             try {
@@ -2193,6 +2303,9 @@ app.get('/api/status', (req, res) => {
         "AI 单轮附件上限（MB）": MAX_AGENT_TOTAL_FILE_BYTES / 1024 ** 2,
         "AI 单轮附件数量": directResponsesEnabled ? MAX_ATTACHMENTS : foundryFileInputSlots.length,
         "AI 分块上传": "4MB / 持久化引用",
+        "AI 上游大文件传输": directResponsesEnabled ? "8MB 分块 / 磁盘流式" : "磁盘流式",
+        "AI 文件副本复用": "同一持久文件、同一资源校验后复用；24小时缓存，运行期间定期清理",
+        "AI 历史同步": "仅写入变化消息 / 数据库限流退避",
         "AI 聊天模型": directResponsesEnabled ? (process.env.AZURE_RESPONSES_DEPLOYMENT || 'gpt-6-astra') : '由 Foundry Agent 版本指定',
         "AI 推理强度": directResponsesEnabled ? (process.env.AZURE_RESPONSES_REASONING_EFFORT || 'medium') : '由 Foundry Agent 版本指定',
         "Foundry Project Endpoint": !!foundryProjectEndpoint ? "✅ 是" : "❌ 否",

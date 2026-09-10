@@ -155,6 +155,26 @@ test('base64 images are stripped before chat messages are persisted', () => {
     assert.equal(html, '');
 });
 
+test('only bounded public progress metadata is accepted for history persistence', () => {
+    assert.equal(_test.sanitizeStoredProgress(null), null);
+    assert.equal(_test.sanitizeStoredProgress({ version: 2 }), null);
+    const stored = _test.sanitizeStoredProgress({
+        version: 1,
+        status: 'stopped',
+        elapsedMs: 999_999_999,
+        entries: [
+            { kind: 'summary', key: 'reasoning:0', text: '公开摘要', atMs: 1200 },
+            { kind: 'private', key: 'tool-payload', text: '只会按普通状态保存', atMs: -10 }
+        ]
+    });
+    assert.equal(stored.status, 'stopped');
+    assert.equal(stored.elapsedMs, 86_400_000);
+    assert.deepEqual(stored.entries, [
+        { kind: 'summary', key: 'reasoning:0', text: '公开摘要', atMs: 1200 },
+        { kind: 'status', key: 'tool-payload', text: '只会按普通状态保存', atMs: 0 }
+    ]);
+});
+
 test('historical files are not mounted for unrelated small talk', () => {
     assert.equal(_test.shouldAttachHistoricalFiles('你好，今天过得怎么样？'), false);
     assert.equal(_test.shouldAttachHistoricalFiles('把刚才的 PDF 转成 Word'), true);

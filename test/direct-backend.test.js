@@ -11,9 +11,11 @@ test('direct HTTP chat mounts uploads, serves generated files from the resource,
     const uploads = [];
     const uploadedBytes = new Map();
     let downloads = 0;
+    let failUpload = false;
     direct.createDirectClient = () => ({
         files: {
             create: async ({ file }) => {
+                if (failUpload) throw Object.assign(new Error('500 status code (no body)'), { status: 500, headers: new Headers({ 'apim-request-id': 'upload-error-request-id' }) });
                 uploads.push(file);
                 const id = uploads.length === 1 ? 'file-upload' : `file-upload-${uploads.length}`;
                 uploadedBytes.set(id, Buffer.from(await file.arrayBuffer()));
@@ -87,6 +89,18 @@ test('direct HTTP chat mounts uploads, serves generated files from the resource,
         await reuse.json();
         assert.equal(uploads.length, uploadCount);
         assert.match(JSON.stringify(calls.at(-1).body.input), /框架.svg.zip/);
+        failUpload = true;
+        const beforeFailure = calls.length;
+        const failed = await fetch(base + '/api/ai-chat', {
+            method: 'POST', headers: { 'Content-Type': 'application/json', 'X-AI-Access': token },
+            body: JSON.stringify({ clientId: 'direct-test', message: '读取附件', stream: true,
+                documents: [{ name: 'input.csv', fileData: 'data:text/csv;base64,eCx5CjEsMgo=' }] })
+        });
+        const events = await failed.text();
+        assert.match(events, /传送附件至 Azure AI/);
+        assert.match(events, /upload-error-request-id/);
+        assert.match(events, /本轮尚未调用模型/);
+        assert.equal(calls.length, beforeFailure, 'file upload failures must never dispatch a model request');
     } finally {
         ws.terminate();
         await new Promise(resolve => server.close(resolve));
