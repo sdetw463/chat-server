@@ -9,6 +9,11 @@ on:
       - main
   workflow_dispatch:
 
+# A newer push must not interrupt an in-flight production deployment.
+concurrency:
+  group: azure-tuotuo-production
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest

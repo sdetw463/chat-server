@@ -8,6 +8,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { DefaultAzureCredential } = require('@azure/identity');
 const { createFoundryClients } = require('./lib/foundry-agent');
+const { resolveLinkedGeneratedFiles, linkedSandboxPaths } = require('./lib/generated-files');
 const { beginChat, abortChat, withSessionWrite, mapWithConcurrency } = require('./lib/session-lifecycle');
 const { pipeline } = require('node:stream/promises');
 const { once } = require('node:events');
@@ -1196,14 +1197,25 @@ function extractGeneratedFileCitations(response) {
     return found.slice(0, 12);
 }
 
-async function materializeGeneratedFiles(response, userId, sessionId) {
-    const citations = extractGeneratedFileCitations(response);
-    if (!citations.length) return [];
+async function materializeGeneratedFiles(response, userId, sessionId, signal) {
+    let citations = extractGeneratedFileCitations(response);
+    let unresolved = [];
+    try {
+        const resolved = await resolveLinkedGeneratedFiles(response, citations, getFoundryClients().openai, { signal });
+        citations = resolved.citations;
+        unresolved = resolved.unresolved;
+    } catch (error) {
+        signal?.throwIfAborted();
+        console.warn('核验生成文件暂时失败:', error.code || error.status || error.name);
+        unresolved = linkedSandboxPaths(response);
+    }
     const files = [];
+    files.warning = unresolved.length ? '部分文件的下载尚未就绪，请在当前聊天中要求重新提供文件。' : '';
     for (const citation of citations) {
+        signal?.throwIfAborted();
         if (canUsePersistentAiStorage() && sessionId) {
             try {
-                const downloaded = await downloadFoundryAgentFile(citation.containerId, citation.fileId);
+                const downloaded = await downloadFoundryAgentFile(citation.containerId, citation.fileId, chatBackend, { signal });
                 const durable = await persistFileBuffer({
                     buffer: downloaded.buffer,
                     filename: citation.filename,
@@ -1217,12 +1229,13 @@ async function materializeGeneratedFiles(response, userId, sessionId) {
                     continue;
                 }
             } catch (error) {
+                signal?.throwIfAborted();
                 console.error('持久化 Agent 生成文件失败，将返回临时链接:', error.message || error);
             }
         }
         files.push(normalizeAgentFileRecord(citation, files.length, userId));
     }
-    return files.filter(Boolean);
+    return files;
 }
 
 function guessAgentFileName(file, index = 0) {
@@ -1502,9 +1515,10 @@ async function runFoundryAgentChat(args) {
             { ...invocation.requestOptions, signal: args.signal, timeout: foundrySdkRequestTimeoutMs }
         );
         if (response.status !== 'completed') throw new Error(formatFoundryIncompleteResponse(response));
-        const reply = extractResponseText(response);
+        let reply = extractResponseText(response);
         const sources = extractCitationSources(response);
-        const files = await materializeGeneratedFiles(response, args.userId, args.sessionId);
+        const files = await materializeGeneratedFiles(response, args.userId, args.sessionId, args.signal);
+        if (files.warning) reply += `\n\n> ${files.warning}`;
         let historyWarning;
         await persistCompletedChatTurn({
             userId: args.userId,
@@ -1707,9 +1721,10 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
 
         (Array.isArray(response.output) ? response.output : []).forEach(sendItemSummaries);
         sendProgress("正在整理本轮结果");
-        const reply = extractResponseText(response);
+        let reply = extractResponseText(response);
         const sources = extractCitationSources(response);
-        const files = await materializeGeneratedFiles(response, args.userId, args.sessionId);
+        const files = await materializeGeneratedFiles(response, args.userId, args.sessionId, abortSignal);
+        if (files.warning) reply += `\n\n> ${files.warning}`;
         let historyWarning;
         await persistCompletedChatTurn({
             userId: args.userId,
@@ -1787,7 +1802,8 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
     }
 }
 
-async function downloadFoundryAgentFile(containerId, fileId, backend = chatBackend) {
+async function downloadFoundryAgentFile(containerId, fileId, backend = chatBackend, { signal } = {}) {
+    signal?.throwIfAborted();
     if (!fileId && containerId) {
         fileId = containerId;
         containerId = "";
@@ -1796,10 +1812,12 @@ async function downloadFoundryAgentFile(containerId, fileId, backend = chatBacke
     if (backend !== chatBackend) throw new Error('旧版临时文件已过期，请重新上传；已持久保存的文件仍可下载。');
     const { openai } = getFoundryClients();
     const response = containerId
-        ? await openai.containers.files.content.retrieve(fileId, { container_id: containerId })
-        : await openai.files.content(fileId);
+        ? await openai.containers.files.content.retrieve(fileId, { container_id: containerId }, { signal })
+        : await openai.files.content(fileId, { signal });
+    const buffer = Buffer.from(await response.arrayBuffer());
+    signal?.throwIfAborted();
     return {
-        buffer: Buffer.from(await response.arrayBuffer()),
+        buffer,
         contentType: response.headers.get("content-type") || "application/octet-stream"
     };
 }
@@ -1857,7 +1875,7 @@ function extractResponseText(response) {
             else if (typeof content.output_text === "string") parts.push(content.output_text);
         }
     }
-    return parts.join("");
+    return parts.join("\n\n");
 }
 
 function extractCitationSources(response) {
