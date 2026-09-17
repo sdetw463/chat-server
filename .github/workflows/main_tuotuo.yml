@@ -69,4 +69,6 @@ jobs:
           app-name: 'tuotuo'
           slot-name: 'Production'
           package: .
+          clean: true
+          restart: true
           

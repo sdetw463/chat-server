@@ -14,6 +14,7 @@
 - 文件槽：`attachment_file_1` 到 `attachment_file_10`，可选、空默认值。
 - `FOUNDRY_USE_CONVERSATIONS=true`，使用 Foundry conversation 保持多轮上下文，数据库历史用于首次创建或恢复。
 - `APP_ALLOWED_ORIGINS=https://tuotuo.love`
+- `WEBSITES_CONTAINER_START_TIME_LIMIT=600`：给平台证书更新、依赖解包和Node冷启动留足时间。
 
 Azure 托管身份已有项目资源上的 Foundry Agent Consumer / Foundry User 权限。密钥保存在 App Service 配置，禁止提交 `.env`。MongoDB、Blob 和图片服务的现有配置继续使用。
 
@@ -56,6 +57,6 @@ npm run check
 
 ## 发布与回退
 
-GitHub `main` 推送触发测试和Azure部署；使用package-lock及npm ci。先更新后端配置和代码，检查 `/api/status`，再验证真实AI流、工具、文件与历史，最后发布前端。
+GitHub `main` 推送触发测试和Azure部署；使用package-lock及npm ci。部署显式clean/restart，避免旧模块残留；应用数据持久保存于MongoDB/Blob，不在部署目录。先更新后端配置和代码，检查 `/api/status`，再验证真实AI流、工具、文件与历史，最后发布前端。
 
 回退需同步恢复旧Git提交和旧App Service配置，因为旧直连变量已经不属于新实现。数据库原有聊天、照片、日记和附件不因代码发布清空。
