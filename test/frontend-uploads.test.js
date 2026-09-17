@@ -8,10 +8,11 @@ const frontend = path.join(root, 'js/features/74-gpt-chat.js');
 
 test('browser retains raw files with 200MB/500MB/10 guards, without Base64 allocation', { skip: !fs.existsSync(frontend) }, async () => {
     const source = fs.readFileSync(frontend, 'utf8');
-    const helper = source.slice(source.indexOf('function shouldSendAsRawInputFile'), source.indexOf('async function extractPdfText'));
+    const helper = source.slice(source.indexOf('const GPT_CHAT_FILE_LIMIT'), source.indexOf('async function handleGPTFileSelect'));
     const handler = source.slice(source.indexOf('async function handleGPTFileSelect'), source.indexOf('\nfunction ', source.indexOf('async function handleGPTFileSelect')));
     const pending = [], alerts = [];
     const context = vm.createContext({ currentGPTMode: 'normal', gptPendingFiles: pending,
+        gptProcessingFileSets: new WeakMap(), autoResizeGPT() {}, document: { getElementById: () => ({}) },
         alert: s => alerts.push(s), showGPTTransientStatus: () => {}, renderGPTFilePreview: () => {},
         readFileAsDataUrl: async () => 'data:application/octet-stream;base64,QQ==',
         processImageAsync: () => { throw new Error('Non-raster file must not be rasterized'); }, console });

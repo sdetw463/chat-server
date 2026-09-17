@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const express = require('express');
-const { installChunkUploads, CHUNK_BYTES } = require('../lib/chunk-uploads');
+const { installChunkUploads, CHUNK_BYTES, pruneAbandonedUploads } = require('../lib/chunk-uploads');
 const { MAX_FILE_BYTES } = require('../lib/file-limits');
 
 test('chunk HTTP upload: exact 200MB, integrity, ownership, order, cancellation and 500MB reservations', async t => {
@@ -80,4 +80,38 @@ test('failed persistence retains completed chunks for retry without duplicate fi
         assert.equal(response.status, 200); assert.equal((await response.json()).downloadId, 'saved-once');
     }
     assert.equal(calls, 2);
+});
+
+test('restart cleanup removes dead-worker and expired legacy uploads without touching live workers or unrelated files', async t => {
+    const fs = require('node:fs/promises');
+    const os = require('node:os');
+    const path = require('node:path');
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tuotuo-cleanup-test-'));
+    t.after(() => fs.rm(root, { recursive: true, force: true }));
+    const now = Date.now();
+    const make = async (name, { owner, stale = false, freshData = false } = {}) => {
+        const dir = path.join(root, name); await fs.mkdir(dir);
+        await fs.writeFile(path.join(dir, 'data'), 'test');
+        if (owner) await fs.writeFile(path.join(dir, '.upload-owner.json'), JSON.stringify(owner));
+        if (stale) {
+            const old = new Date(now - 60 * 60000);
+            await fs.utimes(dir, old, old);
+            if (!freshData) await fs.utimes(path.join(dir, 'data'), old, old);
+        }
+    };
+    await make('tuotuo-upload-dead01', { owner: { pid: 40001, hostname: os.hostname() } });
+    await make('tuotuo-upload-live01', { owner: { pid: 40002, hostname: os.hostname() }, stale: true });
+    await make('tuotuo-upload-legacy', { stale: true });
+    await make('tuotuo-upload-recent');
+    await make('tuotuo-upload-active', { stale: true, freshData: true });
+    await make('tuotuo-upload-remote', { owner: { pid: 40001, hostname: 'another-worker-host' }, stale: true });
+    await make('other-upload-legacy', { stale: true });
+    await fs.symlink(path.join(root, 'other-upload-legacy'), path.join(root, 'tuotuo-upload-linked'));
+    await pruneAbandonedUploads({ tempRoot: root, now, processAlive: pid => pid === 40002 });
+    const remaining = await fs.readdir(root);
+    assert(!remaining.includes('tuotuo-upload-dead01'));
+    assert(!remaining.includes('tuotuo-upload-legacy'));
+    for (const name of ['tuotuo-upload-live01', 'tuotuo-upload-recent', 'tuotuo-upload-active', 'tuotuo-upload-remote', 'other-upload-legacy', 'tuotuo-upload-linked']) {
+        assert(remaining.includes(name), `must preserve ${name}`);
+    }
 });

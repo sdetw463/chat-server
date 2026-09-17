@@ -3,16 +3,17 @@ const assert = require('node:assert/strict');
 const { once } = require('node:events');
 const WebSocket = require('ws');
 
-test('direct HTTP chat mounts uploads, serves generated files from the resource, and never references an Agent', async () => {
-    process.env.AI_CHAT_BACKEND = 'direct-responses';
-    process.env.AZURE_RESPONSES_ENDPOINT = 'https://example.openai.azure.com';
-    const direct = require('../lib/direct-responses');
+test('Foundry HTTP chat mounts files through the pinned Agent and serves original and generated files', async () => {
+    process.env.FOUNDRY_PROJECT_ENDPOINT = 'https://example.services.ai.azure.com/api/projects/test';
+    process.env.FOUNDRY_AGENT_VERSION = '17';
+    process.env.FOUNDRY_USE_CONVERSATIONS = 'false';
+    const foundry = require('../lib/foundry-agent');
     const calls = [];
     const uploads = [];
     const uploadedBytes = new Map();
     let downloads = 0;
     let failUpload = false;
-    direct.createDirectClient = () => ({
+    foundry.createFoundryClients = () => ({ openai: {
         files: {
             create: async ({ file }) => {
                 if (failUpload) throw Object.assign(new Error('500 status code (no body)'), { status: 500, headers: new Headers({ 'apim-request-id': 'upload-error-request-id' }) });
@@ -36,7 +37,7 @@ test('direct HTTP chat mounts uploads, serves generated files from the resource,
                 type: 'output_text', text: '已生成文件', annotations: [{ type: 'container_file_citation', container_id: 'cntr-test', file_id: 'cfile-test', filename: 'result.txt' }]
             }] }] };
         } }
-    });
+    } });
     const { server } = require('../server');
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
@@ -56,13 +57,13 @@ test('direct HTTP chat mounts uploads, serves generated files from the resource,
         });
         assert.equal(res.status, 200);
         const result = await res.json();
-        assert.equal(result.backend, 'direct-responses');
-        assert.equal(result.usedAgent, false);
+        assert.equal(result.backend, 'foundry-agent');
+        assert.equal(result.usedAgent, true);
         assert.equal(result.foundryConversationId, null);
         assert.equal(calls.length, 1);
-        assert.deepEqual(calls[0].options, {});
-        assert.equal(calls[0].body.model, 'gpt-6-astra');
-        assert.deepEqual(calls[0].body.tools[1].container.file_ids, ['file-upload']);
+        assert.deepEqual(calls[0].options.body.agent_reference, { type: 'agent_reference', name: 'tuo-agent', version: '17' });
+        assert.equal(calls[0].body.model, undefined);
+        assert.equal(calls[0].options.body.structured_inputs.attachment_file_1, 'file-upload');
         assert.equal(calls[0].body.input[0].content, '前一轮');
         const file = await fetch(base + result.files[0].url);
         assert.equal(await file.text(), 'generated-file');

@@ -43,7 +43,7 @@ test('uploaded file IDs are mapped to Code Interpreter structured input slots', 
     ]), {
         attachment_file_1: 'assistant-file-1',
         attachment_file_2: 'assistant-file-2',
-        attachment_file_3: ''
+        ...Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`attachment_file_${i + 3}`, '']))
     });
 });
 
@@ -188,7 +188,7 @@ test('historical files are not mounted for unrelated small talk', () => {
 test('stream duration cap is disabled by default while an explicit cap remains opt-in', () => {
     const unlimited = _test.resolveFoundryStreamTimeouts('0');
     assert.equal(unlimited.streamMaxMs, 0);
-    assert.ok(unlimited.sdkRequestTimeoutMs > 20 * 60 * 1000);
+    assert.equal(unlimited.sdkRequestTimeoutMs, 180000);
 
     const capped = _test.resolveFoundryStreamTimeouts('1200000');
     assert.equal(capped.streamMaxMs, 1200000);

@@ -60,13 +60,14 @@ test('unqualified frontend sends no request and does not persist or process atta
 }, async () => {
     const source = fs.readFileSync(path.join(__dirname, '../../js/features/74-gpt-chat.js'), 'utf8');
     const start = source.indexOf('async function sendGPTMessage()');
-    const end = source.indexOf("    if (typeof ensureGPTSessionsLoaded", start);
+    const end = source.indexOf('    // Acquire the lock before the first await', start);
     let displayed = '';
     const context = vm.createContext({
         document: { getElementById: id => id === 'gpt-input-el' ? { value: '你好' } : {
             querySelector: () => null, insertAdjacentHTML: (_, html) => { displayed = html; }, scrollHeight: 1
         } },
         gptIsSending: false, gptPendingFiles: [{}], aiAccessToken: '', chatNickname: '普通用户',
+        gptProcessingFileSets: new WeakMap(),
         localStorage: { getItem: () => '普通用户' },
     });
     // Any call outside this early gate fails because no network/storage helper exists.

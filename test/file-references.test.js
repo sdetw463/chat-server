@@ -1,7 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
-process.env.AI_CHAT_BACKEND = 'direct-responses';
 const { _test } = require('../server');
 const mongoose = require('mongoose');
 
@@ -17,7 +16,7 @@ test('durable references: 10 mounts, 500MB boundary, strict owner/session, old h
         blobName: `private/${i}`, size: 50 * 1024 ** 2
     }));
     model.findOne = query => ({ lean: async () => records.find(r => r.downloadTokenHash === query.downloadTokenHash && r.userId === query.userId && (!query.sessionId || query.sessionId === r.sessionId)) });
-    model.find = () => ({ limit: () => ({ lean: async () => [] }) });
+    model.find = () => ({ sort: () => ({ limit: () => ({ lean: async () => [] }) }) });
     const documents = records.map(r => ({ name: r.filename, uploadToken: r.downloadId, size: 1 }));
     _test.validateAgentRequest({ userMessage: 'read', documents });
     assert.throws(() => _test.validateAgentRequest({ userMessage: 'read', documents: [...documents, documents[0]] }), /10/);

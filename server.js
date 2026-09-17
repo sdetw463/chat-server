@@ -7,10 +7,12 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { DefaultAzureCredential } = require('@azure/identity');
-const { AIProjectClient } = require('@azure/ai-projects');
+const { createFoundryClients } = require('./lib/foundry-agent');
+const { beginChat, abortChat, withSessionWrite, mapWithConcurrency } = require('./lib/session-lifecycle');
+const { pipeline } = require('node:stream/promises');
+const { once } = require('node:events');
 const mongoose = require('mongoose');
 const { BlobServiceClient } = require('@azure/storage-blob');
-const { createDirectClient, buildDirectRequest } = require('./lib/direct-responses');
 const { prepareFileTransportFromPath, transportNote, unwrapFile } = require('./lib/file-transport');
 const { uploadAIFile, getCachedAIFile, upstreamRequestId, CACHE_SECONDS } = require('./lib/ai-file-upload');
 const { changedMessageOperations, retryDatabase } = require('./lib/history-persistence');
@@ -52,7 +54,7 @@ app.use((error, req, res, next) => {
 // 1. 初始化数据库和对象存储
 // ==========================================
 if (process.env.MONGODB_URI) {
-    mongoose.connect(process.env.MONGODB_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+    mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 10000, maxPoolSize: 10 })
         .then(async () => {
             console.log('✅ MongoDB 数据库连接成功！');
             // The first persistence build may have created ai_sessions before
@@ -103,6 +105,9 @@ const aiMessageSchema = new mongoose.Schema({
     progress: { type: mongoose.Schema.Types.Mixed, default: null },
     clientCreatedAt: { type: Number, default: 0 }
 }, { timestamps: true });
+
+aiMessageSchema.index({ clientCreatedAt: -1 });
+aiSessionSchema.index({ clientUpdatedAt: -1 });
 
 const aiFileSchema = new mongoose.Schema({
     userId: { type: String, required: true, index: true },
@@ -170,17 +175,6 @@ async function assertAiSessionActive(userId, sessionId) {
     if (await isAiSessionDeleted(userId, sessionId)) throw deletedSessionError();
 }
 
-async function markAiSessionDeleted(userId, sessionId, reason = 'user_deleted') {
-    if (mongoose.connection.readyState !== 1 || !userId || !sessionId) return;
-    await mongoose.connection.collection(AI_RECORD_COLLECTION).updateOne(
-        { docType: DELETED_SESSION_DOC_TYPE, userId, sessionId },
-        {
-            $set: { deletedAt: new Date(), reason: String(reason).slice(0, 80) },
-            $setOnInsert: { docType: DELETED_SESSION_DOC_TYPE, userId, sessionId, createdAt: new Date() }
-        },
-        { upsert: true }
-    );
-}
 
 let containerClient = null;
 if (process.env.AZURE_STORAGE_CONNECTION_STRING) {
@@ -260,15 +254,13 @@ const foundryAgentName = process.env.FOUNDRY_AGENT_NAME
 const foundryAgentVersion = process.env.FOUNDRY_AGENT_VERSION
     || process.env.AZURE_AI_AGENT_VERSION
     || "";
-const chatBackend = process.env.AI_CHAT_BACKEND || 'foundry-agent';
-if (!['foundry-agent', 'direct-responses'].includes(chatBackend)) throw new Error('未知的 AI_CHAT_BACKEND。');
-const directResponsesEnabled = chatBackend === 'direct-responses';
+const chatBackend = 'foundry-agent';
 const foundryFileInputSlots = String(process.env.FOUNDRY_CODE_INTERPRETER_FILE_SLOTS
-    || "attachment_file_1,attachment_file_2,attachment_file_3")
+    || Array.from({ length: MAX_ATTACHMENTS }, (_, i) => `attachment_file_${i + 1}`).join(','))
     .split(',')
     .map(value => value.trim())
     .filter(Boolean)
-    .slice(0, 8);
+    .slice(0, MAX_ATTACHMENTS);
 const foundryUseConversations = String(process.env.FOUNDRY_USE_CONVERSATIONS || 'true').toLowerCase() === 'true';
 const aiContextMessageLimit = Math.min(80, Math.max(12, Number(process.env.AI_CONTEXT_MESSAGE_LIMIT || 40)));
 const aiContextCharacterBudget = Math.min(200_000, Math.max(24_000, Number(process.env.AI_CONTEXT_CHARACTER_BUDGET || 90_000)));
@@ -283,7 +275,7 @@ const MAX_NODE_TIMER_MS = 2_147_000_000;
 // waiting for the initial HTTP response. Keep that timer below Node's
 // 32-bit setTimeout ceiling when the stream cap is disabled; once headers have
 // arrived, the SDK clears it and the SSE stream can continue indefinitely.
-const MAX_SDK_REQUEST_TIMEOUT_MS = MAX_NODE_TIMER_MS;
+const MAX_SDK_REQUEST_TIMEOUT_MS = 180_000;
 function resolveFoundryStreamTimeouts(rawValue) {
     const configured = Number(rawValue);
     const streamMaxMs = Number.isFinite(configured) && configured > 0
@@ -291,7 +283,7 @@ function resolveFoundryStreamTimeouts(rawValue) {
         : 0;
     const sdkRequestTimeoutMs = Math.min(
         streamMaxMs > 0 ? streamMaxMs + 60_000 : MAX_SDK_REQUEST_TIMEOUT_MS,
-        MAX_SDK_REQUEST_TIMEOUT_MS
+        MAX_NODE_TIMER_MS
     );
     return { streamMaxMs, sdkRequestTimeoutMs };
 }
@@ -309,23 +301,11 @@ const imageApiVersion = process.env.AZURE_OPENAI_IMAGE_API_VERSION || "2025-04-0
 const imageQuality = process.env.AZURE_OPENAI_IMAGE_QUALITY || "medium";
 const imageMaxRetries = Math.max(0, Number(process.env.AZURE_OPENAI_IMAGE_MAX_RETRIES || 2));
 const azureCredential = new DefaultAzureCredential();
-let foundryProjectClient = null;
-let foundryOpenAIClient = null;
-let directOpenAIClient = null;
-
-function getChatClients() {
-    if (!directResponsesEnabled) return getFoundryClients();
-    if (!directOpenAIClient) directOpenAIClient = createDirectClient(azureCredential);
-    return { openai: directOpenAIClient };
-}
-
+let foundryClients = null;
 function getFoundryClients() {
     assertFoundryAgentReady();
-    if (!foundryProjectClient) {
-        foundryProjectClient = new AIProjectClient(foundryProjectEndpoint, azureCredential);
-        foundryOpenAIClient = foundryProjectClient.getOpenAIClient();
-    }
-    return { project: foundryProjectClient, openai: foundryOpenAIClient };
+    if (!foundryClients) foundryClients = createFoundryClients(foundryProjectEndpoint, azureCredential);
+    return foundryClients;
 }
 
 function getImageBaseUrl() {
@@ -605,10 +585,6 @@ function getTextFromMessage(message) {
 }
 
 function assertFoundryAgentReady() {
-    if (directResponsesEnabled) {
-        if (!process.env.AZURE_RESPONSES_ENDPOINT) throw new Error('请配置资源级 AZURE_RESPONSES_ENDPOINT。');
-        return;
-    }
     if (!foundryProjectEndpoint || !foundryAgentName) {
         throw new Error('Foundry Agent 尚未配置完成。聊天不会降级到普通模型，请检查 FOUNDRY_PROJECT_ENDPOINT 和 FOUNDRY_AGENT_NAME。');
     }
@@ -627,10 +603,10 @@ function isInlineInputFileDocument(doc) {
 
 async function buildFoundryAgentUserContent(userMessage, documents, images, reasoningMode, sessionFiles, userId, attachmentNames = []) {
     const docs = Array.isArray(documents) ? documents : [];
-    const fileDocs = docs.filter(isInlineInputFileDocument).slice(0, 5);
+    const fileDocs = docs.filter(isInlineInputFileDocument).slice(0, MAX_ATTACHMENTS);
     const contentDocs = docs.filter(doc => doc && doc.content && !isInlineInputFileDocument(doc));
     const names = (attachmentNames.length ? attachmentNames : fileDocs.map(doc => safeFileName(doc.name || "attachment")))
-        .slice(0, directResponsesEnabled ? MAX_ATTACHMENTS : foundryFileInputSlots.length);
+        .slice(0, foundryFileInputSlots.length);
     const fileSummary = names.length
         ? `\n\n本轮已附加文件：\n${names.map(name => `- ${name}`).join('\n')}`
         : '';
@@ -642,7 +618,7 @@ async function buildFoundryAgentUserContent(userMessage, documents, images, reas
     const normalizedImages = (Array.isArray(images) ? images : [images])
         .map(normalizeChatImage)
         .filter(image => typeof image === 'string' && image.length > 0)
-        .slice(0, directResponsesEnabled ? MAX_ATTACHMENTS : 4);
+        .slice(0, MAX_ATTACHMENTS);
     normalizedImages.forEach(imageUrl => parts.push({ type: 'input_image', image_url: imageUrl, detail: 'auto' }));
     return parts;
 }
@@ -716,7 +692,7 @@ async function collectFoundryCodeInterpreterFiles(documents, sessionFiles, userI
     };
     const rawDocs = (Array.isArray(documents) ? documents : [])
         .filter(isInlineInputFileDocument)
-        .slice(0, directResponsesEnabled ? MAX_ATTACHMENTS : foundryFileInputSlots.length);
+        .slice(0, foundryFileInputSlots.length);
 
     for (const doc of rawDocs) {
         const parsed = parseDataUrlFile(doc);
@@ -735,11 +711,11 @@ async function collectFoundryCodeInterpreterFiles(documents, sessionFiles, userI
         files.push({ filename: record.filename, mimeType: record.mimeType, blobName: record.blobName, size: record.size, storageId: record._id, upstreamFile: record.upstreamFile, persistent: false, isNewSessionFile: false });
     }
 
-    const remaining = (directResponsesEnabled ? MAX_ATTACHMENTS : foundryFileInputSlots.length) - files.length;
+    const remaining = (foundryFileInputSlots.length) - files.length;
     if (remaining > 0 && shouldAttachHistoricalFiles(userMessage)) {
         let candidates = normalizeSessionFileReferences(sessionFiles);
         if (mongoose.connection.readyState === 1 && sessionId) {
-            const stored = (await retryDatabase(() => AiFile.find({ userId, sessionId }).limit(aiSessionFileLimit).lean()))
+            const stored = (await retryDatabase(() => AiFile.find({ userId, sessionId }).sort({ _id: -1 }).limit(aiSessionFileLimit).lean()))
                 .sort((a, b) => new Date(a.updatedAt || a.createdAt || 0) - new Date(b.updatedAt || b.createdAt || 0));
             const storedRefs = stored.map(record => ({
                 filename: record.filename,
@@ -839,12 +815,12 @@ async function uploadFoundryCodeInterpreterFilesSequential(openai, files, { sign
                 continue;
             }
             onProgress?.(`正在检查 AI 附件：${file.filename}`, 'upload');
-            if (file.storageId && directResponsesEnabled) {
+            if (file.storageId) {
                 const latest = await retryDatabase(() => AiFile.findOne({ _id: file.storageId, userId, sessionId }).select('upstreamFile').lean());
                 if (!latest) throw new Error('附件已从当前会话移除。');
                 file.upstreamFile = latest.upstreamFile;
             }
-            const cached = directResponsesEnabled && await getCachedAIFile(openai, file.upstreamFile, scope, signal);
+            const cached = await getCachedAIFile(openai, file.upstreamFile, scope, signal);
             if (cached) {
                 uploaded.push({ id: cached.id, filename: file.filename, transport: cached.transport, size: file.size, persistent: true });
                 onProgress?.(`已复用 AI 附件：${file.filename}`, 'upload');
@@ -863,7 +839,7 @@ async function uploadFoundryCodeInterpreterFilesSequential(openai, files, { sign
                 if (!size || size > MAX_AGENT_FILE_BYTES || (file.size && file.size !== size)) throw new Error('持久附件大小校验失败。');
                 const prepared = await prepareFileTransportFromPath({ ...file, path: localPath, size }, path.join(dir, 'wrapped.zip'), signal);
                 onProgress?.(`正在传送附件至 Azure AI：${file.filename}（${(size / 1024 ** 2).toFixed(1)} MB）`, 'upload');
-                const result = await uploadAIFile(openai, prepared, { signal, multipart: directResponsesEnabled,
+                const result = await uploadAIFile(openai, prepared, { signal, multipart: false,
                     onPhase: () => onProgress?.(`分块已接收，正在等待 Azure AI 合并附件：${file.filename}`, 'upload'),
                     onProgress: (done, total) => onProgress?.(`Azure AI 已接收附件：${file.filename} · ${Math.round(done / total * 100)}%`, 'upload') });
                 const entry = { id: result.id, filename: file.filename, transport: prepared.transport, size,
@@ -871,7 +847,7 @@ async function uploadFoundryCodeInterpreterFilesSequential(openai, files, { sign
                 uploaded.push(entry);
                 // Azure Uploads rejects expires_after. Bound reuse locally and
                 // clean expired AI copies separately; Blob originals stay intact.
-                if (file.storageId && directResponsesEnabled) {
+                if (file.storageId) {
                     try {
                         const expiresAt = Math.min(Number(result.expires_at) * 1000 || Infinity, Date.now() + CACHE_SECONDS * 1000);
                         const saved = await retryDatabase(() => AiFile.updateOne({ _id: file.storageId, userId, sessionId }, { $set: {
@@ -911,10 +887,10 @@ async function deleteCachedAIFile(openai, id) {
 
 let cleaningAiFileCache = false;
 const aiFileCacheTimer = setInterval(async () => {
-    if (cleaningAiFileCache || !directResponsesEnabled || mongoose.connection.readyState !== 1) return;
+    if (cleaningAiFileCache || mongoose.connection.readyState !== 1) return;
     cleaningAiFileCache = true;
     try {
-        const { openai } = getChatClients();
+        const { openai } = getFoundryClients();
         const scope = crypto.createHash('sha256').update(`${chatBackend}:${openai.baseURL}`).digest('hex');
         const expired = await retryDatabase(() => AiFile.find({ 'upstreamFile.scope': scope, 'upstreamFile.expiresAt': { $lt: Date.now() } })
             .select('upstreamFile').limit(20).lean());
@@ -964,8 +940,13 @@ function buildDurableFileResponse(record, downloadId) {
     };
 }
 
-async function persistFileBuffer({ buffer, path: localPath, filename, mimeType, source, userId, sessionId }) {
+async function persistFileBuffer(args) {
+    return withSessionWrite(args.userId, args.sessionId, () => persistFileBufferUnlocked(args));
+}
+
+async function persistFileBufferUnlocked({ buffer, path: localPath, filename, mimeType, source, userId, sessionId }) {
     if (!canUsePersistentAiStorage() || (!buffer?.length && !localPath) || !sessionId) return null;
+    await assertAiSessionActive(userId, sessionId);
     const size = localPath ? (await fs.promises.stat(localPath)).size : buffer.length;
     const [fileCount, sizeRows] = await Promise.all([
         AiFile.countDocuments({ userId, sessionId }),
@@ -991,6 +972,7 @@ async function persistFileBuffer({ buffer, path: localPath, filename, mimeType, 
         });
     } else blobName = await uploadBufferToBlob(buffer, { userId, sessionId, filename, mimeType });
     try {
+        await assertAiSessionActive(userId, sessionId);
         const record = await AiFile.create({
             userId,
             sessionId,
@@ -1354,9 +1336,9 @@ async function upsertStoredMessages(userId, sessionId, messages) {
     }
 }
 
-async function loadStoredConversationHistory(userId, sessionId, fallbackHistory) {
+async function loadStoredConversationHistory(userId, sessionId, fallbackHistory, requestId) {
     if (mongoose.connection.readyState !== 1 || !sessionId) return fallbackHistory;
-    const stored = (await retryDatabase(() => AiMessage.find({ userId, sessionId }).limit(1000).lean()))
+    const stored = (await retryDatabase(() => AiMessage.find({ userId, sessionId, ...(requestId ? { messageId: { $nin: [`${requestId}:user`, `${requestId}:assistant`] } } : {}) }).sort({ clientCreatedAt: -1 }).limit(aiContextMessageLimit).lean()))
         .sort((a, b) => {
             const aTime = Number(a.clientCreatedAt) || new Date(a.createdAt || 0).getTime();
             const bTime = Number(b.clientCreatedAt) || new Date(b.createdAt || 0).getTime();
@@ -1369,19 +1351,23 @@ async function loadStoredConversationHistory(userId, sessionId, fallbackHistory)
 
 async function persistCompletedChatTurn({ userId, sessionId, userMessage, reply, sources, files, requestId, progress }) {
     if (mongoose.connection.readyState !== 1 || !sessionId) return;
-    await ensureAiSession(userId, sessionId);
-    const baseId = normalizeIdentityPart(requestId, 140) || crypto.randomUUID();
-    await upsertStoredMessages(userId, sessionId, [
-        { id: `${baseId}:user`, role: 'user', content: userMessage, createdAt: Date.now() - 1 },
-        { id: `${baseId}:assistant`, role: 'assistant', content: reply, sources, generatedFiles: files, progress, createdAt: Date.now() }
-    ]);
+    return withSessionWrite(userId, sessionId, async () => {
+        await assertAiSessionActive(userId, sessionId);
+        await ensureAiSession(userId, sessionId);
+        const baseId = normalizeIdentityPart(requestId, 140) || crypto.randomUUID();
+        await upsertStoredMessages(userId, sessionId, [
+            { id: `${baseId}:user`, role: 'user', content: userMessage, createdAt: Date.now() - 1 },
+            { id: `${baseId}:assistant`, role: 'assistant', content: reply, sources, generatedFiles: files, progress, createdAt: Date.now() }
+        ]);
+    });
 }
 
 function validateAgentRequest({ userMessage, documents, images, historyMessages, sessionFiles }) {
     if (!String(userMessage || '').trim() && !(Array.isArray(documents) && documents.length) && !(Array.isArray(images) && images.length)) {
         throw new Error('请输入消息或添加附件。');
     }
-    const maxAttachments = directResponsesEnabled ? MAX_ATTACHMENTS : foundryFileInputSlots.length;
+    if (String(userMessage || '').length > 100000) throw Object.assign(new Error('消息过长，请把大段内容作为附件上传。'), { status: 400 });
+    const maxAttachments = foundryFileInputSlots.length;
     if ((Array.isArray(documents) ? documents.length : 0) + (Array.isArray(images) ? images.length : 0) > maxAttachments) throw new Error(`一次最多处理 ${maxAttachments} 个附件。`);
     for (const doc of (Array.isArray(documents) ? documents : [])) {
         if (doc?.uploadToken !== undefined && (typeof doc.uploadToken !== 'string' || !doc.uploadToken || doc.uploadToken.length > 256 || doc.fileData !== undefined)) throw new Error('附件引用格式不正确，请重新上传。');
@@ -1406,6 +1392,7 @@ async function getActiveFoundryConversation(conversationKey, userId, sessionId) 
     if (mongoose.connection.readyState === 1 && userId && sessionId) {
         const session = await AiSession.findOne({ userId, sessionId }).select('foundryConversationId').lean();
         if (session?.foundryConversationId) {
+            if (foundryAgentConversations.size >= 500) foundryAgentConversations.delete(foundryAgentConversations.keys().next().value);
             foundryAgentConversations.set(conversationKey, session.foundryConversationId);
             return session.foundryConversationId;
         }
@@ -1424,27 +1411,32 @@ async function prepareFoundryAgentInvocation({ userMessage, documents, images, h
     signal?.throwIfAborted();
     assertFoundryAgentReady();
     validateAgentRequest({ userMessage, documents, images, historyMessages, sessionFiles });
-    const { openai } = getChatClients();
+    const { openai } = getFoundryClients();
     const conversationKey = sessionId ? `${userId}:${sessionId}` : '';
     await assertAiSessionActive(userId, sessionId);
-    await ensureAiSession(userId, sessionId);
-    let conversationId = directResponsesEnabled ? null : await getActiveFoundryConversation(conversationKey, userId, sessionId);
-    const resolvedHistory = await loadStoredConversationHistory(userId, sessionId, historyMessages);
+    await withSessionWrite(userId, sessionId, async () => {
+        await assertAiSessionActive(userId, sessionId);
+        await ensureAiSession(userId, sessionId);
+    });
+    let conversationId = foundryUseConversations ? await getActiveFoundryConversation(conversationKey, userId, sessionId) : null;
+    const resolvedHistory = conversationId ? historyMessages : await loadStoredConversationHistory(userId, sessionId, historyMessages, requestId);
     const history = buildConversationSeed(resolvedHistory);
 
     // Conversation mode is enabled by default for durable multi-turn context.
     // MongoDB remains the recovery source if the Foundry conversation expires.
-    if (!directResponsesEnabled && foundryUseConversations && !conversationId) {
+    if (foundryUseConversations && !conversationId) {
         try {
-            const conversation = await openai.conversations.create(history.length ? { items: history } : {});
+            const conversation = await openai.conversations.create(history.length ? { items: history } : {}, { signal, timeout: 30000, maxRetries: 0 });
             conversationId = conversation && conversation.id;
             if (conversationKey && conversationId) {
-                foundryAgentConversations.set(conversationKey, conversationId);
+                if (foundryAgentConversations.size >= 500) foundryAgentConversations.delete(foundryAgentConversations.keys().next().value);
+            foundryAgentConversations.set(conversationKey, conversationId);
                 if (mongoose.connection.readyState === 1) {
                     await AiSession.updateOne({ userId, sessionId }, { $set: { foundryConversationId: conversationId } });
                 }
             }
         } catch (error) {
+            signal?.throwIfAborted();
             // Conversation state is an optimization. The request can still be completed
             // statelessly with the browser-provided history if that API is unavailable.
             console.error("创建 Foundry conversation 失败，将使用无状态历史:", error.message || error);
@@ -1491,10 +1483,8 @@ async function prepareFoundryAgentInvocation({ userMessage, documents, images, h
         // Agent 版本是工具选择的唯一配置源。Foundry 不允许请求级
         // tool_choice 覆盖与 Agent 自身的 tool_choice 不同；附件只通过
         // structured_inputs 挂载，是否调用 Code Interpreter 由 Agent 决定。
-        requestBody: directResponsesEnabled
-            ? buildDirectRequest({ history, currentMessage, uploadedFiles: uploadedInputFiles })
-            : buildFoundryResponseRequestBody({ conversationId, history, currentMessage }),
-        requestOptions: directResponsesEnabled ? {} : {
+        requestBody: buildFoundryResponseRequestBody({ conversationId, history, currentMessage }),
+        requestOptions: {
             body: agentBody
         }
     };
@@ -1509,11 +1499,13 @@ async function runFoundryAgentChat(args) {
     try {
         const response = await invocation.openai.responses.create(
             { ...invocation.requestBody, stream: false },
-            invocation.requestOptions
+            { ...invocation.requestOptions, signal: args.signal, timeout: foundrySdkRequestTimeoutMs }
         );
+        if (response.status !== 'completed') throw new Error(formatFoundryIncompleteResponse(response));
         const reply = extractResponseText(response);
         const sources = extractCitationSources(response);
         const files = await materializeGeneratedFiles(response, args.userId, args.sessionId);
+        let historyWarning;
         await persistCompletedChatTurn({
             userId: args.userId,
             sessionId: args.sessionId,
@@ -1522,11 +1514,15 @@ async function runFoundryAgentChat(args) {
             sources,
             files,
             requestId: args.requestId
+        }).catch(error => {
+            historyWarning = '回复已生成，云端保存暂时失败；请保留当前页面，稍后会重新同步。';
+            console.error('保存完成回复失败:', error.code || error.name);
         });
         return {
             reply,
             sources,
             files,
+            historyWarning,
             sessionFiles: invocation.rememberedInputFiles,
             conversationId: invocation.conversationId,
             rawResponseId: response && response.id,
@@ -1568,6 +1564,7 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
     let invocation = null;
     let response = null;
     let streamedText = "";
+    let lastTextItem = null;
     let lastStatus = "";
     let lastTool = "agent";
     const progressEntries = [];
@@ -1649,10 +1646,18 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
                 sendItemSummaries(event.item, event.output_index);
             } else if (event.type === "response.output_text.delta" && event.delta) {
                 if (!streamedText) sendProgress("正在生成回答");
+                const itemKey = event.item_id ?? event.output_index ?? 0;
+                if (lastTextItem !== null && itemKey !== lastTextItem && streamedText) {
+                    streamedText += '\n\n';
+                    sendSSE(res, { delta: '\n\n' });
+                }
+                lastTextItem = itemKey;
                 streamedText += event.delta;
                 lastStatus = "正在生成回答";
                 lastTool = "agent";
-                sendSSE(res, { delta: event.delta });
+                if (!sendSSE(res, { delta: event.delta }) && !res.destroyed) {
+                    await once(res, 'drain', { signal: abortSignal });
+                }
             } else if (event.type === "response.in_progress") {
                 sendProgress("正在分析并组织回答");
             } else if (event.type === "response.mcp_list_tools.in_progress") {
@@ -1705,6 +1710,7 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
         const reply = extractResponseText(response);
         const sources = extractCitationSources(response);
         const files = await materializeGeneratedFiles(response, args.userId, args.sessionId);
+        let historyWarning;
         await persistCompletedChatTurn({
             userId: args.userId,
             sessionId: args.sessionId,
@@ -1719,6 +1725,9 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
                 elapsedMs: Date.now() - startedAt,
                 entries: progressEntries
             })
+        }).catch(error => {
+            historyWarning = '回复已生成，云端保存暂时失败；请保留当前页面，稍后会重新同步。';
+            console.error('保存完成回复失败:', error.code || error.name);
         });
         if (sources.length) sendSSE(res, { sources });
         if (files.length) sendSSE(res, { files });
@@ -1731,6 +1740,8 @@ async function handleFoundryAgentChatSSE(args, res, abortSignal) {
         console.log(`[Foundry SSE +${completedInSeconds}s] completed response=${response && response.id || 'unknown'}`);
         sendSSE(res, {
             done: true,
+            finalText: reply,
+            historyWarning,
             foundryConversationId: invocation.conversationId || null,
             foundryResponseId: response && response.id || null,
             elapsedSeconds: completedInSeconds
@@ -1782,9 +1793,8 @@ async function downloadFoundryAgentFile(containerId, fileId, backend = chatBacke
         containerId = "";
     }
     if (!fileId) throw new Error("缺少 fileId，无法下载 Agent 生成文件。");
-    const { openai } = backend === 'direct-responses'
-        ? { openai: directOpenAIClient || (directOpenAIClient = createDirectClient(azureCredential)) }
-        : getFoundryClients();
+    if (backend !== chatBackend) throw new Error('旧版临时文件已过期，请重新上传；已持久保存的文件仍可下载。');
+    const { openai } = getFoundryClients();
     const response = containerId
         ? await openai.containers.files.content.retrieve(fileId, { container_id: containerId })
         : await openai.files.content(fileId);
@@ -1958,58 +1968,53 @@ require('./lib/chunk-uploads').installChunkUploads(app, express, {
 
 app.post('/api/ai-chat', async (req, res) => {
     const wantsStream = req.body.stream === true || req.body.stream === 'true';
+    const controller = new AbortController();
+    const disconnected = () => { if (!res.writableEnded) controller.abort(new Error('已停止生成。')); };
+    res.once('close', disconnected);
+    let release;
+    let streamTimeout;
     try {
-        const images = await prepareAgentImages(req.body.images || req.body.image || []);
-        const agentRequest = buildAgentRequestFromHttp(req, images);
-        // Check before opening the SSE response so a deleted local browser
-        // session receives HTTP 410 and cannot invoke the model.
+        const rawImages = req.body.images || req.body.image || [];
+        const agentRequest = buildAgentRequestFromHttp(req, Array.isArray(rawImages) ? rawImages : [rawImages]);
+        validateAgentRequest(agentRequest);
+        release = beginChat(agentRequest.userId, agentRequest.sessionId, controller);
         await assertAiSessionActive(agentRequest.userId, agentRequest.sessionId);
+        controller.signal.throwIfAborted();
+        agentRequest.images = await prepareAgentImages(rawImages);
+        agentRequest.signal = controller.signal;
+        controller.signal.throwIfAborted();
+        if (foundryStreamMaxMs > 0) {
+            streamTimeout = setTimeout(() => controller.abort(new Error('本次处理已超时，已生成内容会保留，请重试。')), foundryStreamMaxMs);
+            streamTimeout.unref?.();
+        }
         if (wantsStream) {
             setupSSE(res);
-            const controller = new AbortController();
-            res.once('close', () => {
-                if (!res.writableEnded) controller.abort();
-            });
-            let streamTimeout = null;
-            if (foundryStreamMaxMs > 0) {
-                streamTimeout = setTimeout(() => {
-                    if (!controller.signal.aborted) {
-                        const minutes = Math.max(1, Math.ceil(foundryStreamMaxMs / 60000));
-                        controller.abort(new Error(`Foundry Agent 处理超过 ${minutes} 分钟，已停止本次流式连接。已生成内容会保留，请重试或把任务拆成更小步骤。`));
-                    }
-                }, foundryStreamMaxMs);
-                streamTimeout.unref?.();
-            }
-            try {
-                return await handleFoundryAgentChatSSE(agentRequest, res, controller.signal);
-            } finally {
-                if (streamTimeout) clearTimeout(streamTimeout);
-            }
+            return await handleFoundryAgentChatSSE(agentRequest, res, controller.signal);
         }
-
         const result = await runFoundryAgentChat(agentRequest);
         return res.json({
-            reply: result.reply,
-            sources: result.sources,
-            files: result.files,
+            reply: result.reply, sources: result.sources, files: result.files,
             sessionFiles: result.sessionFiles,
+            historyWarning: result.historyWarning,
             foundryConversationId: result.conversationId || null,
             foundryResponseId: result.rawResponseId || null,
-            usedAgent: !directResponsesEnabled,
-            agentName: directResponsesEnabled ? null : foundryAgentName,
-            backend: chatBackend,
-            model: directResponsesEnabled ? (process.env.AZURE_RESPONSES_DEPLOYMENT || 'gpt-6-astra') : null
+            usedAgent: true, agentName: foundryAgentName, backend: chatBackend,
+            model: 'gpt-6-astra', reasoningEffort: 'high'
         });
     } catch (error) {
-        console.error('🔥 Foundry Agent 聊天失败:', error);
+        if (res.destroyed) return;
+        console.error('Foundry Agent 聊天失败:', error.message || error);
         const errorMessage = formatAIError(error);
         if (res.headersSent) {
-            try {
-                sendSSE(res, { error: errorMessage });
-                return sendSSEDone(res);
-            } catch { return; }
+            sendSSE(res, { error: errorMessage });
+            return sendSSEDone(res);
         }
-        return res.status(Number(error.status) || 500).json({ error: errorMessage, code: error.code || undefined });
+        const status = Number(error.status);
+        return res.status(status >= 400 && status <= 599 ? status : 500).json({ error: errorMessage, code: error.code || undefined });
+    } finally {
+        clearTimeout(streamTimeout);
+        res.removeListener('close', disconnected);
+        release?.();
     }
 });
 
@@ -2140,19 +2145,16 @@ app.get('/api/sessions', async (req, res) => {
     try {
         if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: '聊天历史数据库暂时不可用。' });
         const userId = requireSessionIdentity(req);
-        const sessions = (await AiSession.find({ userId }).limit(200).lean())
-            .sort((a, b) => {
-                if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
-                const aTime = Number(a.clientUpdatedAt) || new Date(a.updatedAt || 0).getTime();
-                const bTime = Number(b.clientUpdatedAt) || new Date(b.updatedAt || 0).getTime();
-                return bTime - aTime;
-            })
-            .slice(0, 80);
-        const result = await Promise.all(sessions.map(async session => {
-            const [messageRows, fileRows] = await Promise.all([
-                AiMessage.find({ userId, sessionId: session.sessionId }).limit(1000).lean(),
-                AiFile.find({ userId, sessionId: session.sessionId }).select('+downloadId').limit(aiSessionFileLimit).lean()
-            ]);
+        const pinned = await retryDatabase(() => AiSession.find({ userId, pinned: true }).sort({ clientUpdatedAt: -1 }).limit(80).lean());
+        const recent = pinned.length < 80
+            ? await retryDatabase(() => AiSession.find({ userId, pinned: { $ne: true } }).sort({ clientUpdatedAt: -1 }).limit(80 - pinned.length).lean())
+            : [];
+        const sessions = [...pinned, ...recent];
+        const result = await mapWithConcurrency(sessions, 2, async session => {
+            const messageRows = await retryDatabase(() => AiMessage.find({ userId, sessionId: session.sessionId })
+                .sort({ clientCreatedAt: -1 }).limit(300).lean());
+            const fileRows = await retryDatabase(() => AiFile.find({ userId, sessionId: session.sessionId })
+                .select('+downloadId').sort({ _id: -1 }).limit(aiSessionFileLimit).lean());
             const messages = messageRows.sort((a, b) => {
                 const aTime = Number(a.clientCreatedAt) || new Date(a.createdAt || 0).getTime();
                 const bTime = Number(b.clientCreatedAt) || new Date(b.createdAt || 0).getTime();
@@ -2185,7 +2187,8 @@ app.get('/api/sessions', async (req, res) => {
                 })),
                 fileRefs: files.map(file => buildDurableFileResponse(file, file.downloadId))
             };
-        }));
+        });
+        res.setHeader('Cache-Control', 'private, no-store');
         res.json({ sessions: result });
     } catch (error) {
         res.status(400).json({ error: error.message || '读取聊天历史失败。' });
@@ -2199,6 +2202,7 @@ app.post('/api/sessions/sync', async (req, res) => {
         const session = req.body?.session;
         const sessionId = normalizeIdentityPart(session?.id);
         if (!sessionId) return res.status(400).json({ error: '缺少会话 ID。' });
+        await withSessionWrite(userId, sessionId, async () => {
         await assertAiSessionActive(userId, sessionId);
         await ensureAiSession(userId, sessionId, {
             title: session.title,
@@ -2209,6 +2213,7 @@ app.post('/api/sessions/sync', async (req, res) => {
             branchDepth: session.branchDepth
         });
         await upsertStoredMessages(userId, sessionId, session.messages);
+        });
         res.json({ ok: true });
     } catch (error) {
         console.error('同步 AI 历史失败:', error);
@@ -2216,39 +2221,22 @@ app.post('/api/sessions/sync', async (req, res) => {
     }
 });
 
+const sessionGarbageCollector = require('./lib/session-gc').createSessionGarbageCollector({
+    getCollection: () => mongoose.connection.collection(AI_RECORD_COLLECTION),
+    databaseReady: () => mongoose.connection.readyState === 1,
+    getStorage: () => containerClient,
+    getFoundry: () => getFoundryClients().openai,
+    projectEndpoint: foundryProjectEndpoint
+});
+
 app.delete('/api/sessions/:sessionId', async (req, res) => {
     try {
         if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: '聊天历史数据库暂时不可用。' });
         const userId = requireSessionIdentity(req);
         const sessionId = normalizeIdentityPart(req.params.sessionId);
-        const session = await AiSession.findOne({ userId, sessionId }).select('foundryConversationId').lean();
-        const files = await AiFile.find({ userId, sessionId }).lean();
-        if (directResponsesEnabled) {
-            const { openai } = getChatClients();
-            const scope = crypto.createHash('sha256').update(`${chatBackend}:${openai.baseURL}`).digest('hex');
-            // Delete tracked AI copies before removing the records used by GC.
-            for (const file of files) {
-                if (file.upstreamFile?.scope === scope && file.upstreamFile.id) await deleteCachedAIFile(openai, file.upstreamFile.id);
-            }
-        }
-        await Promise.allSettled(files.map(file => containerClient?.getBlockBlobClient(file.blobName).deleteIfExists()));
-        if (session?.foundryConversationId) {
-            try {
-                const { openai } = getFoundryClients();
-                await openai.conversations.delete(session.foundryConversationId);
-            } catch (error) {
-                // The tombstone still prevents further usage if Foundry has
-                // already expired the conversation or deletion is unavailable.
-                console.error('删除 Foundry conversation 失败:', error.message || error);
-            }
-        }
-        await Promise.all([
-            AiFile.deleteMany({ userId, sessionId }),
-            AiMessage.deleteMany({ userId, sessionId }),
-            AiSession.deleteOne({ userId, sessionId })
-        ]);
+        abortChat(userId, sessionId, deletedSessionError());
+        await sessionGarbageCollector.deleteSession(userId, sessionId);
         foundryAgentConversations.delete(`${userId}:${sessionId}`);
-        await markAiSessionDeleted(userId, sessionId);
         res.json({ ok: true });
     } catch (error) {
         res.status(400).json({ error: error.message || '删除聊天失败。' });
@@ -2264,11 +2252,17 @@ app.get('/api/ai-agent-file/:downloadId', async (req, res) => {
             : null;
         if (stored?.blobName) {
             const filename = getFileNameFromPath(stored.filename, 'agent-output');
-            const buffer = await downloadBlobBuffer(stored.blobName);
+            const controller = new AbortController();
+            res.once('close', () => { if (!res.writableEnded) controller.abort(); });
+            const blob = await containerClient.getBlockBlobClient(stored.blobName).download(0, undefined, { abortSignal: controller.signal });
             AiFile.updateOne({ _id: stored._id }, { $set: { lastAccessAt: new Date() } }).catch(() => {});
             res.setHeader('Content-Type', stored.mimeType || contentTypeForFileName(filename));
             res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
-            return res.send(buffer);
+            res.setHeader('Cache-Control', 'private, no-store');
+            res.setHeader('X-Content-Type-Options', 'nosniff');
+            if (blob.contentLength != null) res.setHeader('Content-Length', blob.contentLength);
+            await pipeline(blob.readableStreamBody, res, { signal: controller.signal });
+            return;
         }
         const grant = foundryGeneratedFiles.get(downloadId);
         if (!grant) {
@@ -2285,7 +2279,7 @@ app.get('/api/ai-agent-file/:downloadId', async (req, res) => {
         res.send(file.buffer);
     } catch (err) {
         console.error('下载 Foundry Agent 生成文件失败:', err);
-        res.status(500).json({ error: err.message || '下载文件失败' });
+        if (!res.headersSent && !res.destroyed) res.status(500).json({ error: '下载文件失败，请稍后重试。' });
     }
 });
 
@@ -2301,13 +2295,13 @@ app.get('/api/status', (req, res) => {
         "AI 文件上传兼容": "zip-store-v1",
         "AI 文件上传上限（MB）": MAX_AGENT_FILE_BYTES / 1024 ** 2,
         "AI 单轮附件上限（MB）": MAX_AGENT_TOTAL_FILE_BYTES / 1024 ** 2,
-        "AI 单轮附件数量": directResponsesEnabled ? MAX_ATTACHMENTS : foundryFileInputSlots.length,
+        "AI 单轮附件数量": foundryFileInputSlots.length,
         "AI 分块上传": "4MB / 持久化引用",
-        "AI 上游大文件传输": directResponsesEnabled ? "8MB 分块 / 磁盘流式" : "磁盘流式",
+        "AI 上游大文件传输": "Foundry Files / 磁盘流式",
         "AI 文件副本复用": "同一持久文件、同一资源校验后复用；24小时缓存，运行期间定期清理",
         "AI 历史同步": "仅写入变化消息 / 数据库限流退避",
-        "AI 聊天模型": directResponsesEnabled ? (process.env.AZURE_RESPONSES_DEPLOYMENT || 'gpt-6-astra') : '由 Foundry Agent 版本指定',
-        "AI 推理强度": directResponsesEnabled ? (process.env.AZURE_RESPONSES_REASONING_EFFORT || 'medium') : '由 Foundry Agent 版本指定',
+        "AI 聊天模型": 'gpt-6-astra',
+        "AI 推理强度": 'high',
         "Foundry Project Endpoint": !!foundryProjectEndpoint ? "✅ 是" : "❌ 否",
         "Foundry Agent 是否可用": !!foundryProjectEndpoint && !!foundryAgentName ? "✅ 是" : "❌ 否",
         "Foundry Agent 名称": foundryAgentName,
@@ -2334,80 +2328,10 @@ app.get('/', (req, res) => { res.send("TuoTuo Server is running!"); });
 // 4. WebSocket (聊天室、日记、留言) 
 // ==========================================
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
-let clients = new Map();
-
-wss.on('connection', async (ws, req) => {
-    const nickname = decodeURIComponent(req.url.split('/socket/')[1] || "匿名粉丝");
-    clients.set(ws, nickname);
-    // Register access handling before the asynchronous history query.
-    ws.on('message', (message) => {
-        try {
-            const data = JSON.parse(message);
-            if (data.type !== 'ai_access' || nickname !== '拖') return;
-            if (!ws.aiAccessToken) {
-                ws.aiAccessToken = crypto.randomBytes(32).toString('base64url');
-                aiAccessTokens.set(ws.aiAccessToken, ws);
-            }
-            ws.send(JSON.stringify({ type: 'ai_access', token: ws.aiAccessToken }));
-        } catch (_) { /* Invalid messages are handled by the chat listener. */ }
-    });
-    ws.on('close', () => {
-        if (ws.aiAccessToken) aiAccessTokens.delete(ws.aiAccessToken);
-        clients.delete(ws); broadcastUserList();
-    });
-    
-    try {
-        if(process.env.MONGODB_URI) {
-            const history = await WsMessage.find().sort({ _id: -1 }).limit(800).lean();
-            history.reverse();
-            
-            history.forEach(item => {
-                // 将安全的 entryId 恢复给 id，如果早期数据没有，就用 _id 兜底
-                if (item.entryId) {
-                    item.id = item.entryId;
-                } else if (item._id) {
-                    item.id = item._id.toString();
-                }
-            });
-
-            ws.send(JSON.stringify({ type: 'history', data: history }));
-        }
-    } catch (err) { console.error("读取历史记录失败", err); }
-    
-    broadcastUserList();
-    
-    ws.on('message', async (message) => {
-        try {
-            const data = JSON.parse(message);
-            if (data.type === 'ai_access') {
-                return;
-            }
-            
-            // 👇 保护前端传来的 id，存入 schema 中定义的 entryId 字段
-            if (data.id) {
-                data.entryId = data.id;
-            }
-            
-            if (data.msg && data.msg.startsWith('data:image')) {
-                data.msg = await uploadBase64ToBlob(data.msg);
-            }
-            if (data.imgs && Array.isArray(data.imgs)) {
-                data.imgs = await Promise.all(data.imgs.map(img => uploadBase64ToBlob(img)));
-            }
-
-            if(process.env.MONGODB_URI) {
-                await WsMessage.create(data);
-            }
-
-            broadcast(JSON.stringify({ type: 'message', ...data }));
-        } catch (e) { console.error(e); }
-    });
-    
+const realtime = require('./lib/realtime').installRealtime(server, {
+    MessageModel: WsMessage, aiAccessTokens, uploadImage: uploadBase64ToBlob,
+    databaseReady: () => mongoose.connection.readyState === 1, allowedOrigins
 });
-
-function broadcast(data) { wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(data); }); }
-function broadcastUserList() { broadcast(JSON.stringify({ type: 'userlist', data: Array.from(clients.values()) })); }
 
 if (require.main === module) {
     server.listen(process.env.PORT || 8888, () => { console.log(`✅ TuoTuo 服务器已启动！`); });

@@ -6,7 +6,7 @@ const path = require('node:path');
 const frontend = path.resolve(__dirname, '../../js/features');
 const available = fs.existsSync(path.join(frontend, '70-gpt-sessions.js'));
 const load = extra => {
-    const context = vm.createContext({ console: { warn(){}, error(){} },
+    const context = vm.createContext({ console: { warn(){}, error(){} }, AbortSignal,
         document: { getElementById: () => ({ classList: { contains: () => false } }) },
         persistSessionsToBrowser(){}, renderHistoryList(){}, ...extra });
     vm.runInContext(fs.readFileSync(path.join(frontend, '70-gpt-sessions.js'), 'utf8'), context);
@@ -31,8 +31,10 @@ test('failed first cloud load retries, malformed local cache does not block reco
         tuoApiFetch: async () => { calls++; return calls === 1 ? {ok:false,status:503} : {ok:true,json:async()=>({sessions:[{id:'restored',createdAt:10,updatedAt:20,messages:[{id:'m',role:'user',content:'preserved',createdAt:20}]}]})}; }
     });
     await vm.runInContext('ensureGPTSessionsLoaded()', c);
+    await vm.runInContext('gptRemoteHistoryPromise', c);
     assert.equal(calls, 1);
     await vm.runInContext('ensureGPTSessionsLoaded()', c);
+    await vm.runInContext('gptRemoteHistoryPromise', c);
     assert.equal(calls, 2);
     assert.equal(vm.runInContext('chatSessions[0].messages[0].content', c), 'preserved');
 });

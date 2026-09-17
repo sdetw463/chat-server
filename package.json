@@ -6,7 +6,9 @@
     "start": "node server.js",
     "test": "node --test test/*.test.js",
     "foundry:enable-files": "node scripts/enable-foundry-runtime-files.js",
-    "foundry:enable-toolbox": "node scripts/enable-foundry-toolbox.js"
+    "check": "node --check server.js",
+    "foundry:check-upload": "node scripts/check-ai-file-upload.js",
+    "foundry:configure": "node scripts/configure-foundry-agent.js"
   },
   "dependencies": {
     "express": "^4.18.2",
@@ -17,5 +19,8 @@
     "cors": "^2.8.5",
     "mongoose": "^8.0.0",
     "@azure/storage-blob": "^12.0.0"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

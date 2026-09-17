@@ -3,7 +3,7 @@
 const { DefaultAzureCredential } = require('@azure/identity');
 const { AIProjectClient } = require('@azure/ai-projects');
 
-const DEFAULT_SLOTS = 'attachment_file_1,attachment_file_2,attachment_file_3';
+const DEFAULT_SLOTS = Array.from({ length: 10 }, (_, i) => `attachment_file_${i + 1}`).join(',');
 
 function readArg(name) {
     const index = process.argv.indexOf(name);
@@ -41,7 +41,7 @@ function parseSlots(value) {
         .filter(Boolean);
 
     if (!slots.length) throw new Error('至少需要一个运行时文件槽。');
-    if (slots.length > 8) throw new Error('运行时文件槽最多配置 8 个。');
+    if (slots.length > 10) throw new Error('运行时文件槽最多配置 10 个。');
     if (new Set(slots).size !== slots.length) throw new Error('运行时文件槽不能重名。');
 
     for (const slot of slots) {
