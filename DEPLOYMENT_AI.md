@@ -7,10 +7,11 @@
 - App Service：`tuotuo`，资源组 `web`，Node.js 22，1个实例，Always On。
 - Project：`https://nantaisdeninis-6292-resource.services.ai.azure.com/api/projects/nantaisdeninis-6292`
 - `FOUNDRY_AGENT_NAME=tuo-agent`
-- `FOUNDRY_AGENT_VERSION=17`
+- `FOUNDRY_AGENT_VERSION=19`
 - 代理模型：`gpt-6-astra`
 - 推理配置：`effort=high`，`summary=auto`。
-- 工具：原生 `web_search`、`code_interpreter`。
+- 工具：原生 `web_search`（`search_context_size=high`）、`code_interpreter`。
+- 输出：Responses 不设置 `max_output_tokens`，保持模型端可用输出上限，不额外截短可见回答或推理；回答详细程度由 Agent 指令自适应控制。
 - 文件槽：`attachment_file_1` 到 `attachment_file_10`，可选、空默认值。
 - `FOUNDRY_USE_CONVERSATIONS=true`，使用 Foundry conversation 保持多轮上下文，数据库历史用于首次创建或恢复。
 - `APP_ALLOWED_ORIGINS=https://tuotuo.love`
@@ -28,7 +29,9 @@ npm test
 npm run check
 ```
 
-修改 `config/chat-instructions.md` 后，用 `npm run foundry:configure` 预览基于 `FOUNDRY_AGENT_VERSION` 的新定义；添加 `-- --apply` 创建新版本。脚本固定 Astra/high 和10个附件槽，不会自行切换线上。测试新版本后更新 App Service 的 `FOUNDRY_AGENT_VERSION`。
+修改 `config/chat-instructions.md` 后，用 `npm run foundry:configure` 预览基于 `FOUNDRY_AGENT_VERSION` 的新定义；添加 `-- --apply` 创建新版本。脚本固定 Astra high reasoning、Web Search high context、详细回答指令和10个附件槽，不会自行切换线上。测试新版本后更新 App Service 的 `FOUNDRY_AGENT_VERSION`。
+
+Foundry Agent reference 当前不允许请求级覆盖 `text.verbosity`；即使 Prompt Agent 定义接收该字段，实测响应仍报告 `medium`。因此不要把该字段当作生产保证，回答深度使用 Agent 指令控制。`gpt-6-astra` 的长回答实测为 7159 个字符，响应 `max_output_tokens=null`，确认后端没有额外输出上限。
 
 ## 请求与存储
 

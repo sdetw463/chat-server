@@ -593,7 +593,7 @@ function assertFoundryAgentReady() {
 
 function buildFoundryAgentUserMessage(userMessage, documents, reasoningMode) {
     const modePrefix = reasoningMode === "research"
-        ? "请对下面的问题进行深入研究，并给出可核验的依据。\n\n"
+        ? "这是深度研究请求。请进行多轮、不同关键词和角度的网页检索，优先阅读一手权威来源并交叉核验；覆盖核心事实、最新进展、不同观点和限制，给出详细、可核验且引用清楚的综合回答。不要只依赖单一搜索或搜索摘要。\n\n"
         : reasoningMode === "think" ? "请仔细分析后回答。\n\n" : "";
     return `${modePrefix}${userMessage || ""}${buildAttachmentText(documents)}`.trim() || "你好";
 }
