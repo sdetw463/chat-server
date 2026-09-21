@@ -12,7 +12,10 @@ test('normal chat forwards the user message without a duplicate backend persona'
 
 test('reasoning modes add only a short per-request user preference', () => {
     assert.match(_test.buildFoundryAgentUserMessage('比较两个方案', [], 'think'), /^请仔细分析后回答。/);
-    assert.match(_test.buildFoundryAgentUserMessage('查资料', [], 'research'), /^请对下面的问题进行深入研究/);
+    const research = _test.buildFoundryAgentUserMessage('查资料', [], 'research');
+    assert.match(research, /^这是深度研究请求/);
+    assert.match(research, /多轮、不同关键词和角度的网页检索/);
+    assert.match(research, /不要只依赖单一搜索/);
 });
 
 test('uploaded documents are described in the message instead of using unsupported native input_file', async () => {
