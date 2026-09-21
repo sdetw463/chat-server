@@ -13,6 +13,9 @@ function buildDefinition(source) {
     definition.model = 'gpt-6-astra';
     definition.reasoning = { effort: 'high', summary: 'auto' };
     definition.instructions = fs.readFileSync(path.join(__dirname, '../config/chat-instructions.md'), 'utf8');
+    definition.tools = (definition.tools || []).map(tool => tool?.type === 'web_search'
+        ? { ...tool, search_context_size: 'high' }
+        : tool);
     return definition;
 }
 
@@ -28,7 +31,7 @@ async function main() {
         console.log(JSON.stringify({ name, sourceVersion: version, definition }, null, 2));
         return;
     }
-    const created = await project.agents.createVersion(name, definition, { description: 'Astra high, native tools, 10 runtime attachments' });
+    const created = await project.agents.createVersion(name, definition, { description: 'Astra high, broader web search, detailed responses, 10 runtime attachments' });
     console.log(JSON.stringify({ name: created.name, version: created.version }));
     console.log('请先测试新版本，再更新 App Service 的 FOUNDRY_AGENT_VERSION；此命令不会切换线上配置。');
 }
