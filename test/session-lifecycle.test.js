@@ -30,6 +30,7 @@ test('Agent definition pins Astra high, public summaries, native tools and 10 at
     const source = { kind: 'prompt', model: 'old', tools: [{ type: 'web_search' }, { type: 'code_interpreter', container: { type: 'auto' } }] };
     const d = buildDefinition(source);
     assert.equal(d.model, 'gpt-6-astra'); assert.deepEqual(d.reasoning, { effort: 'high', summary: 'auto' });
+    assert.equal(d.tools[0].search_context_size, 'high');
     assert.equal(Object.keys(d.structured_inputs).length, 10);
     assert.equal(d.tools[1].container.file_ids[9], '{{attachment_file_10}}'); assert.equal(source.model, 'old');
 });
